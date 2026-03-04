@@ -1,0 +1,11 @@
+flask
+opencv-python
+ultralytics
+numpy
+scipy
+Pillow
+pyyaml
+pyserial
+reportlab
+mysql-connector-python
+Werkzeug

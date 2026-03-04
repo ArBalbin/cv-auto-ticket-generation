@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.weights
+*.bin
+
+# Training runs & data
+runs/
+weights/
+data/
+
+# Images & videos
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
