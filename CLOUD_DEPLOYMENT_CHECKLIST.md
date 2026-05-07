@@ -43,16 +43,16 @@ The app expects your database to contain the required tables, including staff us
 For a fresh cloud database, import:
 
 ```text
-database/schema_cloud_ready.sql
+database_sql/schema_cloud_ready.sql
 ```
 
-For an existing database created from the older local script, run this migration as a MySQL admin/root user:
+For a clean Aiven reset that drops and recreates all QueueFlow tables, use:
 
 ```text
-database/migrations/001_queue_records_cloud_ready.sql
+database_sql/aiven_clean_full_schema.sql
 ```
 
-The migration adds `service_date`, removes the risky global `UNIQUE(queue_number)`, and keeps existing rows.
+Only use the clean reset file if you are okay deleting the current cloud database rows.
 
 For staff registration/login, the `users` table must have at least:
 

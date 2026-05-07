@@ -11,7 +11,8 @@ class QueuePerson:
         'queue_number', 'track_id', 'bbox', 'entered_at', 'last_seen',
         'went_missing_at', 'status', 'missing_frames', 'position_in_line',
         'access_token', 'short_code', 'pdf_path',
-        'appearance_signature', 'appearance_history'
+        'appearance_signature', 'appearance_history',
+        'on_the_way', 'on_the_way_at'
     )
 
     def __init__(self, queue_number: int, track_id: int, bbox: tuple):
@@ -29,6 +30,8 @@ class QueuePerson:
         self.pdf_path             = None
         self.appearance_signature = None
         self.appearance_history   = []
+        self.on_the_way           = False
+        self.on_the_way_at        = None
 
     @property
     def wait_duration(self) -> timedelta:
@@ -74,6 +77,9 @@ class QueuePerson:
             'joined_at_iso':     self.entered_at.isoformat(),
             'bbox':              self.bbox,
             'access_token':      self.short_code if self.short_code else self.access_token,
+            'on_the_way':        self.on_the_way,
+            'on_the_way_at':     self.on_the_way_at.isoformat() if self.on_the_way_at else None,
+            'on_the_way_at_display': self.on_the_way_at.strftime("%I:%M:%S %p") if self.on_the_way_at else None,
         }
 
 
@@ -123,6 +129,7 @@ class QueueTracker:
         self.total_served                = 0
         self._noshow_timers: dict        = {}
         self.appearance_rejections: list = []
+        self.on_way_notifications: list  = []
         self.on_new_person               = None
         self.on_noshow                   = None
         self._done_appearances: list     = []
@@ -478,6 +485,18 @@ class QueueTracker:
     def _is_duplicate_of(self, bbox_a, bbox_b) -> bool:
         if self._iou(bbox_a, bbox_b) > self.DEDUP_IOU_THRESH:
             return True
+        ca = self._bbox_centre(bbox_a)
+        cb = self._bbox_centre(bbox_b)
+        centre_dist = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
+        avg_diag = max(
+            1.0,
+            (self._bbox_diagonal(bbox_a) + self._bbox_diagonal(bbox_b)) / 2,
+        )
+        if (
+            centre_dist < self.DEDUP_CENTRE_FRAC * avg_diag
+            and self._x_column_overlap(bbox_a, bbox_b) > 0.30
+        ):
+            return True
         return (self._x_column_overlap(bbox_a, bbox_b) > 0.60
                 and self._y_adjacent(bbox_a, bbox_b, gap_frac=0.6))
 
@@ -628,33 +647,40 @@ class QueueTracker:
             if cand_tid is not None and cand_tid != track_id:
                 info = self._candidates.pop(cand_tid)
                 info['bbox'] = bbox
+                info['count'] = info.get('count', 0) + 1
                 if new_sig is not None:
                     info.setdefault('sigs', []).append(new_sig)
                 info.setdefault('confs', []).append(float(person.get('conf', 0.0)))
                 cx, cy = (bbox[0] + bbox[2]) >> 1, (bbox[1] + bbox[3]) >> 1
                 info.setdefault('centers', []).append((cx, cy))
+                if len(info['centers']) > self.MOTION_HISTORY_LEN:
+                    info['centers'].pop(0)
+                if len(info['confs']) > self.MOTION_HISTORY_LEN:
+                    info['confs'].pop(0)
+                if len(info.get('sigs', [])) > 8:
+                    info['sigs'].pop(0)
                 self._candidates[track_id] = info
-                continue
-
-            cand = self._candidates.setdefault(track_id, {
-                'count': 0, 'bbox': bbox, 'sigs': [], 'centers': [], 'confs': []
-            })
-            cx, cy = (bbox[0] + bbox[2]) >> 1, (bbox[1] + bbox[3]) >> 1
-            cand['count'] += 1
-            cand['bbox']   = bbox
-            centers = cand['centers']
-            centers.append((cx, cy))
-            if len(centers) > self.MOTION_HISTORY_LEN:
-                centers.pop(0)
-            confs = cand['confs']
-            confs.append(float(person.get('conf', 0.0)))
-            if len(confs) > self.MOTION_HISTORY_LEN:
-                confs.pop(0)
-            if new_sig is not None:
-                sigs = cand['sigs']
-                sigs.append(new_sig)
-                if len(sigs) > 8:
-                    sigs.pop(0)
+                cand = info
+            else:
+                cand = self._candidates.setdefault(track_id, {
+                    'count': 0, 'bbox': bbox, 'sigs': [], 'centers': [], 'confs': []
+                })
+                cx, cy = (bbox[0] + bbox[2]) >> 1, (bbox[1] + bbox[3]) >> 1
+                cand['count'] += 1
+                cand['bbox']   = bbox
+                centers = cand['centers']
+                centers.append((cx, cy))
+                if len(centers) > self.MOTION_HISTORY_LEN:
+                    centers.pop(0)
+                confs = cand['confs']
+                confs.append(float(person.get('conf', 0.0)))
+                if len(confs) > self.MOTION_HISTORY_LEN:
+                    confs.pop(0)
+                if new_sig is not None:
+                    sigs = cand['sigs']
+                    sigs.append(new_sig)
+                    if len(sigs) > 8:
+                        sigs.pop(0)
 
             # Mid-accumulation re-entry check 
             if new_sig is not None:
@@ -769,6 +795,36 @@ class QueueTracker:
                 return True
         return False
 
+    def _append_on_the_way_notification(self, queue_number: int, when: datetime) -> dict:
+        notification = {
+            'id': f"Q{queue_number:03d}-{int(when.timestamp())}",
+            'queue_number': queue_number,
+            'queue_label': f"Q{queue_number:03d}",
+            'created_at': when.isoformat(),
+            'created_at_display': when.strftime("%I:%M:%S %p"),
+            'message': f"Q{queue_number:03d} is on the way to the queue zone.",
+        }
+        if not any(item.get('id') == notification['id'] for item in self.on_way_notifications):
+            self.on_way_notifications.append(notification)
+            self.on_way_notifications = self.on_way_notifications[-20:]
+        return notification
+
+    def record_on_the_way_signal(self, queue_number: int) -> dict:
+        notification = self._append_on_the_way_notification(queue_number, datetime.now())
+        print(f"[QueueTracker] Q{queue_number:03d} on-way signal recorded")
+        return notification
+
+    def mark_on_the_way(self, queue_number: int) -> dict | None:
+        for p in self.active_queue.values():
+            if p.queue_number == queue_number and p.status in ('waiting', 'missing'):
+                if not p.on_the_way:
+                    p.on_the_way = True
+                    p.on_the_way_at = datetime.now()
+                    self._append_on_the_way_notification(queue_number, p.on_the_way_at)
+                    print(f"[QueueTracker] Q{queue_number:03d} is on the way to queue zone")
+                return p.to_dict()
+        return None
+
 
     # TOKEN LOOKUP 
 
@@ -821,9 +877,18 @@ class QueueTracker:
                     drop_tid = tids[i] if drop is p_i else tids[j]
                     print(f"♻️  Dedup: Q{drop.queue_number:03d} is duplicate of "
                           f"Q{keep.queue_number:03d} — retiring ghost")
-                    drop.status         = 'done_pending'
-                    drop.missing_frames = self.MAX_MISSING_FRAMES + 1
+                    if drop.pdf_path:
+                        try:
+                            from services.ticket_printer import delete_ticket
+                            delete_ticket(drop.pdf_path)
+                        except Exception as e:
+                            print(f"[QueueTracker] duplicate PDF delete error "
+                                  f"Q{drop.queue_number:03d}: {e}")
                     self._used_numbers.discard(drop.queue_number)
+                    self._done_cooldowns.append({
+                        'bbox': drop.bbox,
+                        'frames_left': min(self.DONE_COOLDOWN_FRAMES, 45),
+                    })
                     to_drop.add(drop_tid)
 
         for tid in to_drop:
@@ -850,6 +915,7 @@ class QueueTracker:
             'total_served':          self.total_served,
             'completed':             self.completed_queue[-10:],
             'noshow_alerts':         self.get_noshow_alerts(),
+            'on_way_notifications':  self.on_way_notifications[-10:],
             'appearance_rejections': self.appearance_rejections[-5:],
         }
 

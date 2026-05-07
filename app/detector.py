@@ -5,7 +5,6 @@ import time
 import signal
 import threading
 import queue as _queue
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 for _stream in (sys.stdout, sys.stderr):
@@ -52,6 +51,10 @@ CAMERA_INDEX_RAW = os.getenv("CAMERA_INDEX", "auto").split("#")[0].strip()
 CAMERA_INDEX = None if CAMERA_INDEX_RAW.lower() in {"", "auto", "-1"} else int(CAMERA_INDEX_RAW)
 CAMERA_SCAN_LIMIT = int(os.getenv("CAMERA_SCAN_LIMIT", "5"))
 CAMERA_FALLBACK_SCAN = os.getenv("CAMERA_FALLBACK_SCAN", "1").strip() != "0"
+CAMERA_FPS = float(os.getenv("CAMERA_FPS", "30"))
+CAMERA_FOURCC = os.getenv("CAMERA_FOURCC", "MJPG").split("#")[0].strip().upper()
+CAMERA_READ_FAIL_LIMIT = int(os.getenv("CAMERA_READ_FAIL_LIMIT", "12"))
+CAMERA_READ_RETRY_SLEEP = float(os.getenv("CAMERA_READ_RETRY_SLEEP", "0.03"))
 CAMERA_BACKENDS = [
     name.strip().upper()
     for name in os.getenv("CAMERA_BACKENDS", "DSHOW,MSMF,ANY").split(",")
@@ -60,11 +63,16 @@ CAMERA_BACKENDS = [
 
 YOLO_EVERY    = int(os.getenv("YOLO_EVERY",    "5"))   # YOLO every Nth frame
 PUSH_EVERY    = int(os.getenv("PUSH_EVERY",    "5"))   # push every Nth YOLO frame
+API_PUSH_FPS  = float(os.getenv("API_PUSH_FPS", "5.0")) # max queue-state pushes/sec
 JPEG_QUALITY  = int(os.getenv("JPEG_QUALITY",  "70"))  # lower = faster encode
 SNAPSHOT_FPS  = float(os.getenv("SNAPSHOT_FPS", "5.0")) # dashboard video upload fps
+SNAPSHOT_UPLOAD_ENABLED = os.getenv("SNAPSHOT_UPLOAD_ENABLED", "1").strip() != "0"
 
 # Downscale factor applied to frame before YOLO + overlay (1.0 = no scaling)
 FRAME_SCALE   = float(os.getenv("FRAME_SCALE", "0.50"))
+
+# Dashboard/video snapshot scale. Keep YOLO small but stream a clearer image.
+SNAPSHOT_SCALE = float(os.getenv("SNAPSHOT_SCALE", "1.0"))
 
 # YOLO inference image size - smaller = faster, less accurate
 YOLO_IMGSZ    = int(os.getenv("YOLO_IMGSZ", "320"))
@@ -85,6 +93,8 @@ NMS_IOU_THRESH = float(os.getenv("NMS_IOU_THRESH", "0.40"))
 NMS_DIST_FRAC  = float(os.getenv("NMS_DIST_FRAC",  "0.25"))
 PUSH_TIMEOUT   = float(os.getenv("PUSH_TIMEOUT",   "5.0"))
 SNAPSHOT_TIMEOUT = float(os.getenv("SNAPSHOT_TIMEOUT", str(min(PUSH_TIMEOUT, 1.0))))
+SNAPSHOT_FAILURE_DISABLE_AFTER = int(os.getenv("SNAPSHOT_FAILURE_DISABLE_AFTER", "3"))
+SNAPSHOT_FAILURE_BACKOFF_SECONDS = float(os.getenv("SNAPSHOT_FAILURE_BACKOFF_SECONDS", "15"))
 YOLO_CONF      = float(os.getenv("YOLO_CONF",      "0.50"))
 MIN_BBOX_AREA  = int(os.getenv("MIN_BBOX_AREA",    "2000"))
 MAX_BBOX_FRAC  = float(os.getenv("MAX_BBOX_FRAC",  "0.70"))
@@ -291,11 +301,17 @@ def _snapshot_upload_worker() -> None:
     headers  = {"X-CAM-TOKEN": CAM_TOKEN, "Content-Type": "image/jpeg"}
     last_seq = -1
     errors   = 0
+    backoff_until = 0.0
 
     session = requests.Session()
     try:
         while not _shutdown.is_set():
             started = time.time()
+            now = started
+            if now < backoff_until:
+                _shutdown.wait(min(interval, backoff_until - now))
+                continue
+
             with _state_lock:
                 snap_jpg = _shared_state.get("snapshot_jpg")
                 seq      = _shared_state.get("snapshot_seq", 0)
@@ -311,9 +327,14 @@ def _snapshot_upload_worker() -> None:
                     last_seq = seq
                     errors   = 0
                 except requests.RequestException as e:
+                    last_seq = seq
                     errors += 1
                     if errors <= 5 or errors % 30 == 0:
                         print(f"[Detector] WARNING snapshot push failed ({errors}x): {e}")
+                    if errors >= SNAPSHOT_FAILURE_DISABLE_AFTER:
+                        backoff_until = time.time() + SNAPSHOT_FAILURE_BACKOFF_SECONDS
+                    else:
+                        backoff_until = time.time() + min(3.0, max(0.5, errors * 0.5))
 
             delay = interval - (time.time() - started)
             if delay > 0:
@@ -394,12 +415,15 @@ def _open_camera(index: int | None) -> cv2.VideoCapture | None:
 
                     # Force MJPEG BEFORE setting resolution - cuts USB bandwidth
                     # and avoids many USB camera read failures on Windows.
-                    cap.set(
-                        cv2.CAP_PROP_FOURCC,
-                        cv2.VideoWriter_fourcc("M", "J", "P", "G"),
-                    )
+                    if CAMERA_FOURCC:
+                        cap.set(
+                            cv2.CAP_PROP_FOURCC,
+                            cv2.VideoWriter_fourcc(*CAMERA_FOURCC[:4]),
+                        )
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    if CAMERA_FPS > 0:
+                        cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
                     if not _has_readable_frame(cap):
@@ -442,8 +466,14 @@ def _open_camera(index: int | None) -> cv2.VideoCapture | None:
 
 
 # OVERLAY DRAWING
-def _draw_queue_overlay(frame, queue_state: dict, done_pending: list,
-                        scale: float = 1.0) -> None:
+def _draw_queue_overlay(
+    frame,
+    queue_state: dict,
+    done_pending: list,
+    scale: float = 1.0,
+    bbox_scale_x: float = 1.0,
+    bbox_scale_y: float = 1.0,
+) -> None:
     if not queue_state and not done_pending:
         return
 
@@ -481,6 +511,8 @@ def _draw_queue_overlay(frame, queue_state: dict, done_pending: list,
         if not bbox or len(bbox) != 4:
             continue
         x1, y1, x2, y2 = bbox
+        x1 = int(x1 * bbox_scale_x); y1 = int(y1 * bbox_scale_y)
+        x2 = int(x2 * bbox_scale_x); y2 = int(y2 * bbox_scale_y)
         x1 = max(0, x1); y1 = max(0, y1)
         x2 = min(w-1, x2); y2 = min(h-1, y2)
 
@@ -520,6 +552,8 @@ def _draw_queue_overlay(frame, queue_state: dict, done_pending: list,
         if not bbox or len(bbox) != 4:
             continue
         x1, y1, x2, y2 = bbox
+        x1 = int(x1 * bbox_scale_x); y1 = int(y1 * bbox_scale_y)
+        x2 = int(x2 * bbox_scale_x); y2 = int(y2 * bbox_scale_y)
         x1 = max(0, x1); y1 = max(0, y1)
         x2 = min(w-1, x2); y2 = min(h-1, y2)
 
@@ -553,11 +587,16 @@ def run() -> None:
     print(f"[Detector] Camera index : {_camera_index_label(CAMERA_INDEX)}")
     print(f"[Detector] Backends     : {', '.join(CAMERA_BACKENDS)}")
     print(f"[Detector] Capture res  : {CAM_WIDTH}x{CAM_HEIGHT}")
+    print(f"[Detector] Camera FPS   : {CAMERA_FPS:g}")
+    print(f"[Detector] Camera codec : {CAMERA_FOURCC or 'default'}")
     print(f"[Detector] Frame scale  : {FRAME_SCALE}")
+    print(f"[Detector] Video scale  : {SNAPSHOT_SCALE}")
     print(f"[Detector] YOLO imgsz   : {YOLO_IMGSZ}")
     print(f"[Detector] YOLO every   : {YOLO_EVERY} frames")
     print(f"[Detector] Push every   : {PUSH_EVERY} YOLO frames")
+    print(f"[Detector] API push fps : {API_PUSH_FPS:.1f}")
     print(f"[Detector] Snapshot fps : {SNAPSHOT_FPS:.1f}")
+    print(f"[Detector] Snapshot push: {'on' if SNAPSHOT_UPLOAD_ENABLED else 'off'}")
 
     try:
         model = YOLO(MODEL_PATH)
@@ -570,8 +609,6 @@ def run() -> None:
     if cap is None:
         return
 
-    _push_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="Push")
-    _push_slots = threading.BoundedSemaphore(2)
     predictor  = PredictionService(QUEUE_CONFIG)
 
     _fallback: dict = {}
@@ -588,6 +625,8 @@ def run() -> None:
     # maxsize=1 means if YOLO is busy the capture loop drops the frame and
     # keeps reading - the camera never stalls waiting for inference.
     _yolo_queue: _queue.Queue = _queue.Queue(maxsize=1)
+    _api_push_queue: _queue.Queue = _queue.Queue(maxsize=1)
+    _snapshot_encode_queue: _queue.Queue = _queue.Queue(maxsize=1)
 
     # Latest YOLO results - written by YOLO thread, read by capture loop.
     _result_lock = threading.Lock()
@@ -597,6 +636,23 @@ def run() -> None:
     }
 
     yolo_frame_idx = [0]   # list so the closure can mutate it
+
+    def _queue_latest(target_queue: _queue.Queue, item) -> None:
+        try:
+            target_queue.put_nowait(item)
+            return
+        except _queue.Full:
+            pass
+
+        try:
+            target_queue.get_nowait()
+        except _queue.Empty:
+            pass
+
+        try:
+            target_queue.put_nowait(item)
+        except _queue.Full:
+            pass
 
     # YOLO worker thread 
     def _yolo_worker() -> None:
@@ -740,43 +796,165 @@ def run() -> None:
                         "yolo_frame_idx":       _shared_state.get("yolo_frame_idx", 0),
                         "tracked_persons":      _shared_state["tracked_persons"],
                     }
-                if _push_slots.acquire(blocking=False):
-                    def _push_latest(snapshot_payload: dict) -> None:
-                        try:
-                            _push_to_api(snapshot_payload)
-                        finally:
-                            _push_slots.release()
+                _queue_latest(_api_push_queue, payload)
 
-                    _push_pool.submit(_push_latest, payload)
+    def _api_push_worker() -> None:
+        interval = 1.0 / max(0.1, API_PUSH_FPS)
+
+        while not _shutdown.is_set():
+            started = time.time()
+            try:
+                payload = _api_push_queue.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+
+            _push_to_api(payload)
+
+            delay = interval - (time.time() - started)
+            if delay > 0:
+                _shutdown.wait(delay)
+
+    def _snapshot_encode_worker() -> None:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        while not _shutdown.is_set():
+            try:
+                frame = _snapshot_encode_queue.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+
+            if frame is None or frame.size == 0:
+                continue
+
+            if SNAPSHOT_SCALE <= 0:
+                h_orig, w_orig = frame.shape[:2]
+                overlay = cv2.resize(
+                    frame,
+                    (
+                        int(w_orig * FRAME_SCALE),
+                        int(h_orig * FRAME_SCALE),
+                    ),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                overlay_scale_x = 1.0
+                overlay_scale_y = 1.0
+                overlay_text_scale = FRAME_SCALE
+            elif abs(SNAPSHOT_SCALE - 1.0) < 0.01:
+                overlay = frame.copy()
+                overlay_scale_x = 1.0 / max(0.01, FRAME_SCALE)
+                overlay_scale_y = 1.0 / max(0.01, FRAME_SCALE)
+                overlay_text_scale = 1.0
+            else:
+                h_orig, w_orig = frame.shape[:2]
+                overlay = cv2.resize(
+                    frame,
+                    (
+                        int(w_orig * SNAPSHOT_SCALE),
+                        int(h_orig * SNAPSHOT_SCALE),
+                    ),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                overlay_scale_x = SNAPSHOT_SCALE / max(0.01, FRAME_SCALE)
+                overlay_scale_y = SNAPSHOT_SCALE / max(0.01, FRAME_SCALE)
+                overlay_text_scale = SNAPSHOT_SCALE
+
+            with _state_lock:
+                api_queue_state = _shared_state.get("api_queue_state", {})
+                done_pending    = _shared_state.get("done_pending",    [])
+                ew_display      = _shared_state.get("estimated_wait_time", 0.0)
+            with _result_lock:
+                last_count = _yolo_cache["count"]
+                last_max_d = _yolo_cache["max_d"]
+
+            _draw_queue_overlay(
+                overlay,
+                api_queue_state,
+                done_pending,
+                scale=overlay_text_scale,
+                bbox_scale_x=overlay_scale_x,
+                bbox_scale_y=overlay_scale_y,
+            )
+
+            hud_fs = max(0.28, 0.50 * overlay_text_scale)
+            text = (
+                f"Count:{last_count} Den:{last_max_d:.1f} "
+                f"Wait:{ew_display:.0f}m"
+            )
+            (tw, th), _ = cv2.getTextSize(text, font, hud_fs, 1)
+            cv2.rectangle(overlay, (4, 4), (tw + 10, th + 10), (0, 0, 0), -1)
+            cv2.putText(
+                overlay,
+                text,
+                (6, th + 6),
+                font,
+                hud_fs,
+                (0, 255, 0),
+                1,
+            )
+
+            ok_jpg, buf = cv2.imencode(
+                ".jpg",
+                overlay,
+                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+            )
+            if ok_jpg:
+                with _state_lock:
+                    _shared_state["snapshot_jpg"] = buf.tobytes()
+                    _shared_state["snapshot_seq"] += 1
 
     yolo_thread = threading.Thread(target=_yolo_worker,
                                    name="YOLOWorker", daemon=True)
     yolo_thread.start()
 
-    snapshot_thread = threading.Thread(target=_snapshot_upload_worker,
-                                       name="SnapshotUploader", daemon=True)
-    snapshot_thread.start()
+    api_push_thread = threading.Thread(
+        target=_api_push_worker,
+        name="APIPushWorker",
+        daemon=True,
+    )
+    api_push_thread.start()
+
+    snapshot_thread: threading.Thread | None = None
+    snapshot_encode_thread: threading.Thread | None = None
+    if SNAPSHOT_UPLOAD_ENABLED:
+        snapshot_encode_thread = threading.Thread(
+            target=_snapshot_encode_worker,
+            name="SnapshotEncoder",
+            daemon=True,
+        )
+        snapshot_encode_thread.start()
+        snapshot_thread = threading.Thread(target=_snapshot_upload_worker,
+                                           name="SnapshotUploader", daemon=True)
+        snapshot_thread.start()
 
     # Capture loop - never blocks on YOLO.
     frame_idx   = 0
     _fps_t0     = time.time()
     _fps_frames = 0
-    FONT        = cv2.FONT_HERSHEY_SIMPLEX
     snapshot_interval = 1.0 / max(0.1, SNAPSHOT_FPS)
     next_snapshot_at  = 0.0
+    read_failures = 0
 
     print("[Detector] Loop started - press Ctrl-C to stop")
 
     try:
         while not _shutdown.is_set():
             ok, frame = cap.read()
-            if not ok:
-                print("[Detector] WARNING frame read failed - attempting reconnect...")
+            if not ok or frame is None or frame.size == 0:
+                read_failures += 1
+                if read_failures < CAMERA_READ_FAIL_LIMIT:
+                    time.sleep(CAMERA_READ_RETRY_SLEEP)
+                    continue
+                print(
+                    "[Detector] WARNING camera returned no frames "
+                    f"({read_failures} reads) - reconnecting..."
+                )
                 cap.release()
                 cap = _open_camera(CAMERA_INDEX)
                 if cap is None:
                     break
+                read_failures = 0
                 continue
+            read_failures = 0
 
             frame_idx   += 1
             _fps_frames += 1
@@ -790,7 +968,8 @@ def run() -> None:
                 _fps_t0     = time.time()
                 _fps_frames = 0
 
-            # Downscale once - reused for YOLO queue + overlay.
+            # Downscale for YOLO only. Dashboard encoding happens in a
+            # separate worker from the original frame.
             if FRAME_SCALE < 1.0:
                 h_orig, w_orig = frame.shape[:2]
                 small = cv2.resize(
@@ -805,52 +984,36 @@ def run() -> None:
             # put_nowait() drops the frame if YOLO is still busy - this is
             # intentional; we never want the camera read to stall.
             if frame_idx % YOLO_EVERY == 0:
+                yolo_frame = small.copy()
                 try:
-                    _yolo_queue.put_nowait(small.copy())
+                    _yolo_queue.put_nowait(yolo_frame)
                 except _queue.Full:
-                    pass
+                    try:
+                        _yolo_queue.get_nowait()
+                    except _queue.Empty:
+                        pass
+                    try:
+                        _yolo_queue.put_nowait(yolo_frame)
+                    except _queue.Full:
+                        pass
 
-            # Draw + encode only at dashboard video cadence. This keeps the
-            # capture loop light while the uploader thread streams fresh JPEGs.
+            # Queue only the newest frame for dashboard video. Drawing and
+            # JPEG encoding happen outside the camera read loop.
             now = time.time()
-            if now >= next_snapshot_at:
+            if SNAPSHOT_UPLOAD_ENABLED and now >= next_snapshot_at:
                 next_snapshot_at = now + snapshot_interval
-                overlay = small.copy()
-
-                with _state_lock:
-                    api_queue_state = _shared_state.get("api_queue_state", {})
-                    done_pending    = _shared_state.get("done_pending",    [])
-                    ew_display      = _shared_state.get("estimated_wait_time", 0.0)
-                with _result_lock:
-                    last_count = _yolo_cache["count"]
-                    last_max_d = _yolo_cache["max_d"]
-
-                _draw_queue_overlay(overlay, api_queue_state, done_pending,
-                                    scale=FRAME_SCALE)
-
-                hud_fs = max(0.28, 0.50 * FRAME_SCALE)
-                text   = (f"Count:{last_count} Den:{last_max_d:.1f} "
-                          f"Wait:{ew_display:.0f}m")
-                (tw, th), _ = cv2.getTextSize(text, FONT, hud_fs, 1)
-                cv2.rectangle(overlay, (4, 4), (tw+10, th+10), (0, 0, 0), -1)
-                cv2.putText(overlay, text, (6, th+6), FONT, hud_fs, (0, 255, 0), 1)
-
-                ok_jpg, buf = cv2.imencode(
-                    ".jpg", overlay,
-                    [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
-                )
-                if ok_jpg:
-                    with _state_lock:
-                        _shared_state["snapshot_jpg"] = buf.tobytes()
-                        _shared_state["snapshot_seq"] += 1
+                _queue_latest(_snapshot_encode_queue, frame.copy())
 
     finally:
         _shutdown.set()
         print("[Detector] Releasing camera...")
         cap.release()
         _session.close()
-        _push_pool.shutdown(wait=False)
-        snapshot_thread.join(timeout=2.0)
+        if snapshot_thread is not None:
+            snapshot_thread.join(timeout=2.0)
+        if snapshot_encode_thread is not None:
+            snapshot_encode_thread.join(timeout=2.0)
+        api_push_thread.join(timeout=2.0)
         yolo_thread.join(timeout=2.0)
         print("[Detector] Stopped.")
 

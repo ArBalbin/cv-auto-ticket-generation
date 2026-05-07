@@ -28,3 +28,10 @@ data/
 
 # Generated runtime files
 app/tickets/
+
+# Logs
+*.err.log
+*.out.log
+
+# VS Code
+.vscode/

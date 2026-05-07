@@ -121,7 +121,7 @@ Ticket output note: the target deployment uses a thermal printer at the queue ar
 
 Staff registration is available at `/register` when `STAFF_REGISTRATION_ENABLED=1`. For cloud deployments, set `STAFF_REGISTRATION_CODE` so only authorized staff can create dashboard accounts.
 
-For cloud MySQL, use `database/schema_cloud_ready.sql` for a fresh database. If your database already uses the older `queue_number INT NOT NULL UNIQUE` table, run `database/migrations/001_queue_records_cloud_ready.sql` as a MySQL admin/root user.
+For cloud MySQL, use `database_sql/schema_cloud_ready.sql` for a fresh database. For a clean Aiven reset that drops and recreates all QueueFlow tables, use `database_sql/aiven_clean_full_schema.sql`.
 
 Redis caching is enabled by setting `REDIS_URL`. Ticket PDF object storage is optional and S3-compatible; enable it with `OBJECT_STORAGE_ENABLED=1` and the `OBJECT_STORAGE_*` environment variables shown in `.env.example`.
 

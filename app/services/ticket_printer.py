@@ -84,14 +84,26 @@ def validate_jwt_token(token: str) -> dict | None:
 
 
 def validate_short_code(short_code: str, queue_number: int, db_pool) -> dict | None:
+    record = get_ticket_record_by_short_code(short_code, queue_number, db_pool)
+    if not record or record.get("status") != "waiting":
+        return None
+    return record.get("jwt_payload")
+
+
+def get_ticket_record_by_short_code(
+    short_code: str,
+    queue_number: int,
+    db_pool,
+) -> dict | None:
     try:
         conn   = db_pool.get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "SELECT jwt_token FROM queue_records "
+            "SELECT id, queue_number, short_code, jwt_token, status, "
+            "created_at, served_at, expires_at "
+            "FROM queue_records "
             "WHERE short_code = %s "
             "AND queue_number = %s "
-            "AND status = 'waiting' "
             "AND (expires_at IS NULL OR expires_at > NOW()) "
             "ORDER BY created_at DESC, id DESC "
             "LIMIT 1",
@@ -103,7 +115,11 @@ def validate_short_code(short_code: str, queue_number: int, db_pool) -> dict | N
         if not row:
             print("[JWT] Short code not found or queue number mismatch")
             return None
-        return validate_jwt_token(row["jwt_token"])
+        payload = validate_jwt_token(row["jwt_token"])
+        if not payload:
+            return None
+        row["jwt_payload"] = payload
+        return row
     except Exception as e:
         print(f"[JWT] DB error during validation: {e}")
         return None

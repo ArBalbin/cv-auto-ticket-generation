@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from core.config import (
     OBJECT_STORAGE_ACCESS_KEY_ID,
@@ -76,6 +77,44 @@ def _object_url(key: str) -> str:
     return f"s3://{OBJECT_STORAGE_BUCKET}/{key}"
 
 
+def _key_from_reference(reference: str) -> str | None:
+    reference = (reference or "").strip()
+    if not reference:
+        return None
+
+    if reference.startswith("s3://"):
+        parsed = urlparse(reference)
+        if parsed.netloc == OBJECT_STORAGE_BUCKET:
+            return unquote(parsed.path.lstrip("/")) or None
+        return None
+
+    if not reference.startswith(("http://", "https://")):
+        normalized = reference.replace("\\", "/").lstrip("/")
+        if normalized.startswith(f"{OBJECT_STORAGE_PREFIX}/"):
+            return normalized
+        return None
+
+    parsed = urlparse(reference)
+    path = unquote(parsed.path).lstrip("/")
+
+    public_base = OBJECT_STORAGE_PUBLIC_BASE_URL.rstrip("/")
+    if public_base and reference.startswith(f"{public_base}/"):
+        return reference[len(public_base) + 1:].split("?", 1)[0].lstrip("/") or None
+
+    endpoint = OBJECT_STORAGE_ENDPOINT_URL.rstrip("/")
+    if endpoint and reference.startswith(f"{endpoint}/{OBJECT_STORAGE_BUCKET}/"):
+        key = reference[len(f"{endpoint}/{OBJECT_STORAGE_BUCKET}/"):].split("?", 1)[0]
+        return unquote(key).lstrip("/") or None
+
+    segments = [segment for segment in path.split("/") if segment]
+    if OBJECT_STORAGE_BUCKET in segments:
+        bucket_index = segments.index(OBJECT_STORAGE_BUCKET)
+        key = "/".join(segments[bucket_index + 1:])
+        return key or None
+
+    return None
+
+
 def upload_ticket_pdf(pdf_path: str, queue_number: int) -> dict | None:
     c = client()
     if c is None:
@@ -107,3 +146,22 @@ def upload_ticket_pdf(pdf_path: str, queue_number: int) -> dict | None:
     url = _object_url(key)
     print(f"[ObjectStorage] Ticket uploaded: {url}")
     return {"storage_key": key, "storage_url": url}
+
+
+def delete_ticket_object(reference: str) -> bool:
+    key = _key_from_reference(reference)
+    if not key:
+        return False
+
+    c = client()
+    if c is None:
+        return False
+
+    try:
+        c.delete_object(Bucket=OBJECT_STORAGE_BUCKET, Key=key)
+    except (BotoCoreError, ClientError) as exc:
+        print(f"[ObjectStorage] Ticket delete failed: {exc}")
+        return False
+
+    print(f"[ObjectStorage] Ticket deleted: {key}")
+    return True

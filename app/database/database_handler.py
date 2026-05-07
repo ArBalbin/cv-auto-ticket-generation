@@ -10,6 +10,7 @@ from core.config import (
     DB_SSL_MODE,
     DB_USERNAME,
 )
+from services import object_storage_service
 
 
 db_pool = None
@@ -19,6 +20,7 @@ _mysql_connector = None
 _mysql_errors = None
 _mysql_pooling = None
 _table_columns_cache: dict[str, set[str]] = {}
+_table_exists_cache: dict[str, bool] = {}
 
 
 def _load_mysql():
@@ -163,6 +165,188 @@ def _get_table_columns(cursor, table_name: str) -> set[str]:
     return columns
 
 
+def _table_exists(cursor, table_name: str) -> bool:
+    cached = _table_exists_cache.get(table_name)
+    if cached is not None:
+        return cached
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS table_count
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+        """,
+        (table_name,),
+    )
+    row = cursor.fetchone()
+    if isinstance(row, dict):
+        exists = bool(row.get("table_count"))
+    else:
+        exists = bool(row and row[0])
+
+    _table_exists_cache[table_name] = exists
+    return exists
+
+
+def _row_value(row, key: str, index: int = 0):
+    if isinstance(row, dict):
+        return row.get(key)
+    if row is None:
+        return None
+    return row[index]
+
+
+def _lookup_user_id(cursor, username: str | None) -> int | None:
+    username = (username or "").strip()
+    if not username or not _table_exists(cursor, "users"):
+        return None
+
+    cursor.execute(
+        "SELECT id FROM users WHERE username=%s LIMIT 1",
+        (username,),
+    )
+    row = cursor.fetchone()
+    value = _row_value(row, "id")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_queue_record_id(cursor, queue_number: int) -> int | None:
+    if not _table_exists(cursor, "queue_records"):
+        return None
+
+    cursor.execute(
+        """
+        SELECT id
+        FROM queue_records
+        WHERE queue_number=%s
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (queue_number,),
+    )
+    row = cursor.fetchone()
+    value = _row_value(row, "id")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_waiting_queue_records(limit: int = 100) -> list[dict]:
+    pool = _ensure_db_pool()
+    if pool is None:
+        return []
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if not _table_exists(cursor, "queue_records"):
+            return []
+
+        columns = _get_table_columns(cursor, "queue_records")
+        fields = [
+            "id",
+            "queue_number",
+            "status",
+            "created_at",
+            "expires_at",
+            "served_at",
+        ]
+        for optional in ("service_date", "short_code", "pdf_path"):
+            if optional in columns:
+                fields.append(optional)
+
+        where = ["status='waiting'"]
+        if "service_date" in columns:
+            where.append("service_date=CURDATE()")
+        else:
+            where.append("created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)")
+
+        cursor.execute(
+            f"""
+            SELECT {', '.join(fields)}
+            FROM queue_records
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at ASC, id ASC
+            LIMIT %s
+            """,
+            (max(1, min(500, int(limit))),),
+        )
+        return list(cursor.fetchall() or [])
+    except Exception as exc:
+        if _is_pool_exhausted(exc):
+            print("[DB] Pool exhausted - waiting ticket list unavailable")
+        else:
+            print(f"[DB] Error loading waiting tickets: {exc}")
+        return []
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def _queue_record_context(cursor, queue_record_id: int | None, queue_number: int | None):
+    if not queue_record_id:
+        return None, queue_number
+
+    columns = _get_table_columns(cursor, "queue_records")
+    fields = ["queue_number"]
+    if "service_date" in columns:
+        fields.insert(0, "service_date")
+
+    cursor.execute(
+        f"SELECT {', '.join(fields)} FROM queue_records WHERE id=%s LIMIT 1",
+        (queue_record_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, queue_number
+
+    service_date = _row_value(row, "service_date", 0) if "service_date" in columns else None
+    q_index = 1 if "service_date" in columns else 0
+    stored_queue_number = _row_value(row, "queue_number", q_index)
+    return service_date, stored_queue_number or queue_number
+
+
+def _insert_queue_event(
+    cursor,
+    event_type: str,
+    queue_record_id: int | None = None,
+    queue_number: int | None = None,
+    actor_user_id: int | None = None,
+    event_note: str | None = None,
+) -> None:
+    if event_type not in {"created", "served", "no_show", "expired", "reset"}:
+        return
+    if not _table_exists(cursor, "queue_events"):
+        return
+
+    service_date, stored_queue_number = _queue_record_context(
+        cursor,
+        queue_record_id,
+        queue_number,
+    )
+    cursor.execute(
+        """
+        INSERT INTO queue_events
+            (queue_record_id, service_date, queue_number, event_type,
+             actor_user_id, event_note, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+        """,
+        (
+            queue_record_id,
+            service_date,
+            stored_queue_number,
+            event_type,
+            actor_user_id,
+            event_note,
+        ),
+    )
+
+
 def save_ticket_record(ticket: dict) -> bool:
     pool = _ensure_db_pool()
     if pool is None:
@@ -174,6 +358,7 @@ def save_ticket_record(ticket: dict) -> bool:
         conn = pool.get_connection()
         cursor = conn.cursor()
         columns = _get_table_columns(cursor, "queue_records")
+        record_id = None
         if "service_date" in columns:
             cursor.execute(
                 """
@@ -190,6 +375,7 @@ def save_ticket_record(ticket: dict) -> bool:
                     ticket["expires_at"],
                 ),
             )
+            record_id = cursor.lastrowid
         else:
             cursor.execute(
                 """
@@ -212,6 +398,17 @@ def save_ticket_record(ticket: dict) -> bool:
                     ticket["expires_at"],
                 ),
             )
+            record_id = cursor.lastrowid or _latest_queue_record_id(
+                cursor,
+                ticket["queue_number"],
+            )
+        _insert_queue_event(
+            cursor,
+            event_type="created",
+            queue_record_id=record_id,
+            queue_number=ticket["queue_number"],
+            event_note="Ticket generated by detector",
+        )
         conn.commit()
         print(f"[TicketWorker] Q{ticket['queue_number']:03d} saved to DB")
         return True
@@ -228,7 +425,15 @@ def save_ticket_record(ticket: dict) -> bool:
     return False
 
 
-def update_queue_status(queue_number: int, status: str) -> None:
+def update_queue_status(
+    queue_number: int,
+    status: str,
+    actor_username: str | None = None,
+) -> None:
+    if status not in {"served", "no_show", "expired"}:
+        print(f"[DB] Ignored unsupported status '{status}' for Q{queue_number:03d}")
+        return
+
     pool = _ensure_db_pool()
     if pool is None:
         print(f"[DB] No pool - Q{queue_number:03d} status not persisted")
@@ -238,15 +443,53 @@ def update_queue_status(queue_number: int, status: str) -> None:
     try:
         conn = pool.get_connection()
         cursor = conn.cursor()
+        columns = _get_table_columns(cursor, "queue_records")
+        actor_user_id = _lookup_user_id(cursor, actor_username)
+
         cursor.execute(
-            "UPDATE queue_records SET status=%s, served_at=NOW() "
-            "WHERE queue_number=%s AND status='waiting' "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
-            (status, queue_number),
+            """
+            SELECT id, pdf_path
+            FROM queue_records
+            WHERE queue_number=%s AND status='waiting'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (queue_number,),
+        )
+        row = cursor.fetchone()
+        record_id = _row_value(row, "id")
+        pdf_path = _row_value(row, "pdf_path", 1)
+        if not record_id:
+            conn.commit()
+            print(f"[DB] Q{queue_number:03d} status='{status}' had no waiting DB row")
+            return
+
+        set_parts = ["status=%s", "served_at=NOW()"]
+        params = [status]
+        if status == "served" and "served_by_user_id" in columns:
+            set_parts.append("served_by_user_id=%s")
+            params.append(actor_user_id)
+        params.append(record_id)
+
+        cursor.execute(
+            f"UPDATE queue_records SET {', '.join(set_parts)} WHERE id=%s",
+            tuple(params),
+        )
+        updated_rows = cursor.rowcount
+        _insert_queue_event(
+            cursor,
+            event_type=status,
+            queue_record_id=int(record_id),
+            queue_number=queue_number,
+            actor_user_id=actor_user_id,
+            event_note=f"Queue marked {status}",
         )
         conn.commit()
-        if cursor.rowcount:
+        if updated_rows:
             print(f"[DB] Q{queue_number:03d} status='{status}' persisted")
+            if status == "served" and pdf_path:
+                object_storage_service.delete_ticket_object(str(pdf_path))
         else:
             print(f"[DB] Q{queue_number:03d} status='{status}' had no waiting DB row")
     except Exception as exc:
@@ -254,5 +497,70 @@ def update_queue_status(queue_number: int, status: str) -> None:
             print(f"[DB] Pool exhausted - Q{queue_number:03d} status not updated")
         else:
             print(f"[DB] Error updating Q{queue_number:03d}: {exc}")
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def record_queue_reset(actor_username: str | None = None) -> None:
+    pool = _ensure_db_pool()
+    if pool is None:
+        return
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        actor_user_id = _lookup_user_id(cursor, actor_username)
+        _insert_queue_event(
+            cursor,
+            event_type="reset",
+            actor_user_id=actor_user_id,
+            event_note="Queue reset by staff",
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[DB] Error recording queue reset: {exc}")
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def record_counter_config_change(
+    old_counters: int | None,
+    new_counters: int,
+    avg_service_time: float,
+    actor_username: str | None = None,
+) -> None:
+    if old_counters == new_counters:
+        return
+
+    pool = _ensure_db_pool()
+    if pool is None:
+        return
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        if not _table_exists(cursor, "counter_config_history"):
+            return
+        actor_user_id = _lookup_user_id(cursor, actor_username)
+        cursor.execute(
+            """
+            INSERT INTO counter_config_history
+                (old_counters, new_counters, avg_service_time,
+                 changed_by_user_id, created_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            """,
+            (
+                old_counters,
+                new_counters,
+                avg_service_time,
+                actor_user_id,
+            ),
+        )
+        conn.commit()
+        print(f"[DB] Counter config change persisted: {old_counters} -> {new_counters}")
+    except Exception as exc:
+        print(f"[DB] Error recording counter config change: {exc}")
     finally:
         close_db_resources(cursor, conn)

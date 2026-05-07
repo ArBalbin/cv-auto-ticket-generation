@@ -243,6 +243,29 @@
       background: var(--red-soft);
       color: var(--red);
     }
+    .signal-box {
+      display: none;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      border: 1px solid #fbbf24;
+      border-radius: 8px;
+      background: var(--amber-soft);
+      color: var(--amber);
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .signal-box span {
+      display: inline-block;
+      margin-right: 10px;
+      color: var(--ink);
+    }
+    .signal-box.is-active {
+      animation: signalPulse 1.2s ease-in-out 2;
+    }
+    @keyframes signalPulse {
+      0% { box-shadow: 0 0 0 0 rgba(180, 83, 9, .35); }
+      100% { box-shadow: 0 0 0 10px rgba(180, 83, 9, 0); }
+    }
     @media (max-width: 960px) {
       header {
         align-items: flex-start;
@@ -292,6 +315,7 @@
     </section>
 
     <div id="errorBox" class="error-box"></div>
+    <div id="onWayBox" class="signal-box"></div>
 
     <section class="metric-grid">
       <div class="metric">
@@ -333,6 +357,7 @@
               <th>Queue</th>
               <th>Position</th>
               <th>Status</th>
+              <th>Customer Signal</th>
               <th>Waiting</th>
               <th>Predicted Start</th>
               <th>Action</th>
@@ -348,6 +373,7 @@
   <script>
     const els = {
       errorBox: document.getElementById("errorBox"),
+      onWayBox: document.getElementById("onWayBox"),
       queueNow: document.getElementById("queueNow"),
       queueNote: document.getElementById("queueNote"),
       nextNumber: document.getElementById("nextNumber"),
@@ -368,6 +394,9 @@
 
     let currentCounters = 1;
     let adjustingCounters = false;
+    let hasLoadedOnce = false;
+    const seenOnWayNotifications = new Set();
+    let audioContext = null;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -409,11 +438,14 @@
       els.activeRows.innerHTML = rows.map((row) => {
         const queueNumber = number(row.queue_number, 0);
         const label = row.queue_label || queueLabel(queueNumber);
+        const onWay = row.on_the_way === true;
+        const onWayAt = row.on_the_way_at_display || "";
         return `
           <tr>
             <td>${escapeHtml(label)}</td>
             <td>${escapeHtml(row.position || row.position_in_line || "-")}</td>
             <td><span class="badge ${escapeHtml(row.status)}">${escapeHtml(row.status || "waiting")}</span></td>
+            <td>${onWay ? `<span class="badge missing">On the way</span> ${escapeHtml(onWayAt)}` : "-"}</td>
             <td>${escapeHtml(row.wait_time || "-")}</td>
             <td>${escapeHtml(row.estimated_wait_time_label || "-")}</td>
             <td>
@@ -422,6 +454,95 @@
           </tr>
         `;
       }).join("");
+    }
+
+    function unlockAudio() {
+      if (audioContext !== null) {
+        return;
+      }
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) {
+        return;
+      }
+      audioContext = new AudioCtx();
+      if (audioContext.state === "suspended") {
+        audioContext.resume().catch(() => {});
+      }
+    }
+
+    function playSignalTone() {
+      unlockAudio();
+      if (!audioContext) {
+        return;
+      }
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.value = 880;
+      gain.gain.setValueAtTime(0.001, audioContext.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.12, audioContext.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.35);
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+      oscillator.start();
+      oscillator.stop(audioContext.currentTime + 0.38);
+    }
+
+    function requestNotificationPermission() {
+      if (!("Notification" in window) || Notification.permission !== "default") {
+        return;
+      }
+      Notification.requestPermission().catch(() => {});
+    }
+
+    function notifyStaffSignal(signal) {
+      const label = signal.queue_label || queueLabel(signal.queue_number);
+      playSignalTone();
+      els.onWayBox.classList.remove("is-active");
+      window.requestAnimationFrame(() => els.onWayBox.classList.add("is-active"));
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification("QueueFlow customer signal", {
+          body: `${label} is on the way to the queue zone.`,
+        });
+      }
+    }
+
+    function signalFromRow(row) {
+      const label = row.queue_label || queueLabel(row.queue_number);
+      const time = row.on_the_way_at_display || "";
+      return {
+        id: `${label}-${row.on_the_way_at || time || "active"}`,
+        queue_number: row.queue_number,
+        queue_label: label,
+        created_at_display: time,
+        message: `${label} is on the way to the queue zone.`,
+      };
+    }
+
+    function renderOnWaySignals(rows, notifications = []) {
+      const rowSignals = rows
+        .filter((row) => row.on_the_way === true)
+        .map(signalFromRow);
+      const signals = notifications.length ? notifications : rowSignals;
+      if (!signals.length) {
+        els.onWayBox.style.display = "none";
+        els.onWayBox.innerHTML = "";
+        return;
+      }
+      els.onWayBox.style.display = "block";
+      els.onWayBox.innerHTML = signals.map((signal) => {
+        const label = signal.queue_label || queueLabel(signal.queue_number);
+        const time = signal.created_at_display ? ` at ${signal.created_at_display}` : "";
+        return `<span>${escapeHtml(label)}</span> is on the way to the queue zone${escapeHtml(time)}.`;
+      }).join("<br>");
+
+      for (const signal of signals) {
+        const id = signal.id || `${signal.queue_label}-${signal.created_at_display || ""}`;
+        if (hasLoadedOnce && !seenOnWayNotifications.has(id)) {
+          notifyStaffSignal(signal);
+        }
+        seenOnWayNotifications.add(id);
+      }
     }
 
     function render(data) {
@@ -440,7 +561,9 @@
       els.updatedAt.textContent = data.generated_at
         ? `Updated ${new Date(data.generated_at).toLocaleTimeString()}`
         : "Updated just now";
+      renderOnWaySignals(rows, data.on_way_notifications || []);
       renderRows(rows);
+      hasLoadedOnce = true;
     }
 
     async function requestJson(url, options = {}) {
@@ -469,10 +592,19 @@
         const data = await requestJson("/api/queue/analytics");
         if (data) {
           render(data);
+          loadOnWayNotifications().catch(() => {});
         }
       } catch (error) {
         showError(error.message || "Unable to load queue data.");
       }
+    }
+
+    async function loadOnWayNotifications() {
+      const data = await requestJson("/api/queue/on_way_notifications");
+      if (!data) {
+        return;
+      }
+      renderOnWaySignals(data.active_queue || [], data.notifications || []);
     }
 
     async function adjustCounters(delta) {
@@ -530,6 +662,10 @@
     els.counterPlus.addEventListener("click", () => adjustCounters(1));
     els.refreshBtn.addEventListener("click", loadQueue);
     els.resetBtn.addEventListener("click", resetQueue);
+    document.addEventListener("click", () => {
+      unlockAudio();
+      requestNotificationPermission();
+    }, {once: true});
     els.activeRows.addEventListener("click", (event) => {
       const button = event.target.closest("[data-done]");
       if (button) {
@@ -539,6 +675,9 @@
 
     loadQueue();
     setInterval(loadQueue, 2500);
+    setInterval(() => {
+      loadOnWayNotifications().catch(() => {});
+    }, 1500);
   </script>
 </body>
 </html>

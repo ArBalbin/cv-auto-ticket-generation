@@ -4,6 +4,7 @@ from collections import deque
 
 from core.config import (
     CACHE_HISTORY_TTL_SECONDS,
+    CACHE_SNAPSHOT_MIN_INTERVAL_SECONDS,
     CACHE_SNAPSHOT_TTL_SECONDS,
     CACHE_STATE_TTL_SECONDS,
     HISTORY_LEN,
@@ -32,6 +33,10 @@ latest_state = {
 
 latest_snapshot: bytes | None = None
 latest_snapshot_seq = 0
+latest_snapshot_cache_write_at = 0.0
+_snapshot_cache_lock = threading.Lock()
+_snapshot_cache_pending: tuple[bytes, int] | None = None
+_snapshot_cache_writer_running = False
 snapshot_cond = threading.Condition()
 history: deque = deque(maxlen=HISTORY_LEN)
 
@@ -39,6 +44,44 @@ _STATE_CACHE_KEY = "state:latest"
 _HISTORY_CACHE_KEY = "history:recent"
 _SNAPSHOT_CACHE_KEY = "snapshot:latest"
 _SNAPSHOT_SEQ_CACHE_KEY = "snapshot:seq"
+_cache_write_lock = threading.Lock()
+_cache_write_pending: dict[str, tuple[object, int]] = {}
+_cache_write_worker_running = False
+
+
+def _schedule_json_cache_write(name: str, value: object, ttl_seconds: int) -> None:
+    global _cache_write_worker_running
+
+    with _cache_write_lock:
+        _cache_write_pending[name] = (value, ttl_seconds)
+        if _cache_write_worker_running:
+            return
+        _cache_write_worker_running = True
+
+    threading.Thread(
+        target=_json_cache_writer,
+        name="StateCacheWriter",
+        daemon=True,
+    ).start()
+
+
+def _json_cache_writer() -> None:
+    global _cache_write_worker_running
+
+    while True:
+        with _cache_write_lock:
+            pending = dict(_cache_write_pending)
+            _cache_write_pending.clear()
+
+        if not pending:
+            with _cache_write_lock:
+                if not _cache_write_pending:
+                    _cache_write_worker_running = False
+                    return
+                continue
+
+        for name, (value, ttl_seconds) in pending.items():
+            cache_service.set_json(name, value, ttl_seconds)
 
 
 def update_from_detector_payload(body: dict) -> None:
@@ -67,12 +110,12 @@ def update_from_detector_payload(body: dict) -> None:
         state_snapshot = dict(latest_state)
         history_snapshot = list(history)
 
-    cache_service.set_json(
+    _schedule_json_cache_write(
         _STATE_CACHE_KEY,
         state_snapshot,
         CACHE_STATE_TTL_SECONDS,
     )
-    cache_service.set_json(
+    _schedule_json_cache_write(
         _HISTORY_CACHE_KEY,
         history_snapshot,
         CACHE_HISTORY_TTL_SECONDS,
@@ -84,7 +127,7 @@ def set_active_counters(counters: int) -> None:
         latest_state["active_counters"] = counters
         state_snapshot = dict(latest_state)
 
-    cache_service.set_json(
+    _schedule_json_cache_write(
         _STATE_CACHE_KEY,
         state_snapshot,
         CACHE_STATE_TTL_SECONDS,
@@ -92,12 +135,55 @@ def set_active_counters(counters: int) -> None:
 
 
 def set_snapshot(snapshot: bytes) -> None:
-    global latest_snapshot, latest_snapshot_seq
+    global latest_snapshot, latest_snapshot_cache_write_at, latest_snapshot_seq
     with snapshot_cond:
         latest_snapshot = snapshot
         latest_snapshot_seq += 1
         seq = latest_snapshot_seq
         snapshot_cond.notify_all()
+    now = time.time()
+    if now - latest_snapshot_cache_write_at < CACHE_SNAPSHOT_MIN_INTERVAL_SECONDS:
+        return
+    latest_snapshot_cache_write_at = now
+    _schedule_snapshot_cache_write(snapshot, seq)
+
+
+def _schedule_snapshot_cache_write(snapshot: bytes, seq: int) -> None:
+    global _snapshot_cache_pending, _snapshot_cache_writer_running
+
+    with _snapshot_cache_lock:
+        _snapshot_cache_pending = (snapshot, seq)
+        if _snapshot_cache_writer_running:
+            return
+        _snapshot_cache_writer_running = True
+
+    threading.Thread(
+        target=_snapshot_cache_writer,
+        name="SnapshotCacheWriter",
+        daemon=True,
+    ).start()
+
+
+def _snapshot_cache_writer() -> None:
+    global _snapshot_cache_pending, _snapshot_cache_writer_running
+
+    while True:
+        with _snapshot_cache_lock:
+            pending = _snapshot_cache_pending
+            _snapshot_cache_pending = None
+
+        if pending is None:
+            with _snapshot_cache_lock:
+                if _snapshot_cache_pending is None:
+                    _snapshot_cache_writer_running = False
+                    return
+                continue
+
+        snapshot, seq = pending
+        _write_snapshot_cache(snapshot, seq)
+
+
+def _write_snapshot_cache(snapshot: bytes, seq: int) -> None:
     cache_service.set_bytes(
         _SNAPSHOT_CACHE_KEY,
         snapshot,
@@ -111,17 +197,21 @@ def set_snapshot(snapshot: bytes) -> None:
 
 
 def get_snapshot() -> bytes | None:
+    if latest_snapshot is not None:
+        return latest_snapshot
     cached = cache_service.get_bytes(_SNAPSHOT_CACHE_KEY)
     if cached is not None:
         return cached
-    return latest_snapshot
+    return None
 
 
 def get_snapshot_seq() -> int:
+    if latest_snapshot_seq:
+        return latest_snapshot_seq
     cached = cache_service.get_json(_SNAPSHOT_SEQ_CACHE_KEY)
     if isinstance(cached, int):
         return cached
-    return latest_snapshot_seq
+    return 0
 
 
 def has_snapshot() -> bool:
@@ -165,17 +255,22 @@ def full_data() -> dict:
 
 
 def history_data() -> dict:
+    with state_lock:
+        history_snapshot = list(history)
+    if history_snapshot:
+        return {"history": history_snapshot}
     cached = cache_service.get_json(_HISTORY_CACHE_KEY)
     if isinstance(cached, list):
         return {"history": cached}
-    with state_lock:
-        return {"history": list(history)}
+    return {"history": history_snapshot}
 
 
 def _latest_state_data() -> dict:
-    cached = cache_service.get_json(_STATE_CACHE_KEY)
     with state_lock:
         data = dict(latest_state)
+    if time.time() - float(data.get("timestamp") or 0) <= CACHE_STATE_TTL_SECONDS:
+        return data
+    cached = cache_service.get_json(_STATE_CACHE_KEY)
     if isinstance(cached, dict):
         data.update(cached)
     return data

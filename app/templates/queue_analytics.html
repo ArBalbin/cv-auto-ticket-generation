@@ -379,6 +379,24 @@
       margin-bottom: 14px;
     }
 
+    .signal-box {
+      display: none;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      border: 1px solid #fbbf24;
+      border-radius: 8px;
+      background: var(--amber-soft);
+      color: var(--amber);
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .signal-box span {
+      display: inline-block;
+      margin-right: 10px;
+      color: var(--ink);
+    }
+
     @media (max-width: 960px) {
       header {
         align-items: flex-start;
@@ -440,6 +458,7 @@
     </section>
 
     <div id="errorBox" class="error-box"></div>
+    <div id="onWayBox" class="signal-box"></div>
 
     <section class="metric-grid">
       <div class="metric">
@@ -563,6 +582,7 @@
       statusDot: document.getElementById("statusDot"),
       statusText: document.getElementById("statusText"),
       errorBox: document.getElementById("errorBox"),
+      onWayBox: document.getElementById("onWayBox"),
       queueNow: document.getElementById("queueNow"),
       queueNote: document.getElementById("queueNote"),
       avgWait: document.getElementById("avgWait"),
@@ -591,6 +611,8 @@
 
     let currentCounters = 0;
     let adjustingCounters = false;
+    let hasLoadedOnce = false;
+    const seenOnWayNotifications = new Set();
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -701,6 +723,39 @@
       `).join("");
     }
 
+    function queueLabel(value) {
+      return `Q${String(number(value, 1)).padStart(3, "0")}`;
+    }
+
+    function renderOnWaySignals(notifications = []) {
+      if (!notifications.length) {
+        els.onWayBox.style.display = "none";
+        els.onWayBox.innerHTML = "";
+        return;
+      }
+
+      els.onWayBox.style.display = "block";
+      els.onWayBox.innerHTML = notifications.map((signal) => {
+        const label = signal.queue_label || queueLabel(signal.queue_number);
+        const time = signal.created_at_display ? ` at ${signal.created_at_display}` : "";
+        return `<span>${escapeHtml(label)}</span> is on the way to the queue zone${escapeHtml(time)}.`;
+      }).join("<br>");
+
+      for (const signal of notifications) {
+        const id = signal.id || `${signal.queue_label}-${signal.created_at_display || ""}`;
+        if (hasLoadedOnce && !seenOnWayNotifications.has(id)) {
+          els.onWayBox.animate(
+            [
+              {boxShadow: "0 0 0 0 rgba(180, 83, 9, .35)"},
+              {boxShadow: "0 0 0 10px rgba(180, 83, 9, 0)"},
+            ],
+            {duration: 1200, iterations: 2},
+          );
+        }
+        seenOnWayNotifications.add(id);
+      }
+    }
+
     function render(data) {
       const overview = data.overview || {};
       const waits = data.wait_times || {};
@@ -724,6 +779,8 @@
       renderActive(data.active_queue || []);
       renderCompleted(data.recent_completed || []);
       renderAlerts(data.noshow_alerts || []);
+      renderOnWaySignals(data.on_way_notifications || []);
+      hasLoadedOnce = true;
     }
 
     async function adjustCounters(delta) {
@@ -782,6 +839,7 @@
           throw new Error(`Request failed with ${response.status}`);
         }
         render(await response.json());
+        loadOnWayNotifications().catch(() => {});
       } catch (error) {
         els.statusDot.classList.add("error");
         els.statusText.textContent = "Disconnected";
@@ -790,11 +848,30 @@
       }
     }
 
+    async function loadOnWayNotifications() {
+      const response = await fetch("/api/queue/on_way_notifications", {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (response.status === 401 || response.status === 403) {
+        window.location.href = "/login";
+        return;
+      }
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json();
+      renderOnWaySignals(data.notifications || []);
+    }
+
     els.counterMinus.addEventListener("click", () => adjustCounters(-1));
     els.counterPlus.addEventListener("click", () => adjustCounters(1));
 
     loadAnalytics();
     setInterval(loadAnalytics, 2500);
+    setInterval(() => {
+      loadOnWayNotifications().catch(() => {});
+    }, 1500);
   </script>
 </body>
 </html>

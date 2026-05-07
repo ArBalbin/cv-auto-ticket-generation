@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS queue_records (
     short_code   VARCHAR(10)   DEFAULT NULL,
     jwt_token    TEXT          DEFAULT NULL,
     pdf_path     VARCHAR(512)  DEFAULT NULL,
+    created_by_user_id INT     DEFAULT NULL,
+    served_by_user_id  INT     DEFAULT NULL,
     status       ENUM('waiting','served','no_show','expired')
                                NOT NULL DEFAULT 'waiting',
     expires_at   DATETIME      DEFAULT NULL,
@@ -36,7 +38,51 @@ CREATE TABLE IF NOT EXISTS queue_records (
     INDEX idx_short_code (short_code),
     INDEX idx_status (status),
     INDEX idx_expires_at (expires_at),
-    INDEX idx_queue_status_created (queue_number, status, created_at)
+    INDEX idx_queue_status_created (queue_number, status, created_at),
+    INDEX idx_created_by_user_id (created_by_user_id),
+    INDEX idx_served_by_user_id (served_by_user_id),
+    CONSTRAINT fk_queue_records_created_by
+        FOREIGN KEY (created_by_user_id) REFERENCES users(id)
+        ON DELETE SET NULL,
+    CONSTRAINT fk_queue_records_served_by
+        FOREIGN KEY (served_by_user_id) REFERENCES users(id)
+        ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS queue_events (
+    id              INT          AUTO_INCREMENT PRIMARY KEY,
+    queue_record_id INT          DEFAULT NULL,
+    service_date    DATE         DEFAULT NULL,
+    queue_number    INT          DEFAULT NULL,
+    event_type      ENUM('created','served','no_show','expired','reset')
+                                NOT NULL,
+    actor_user_id   INT          DEFAULT NULL,
+    event_note      VARCHAR(255) DEFAULT NULL,
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_queue_record_id (queue_record_id),
+    INDEX idx_queue_number_created (queue_number, created_at),
+    INDEX idx_event_type_created (event_type, created_at),
+    INDEX idx_actor_user_id (actor_user_id),
+    CONSTRAINT fk_queue_events_record
+        FOREIGN KEY (queue_record_id) REFERENCES queue_records(id)
+        ON DELETE SET NULL,
+    CONSTRAINT fk_queue_events_actor
+        FOREIGN KEY (actor_user_id) REFERENCES users(id)
+        ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS counter_config_history (
+    id                 INT       AUTO_INCREMENT PRIMARY KEY,
+    old_counters       INT       DEFAULT NULL,
+    new_counters       INT       NOT NULL,
+    avg_service_time   FLOAT     NOT NULL DEFAULT 3.0,
+    changed_by_user_id INT       DEFAULT NULL,
+    created_at         DATETIME  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_created_at (created_at),
+    INDEX idx_changed_by_user_id (changed_by_user_id),
+    CONSTRAINT fk_counter_config_actor
+        FOREIGN KEY (changed_by_user_id) REFERENCES users(id)
+        ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS crowd_snapshots (

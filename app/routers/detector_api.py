@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends
 
 import state
 from core.security import verify_cam_token
@@ -13,8 +13,7 @@ router = APIRouter()
     summary="Detector pushes crowd + queue metadata",
     tags=["Detector"],
 )
-async def push_frame(request: Request, _=Depends(verify_cam_token)):
-    body = await request.json()
+def push_frame(body: dict = Body(...), _=Depends(verify_cam_token)):
     state.update_from_detector_payload(body)
 
     queue_state = queue_service.process_tracked_persons(
@@ -35,6 +34,9 @@ async def push_frame(request: Request, _=Depends(verify_cam_token)):
     summary="Detector pushes annotated JPEG snapshot",
     tags=["Detector"],
 )
-async def push_snapshot(request: Request, _=Depends(verify_cam_token)):
-    state.set_snapshot(await request.body())
+def push_snapshot(
+    snapshot: bytes = Body(..., media_type="image/jpeg"),
+    _=Depends(verify_cam_token),
+):
+    state.set_snapshot(snapshot)
     return {"ok": True}

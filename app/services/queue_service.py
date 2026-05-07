@@ -10,12 +10,26 @@ from core.config import (
     API_MIN_BBOX_AREA,
     LOW_CONF_BOOST,
     QUEUE_CONFIG,
+    QUEUE_DEDUP_CENTRE_FRAC,
+    QUEUE_DEDUP_IOU_THRESH,
+    QUEUE_MAX_MISSING_FRAMES,
+    QUEUE_MIN_CONFIRM_FRAMES,
     QUEUE_MIN_MOTION_PIXELS,
     QUEUE_MIN_PORTRAIT_ASPECT,
+    QUEUE_NOSHOW_WINDOW_SECONDS,
+    QUEUE_RECENCY_SINGLE_MATCH_SECONDS,
+    QUEUE_REMAP_ABSENT_FRAMES,
+    QUEUE_REMAP_DIST_THRESH,
+    QUEUE_REMAP_IOU_THRESH,
     QUEUE_STATIC_CONF_BYPASS,
     QUEUE_STATIC_STDEV_THRESHOLD,
 )
-from database.database_handler import update_queue_status
+from database.database_handler import (
+    fetch_waiting_queue_records,
+    record_counter_config_change,
+    record_queue_reset,
+    update_queue_status,
+)
 from services.queue_tracker import QueueTracker, QueueZone
 from services import ticket_service
 from services.ticket_printer import delete_all_tickets
@@ -24,9 +38,9 @@ from services.ticket_printer import delete_all_tickets
 queue_zone = QueueZone(x1=10, y1=10, x2=1910, y2=1070)
 queue_tracker = QueueTracker(zone=queue_zone)
 
-_REMAP_IOU_THRESH = 0.15
-_REMAP_DIST_THRESH = 120
-_MAX_REMAP_ABSENT_FRAMES = 18
+_REMAP_IOU_THRESH = QUEUE_REMAP_IOU_THRESH
+_REMAP_DIST_THRESH = QUEUE_REMAP_DIST_THRESH
+_MAX_REMAP_ABSENT_FRAMES = QUEUE_REMAP_ABSENT_FRAMES
 _config_lock = threading.Lock()
 
 
@@ -61,16 +75,18 @@ def _on_noshow(queue_number: int) -> None:
 def wire_callbacks() -> None:
     queue_tracker.on_new_person = _on_new_person
     queue_tracker.on_noshow = _on_noshow
-    queue_tracker.MAX_MISSING_FRAMES = 150
-    queue_tracker.MIN_CONFIRM_FRAMES = 8
+    queue_tracker.MAX_MISSING_FRAMES = QUEUE_MAX_MISSING_FRAMES
+    queue_tracker.MIN_CONFIRM_FRAMES = QUEUE_MIN_CONFIRM_FRAMES
     queue_tracker.MIN_MOTION_PIXELS = QUEUE_MIN_MOTION_PIXELS
     queue_tracker.STATIC_STDEV_THRESHOLD = QUEUE_STATIC_STDEV_THRESHOLD
     queue_tracker.STATIC_CONF_BYPASS_THRESHOLD = QUEUE_STATIC_CONF_BYPASS
     queue_tracker.MIN_PORTRAIT_ASPECT = QUEUE_MIN_PORTRAIT_ASPECT
     queue_tracker.APPEARANCE_TIEBREAK_THRESHOLD = 0.20
     queue_tracker.DONE_BLACKLIST_THRESH = 0.55
-    queue_tracker.NOSHOW_WINDOW_SECONDS = 180
-    queue_tracker.RECENCY_SINGLE_MATCH_SECONDS = 20
+    queue_tracker.NOSHOW_WINDOW_SECONDS = QUEUE_NOSHOW_WINDOW_SECONDS
+    queue_tracker.RECENCY_SINGLE_MATCH_SECONDS = QUEUE_RECENCY_SINGLE_MATCH_SECONDS
+    queue_tracker.DEDUP_IOU_THRESH = QUEUE_DEDUP_IOU_THRESH
+    queue_tracker.DEDUP_CENTRE_FRAC = QUEUE_DEDUP_CENTRE_FRAC
 
 
 def _bbox_iou(a: tuple, b: tuple) -> float:
@@ -225,6 +241,7 @@ def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
                 "track_id": p["track_id"],
                 "bbox": tuple(p["bbox"]),
                 "conf": p.get("conf", 0.0),
+                "appearance": p.get("appearance"),
             }
             for p in tracked_filtered
         ]
@@ -252,25 +269,78 @@ def done_pending_people() -> list:
     ]
 
 
-def reset_queue() -> None:
+def is_queue_number_active(queue_number: int) -> bool:
+    return any(
+        p.queue_number == queue_number and p.status in ("waiting", "missing")
+        for p in queue_tracker.active_queue.values()
+    )
+
+
+def reset_queue(actor_username: str | None = None) -> None:
     global queue_tracker
     deleted = delete_all_tickets()
     print(f"[Reset] Deleted {deleted} ticket PDF(s)")
     queue_tracker = QueueTracker(zone=queue_zone)
     wire_callbacks()
+    threading.Thread(
+        target=record_queue_reset,
+        args=(actor_username,),
+        daemon=True,
+        name="DBAudit-queue-reset",
+    ).start()
 
 
-def mark_done(queue_number: int) -> dict | None:
+def mark_done(queue_number: int, actor_username: str | None = None) -> dict | None:
     if not queue_tracker.mark_transaction_done(queue_number):
         return None
 
     threading.Thread(
         target=update_queue_status,
-        args=(queue_number, "served"),
+        args=(queue_number, "served", actor_username),
         daemon=True,
         name=f"DBUpdate-Q{queue_number:03d}-served",
     ).start()
     return queue_tracker.get_state()
+
+
+def mark_on_the_way(queue_number: int) -> dict | None:
+    return queue_tracker.mark_on_the_way(queue_number)
+
+
+def record_on_the_way_signal(queue_number: int) -> dict:
+    return queue_tracker.record_on_the_way_signal(queue_number)
+
+
+def on_way_notification_state() -> dict:
+    queue_state = queue_tracker.get_state()
+    active_queue = queue_state.get("active_queue", [])
+    notifications = list(queue_state.get("on_way_notifications", []))
+    notification_ids = {item.get("id") for item in notifications}
+
+    for person in active_queue:
+        if person.get("on_the_way") is not True:
+            continue
+        queue_number = as_int(person.get("queue_number"), 0)
+        queue_label = person.get("queue_label") or f"Q{queue_number:03d}"
+        notification_id = (
+            f"{queue_label}-{person.get('on_the_way_at') or 'active'}"
+        )
+        if notification_id in notification_ids:
+            continue
+        notifications.append({
+            "id": notification_id,
+            "queue_number": queue_number,
+            "queue_label": queue_label,
+            "created_at": person.get("on_the_way_at"),
+            "created_at_display": person.get("on_the_way_at_display"),
+            "message": f"{queue_label} is on the way to the queue zone.",
+        })
+        notification_ids.add(notification_id)
+
+    return {
+        "notifications": notifications[-20:],
+        "active_queue": active_queue,
+    }
 
 
 def zone_dict() -> dict:
@@ -310,9 +380,13 @@ def runtime_config() -> dict:
     }
 
 
-def set_active_counters(counters: int) -> dict:
+def set_active_counters(
+    counters: int,
+    actor_username: str | None = None,
+) -> dict:
     counters = max(1, as_int(counters, QUEUE_CONFIG["num_counters"]))
     with _config_lock:
+        old_counters = max(1, as_int(QUEUE_CONFIG.get("num_counters"), 3))
         QUEUE_CONFIG["num_counters"] = counters
         avg_service_time = max(
             0.1,
@@ -320,6 +394,12 @@ def set_active_counters(counters: int) -> dict:
         )
 
     state.set_active_counters(counters)
+    threading.Thread(
+        target=record_counter_config_change,
+        args=(old_counters, counters, avg_service_time, actor_username),
+        daemon=True,
+        name="DBAudit-counter-config",
+    ).start()
     return {
         "active_counters": counters,
         "avg_service_time": avg_service_time,
@@ -338,6 +418,17 @@ def format_minutes(minutes: float) -> str:
     if mins == 0:
         return f"{hours} hr" if hours == 1 else f"{hours} hrs"
     return f"{hours} hr {mins} min" if hours == 1 else f"{hours} hrs {mins} min"
+
+
+def format_seconds(seconds: int) -> str:
+    seconds = max(0, as_int(seconds, 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remaining = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {remaining}s" if remaining else f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
 
 
 def eta_iso(wait_minutes: float) -> str:
@@ -375,6 +466,141 @@ def prediction_for_position(
     }
 
 
+def _as_datetime(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def ticket_record_status_response(record: dict) -> dict:
+    queue_number = as_int(record.get("queue_number"), 0)
+    status = str(record.get("status") or "expired")
+    created_at = _as_datetime(record.get("created_at")) or datetime.now()
+    ended_at = _as_datetime(record.get("served_at")) or datetime.now()
+    wait_seconds = max(0, int((ended_at - created_at).total_seconds()))
+    config = runtime_config()
+
+    messages = {
+        "served": "Your queue ticket is done. Please exit the queue area.",
+        "no_show": "Your queue ticket was marked as no-show. Please contact staff if you still need service.",
+        "expired": "Your queue ticket has expired. Please get a new ticket if you still need service.",
+    }
+
+    return {
+        "queue_number": queue_number,
+        "queue_label": f"Q{queue_number:03d}",
+        "status": status,
+        "position_in_line": 0,
+        "wait_time": format_seconds(wait_seconds),
+        "wait_time_seconds": wait_seconds,
+        "joined_at": created_at.strftime("%I:%M:%S %p"),
+        "joined_at_full": created_at.strftime("%b %d, %Y %I:%M:%S %p"),
+        "joined_at_iso": created_at.isoformat(),
+        "completed_at": ended_at.strftime("%I:%M:%S %p"),
+        "completed_at_full": ended_at.strftime("%b %d, %Y %I:%M:%S %p"),
+        "completed_at_iso": ended_at.isoformat(),
+        "noshow_warning": False,
+        "noshow_countdown": None,
+        "message": messages.get(status, "This queue ticket is no longer active."),
+        "prediction": prediction_for_position(
+            0,
+            config["avg_service_time"],
+            config["active_counters"],
+        ),
+    }
+
+
+def ticket_record_waiting_response(record: dict) -> dict:
+    queue_number = as_int(record.get("queue_number"), 0)
+    created_at = _as_datetime(record.get("created_at")) or datetime.now()
+    wait_seconds = max(0, int((datetime.now() - created_at).total_seconds()))
+    config = runtime_config()
+
+    return {
+        "queue_number": queue_number,
+        "queue_label": f"Q{queue_number:03d}",
+        "status": "waiting",
+        "position_in_line": 0,
+        "wait_time": format_seconds(wait_seconds),
+        "wait_time_seconds": wait_seconds,
+        "joined_at": created_at.strftime("%I:%M:%S %p"),
+        "joined_at_full": created_at.strftime("%b %d, %Y %I:%M:%S %p"),
+        "joined_at_iso": created_at.isoformat(),
+        "noshow_warning": False,
+        "noshow_countdown": None,
+        "message": (
+            "Your ticket is still active, but you are not currently visible "
+            "in the live queue. Please return to the queue zone and ask staff "
+            "if your number is not shown."
+        ),
+        "prediction": prediction_for_position(
+            0,
+            config["avg_service_time"],
+            config["active_counters"],
+        ),
+    }
+
+
+def _active_ticket_numbers() -> set[int]:
+    return {
+        p.queue_number
+        for p in queue_tracker.active_queue.values()
+        if p.status in ("waiting", "missing")
+    }
+
+
+def _fallback_person_from_ticket(record: dict, position: int) -> dict:
+    queue_number = as_int(record.get("queue_number"), 0)
+    created_at = _as_datetime(record.get("created_at")) or datetime.now()
+    wait_seconds = max(0, int((datetime.now() - created_at).total_seconds()))
+    return {
+        "queue_number": queue_number,
+        "queue_label": f"Q{queue_number:03d}",
+        "status": "missing",
+        "position_in_line": position,
+        "position": position,
+        "wait_time": format_seconds(wait_seconds),
+        "wait_time_seconds": wait_seconds,
+        "joined_at": created_at.strftime("%I:%M:%S %p"),
+        "joined_at_full": created_at.strftime("%b %d, %Y %I:%M:%S %p"),
+        "joined_at_iso": created_at.isoformat(),
+        "on_the_way": False,
+        "on_the_way_at": None,
+        "on_the_way_at_display": None,
+        "source": "database_waiting_ticket",
+        "message": (
+            "Ticket is still waiting in the database, but the person is not "
+            "currently visible to the detector."
+        ),
+    }
+
+
+def live_or_db_active_queue() -> list[dict]:
+    queue_state = queue_tracker.get_state()
+    active = list(queue_state.get("active_queue", []))
+    seen_numbers = {as_int(person.get("queue_number"), 0) for person in active}
+
+    for record in fetch_waiting_queue_records():
+        queue_number = as_int(record.get("queue_number"), 0)
+        if not queue_number or queue_number in seen_numbers:
+            continue
+        active.append(_fallback_person_from_ticket(record, len(active) + 1))
+        seen_numbers.add(queue_number)
+
+    active.sort(key=lambda person: as_int(person.get("queue_number"), 0))
+    for index, person in enumerate(active, start=1):
+        if as_int(person.get("position_in_line"), 0) <= 0:
+            person["position_in_line"] = index
+        if as_int(person.get("position"), 0) <= 0:
+            person["position"] = person["position_in_line"]
+    return active
+
+
 def build_queue_prediction() -> dict:
     with state.state_lock:
         metrics = {
@@ -388,8 +614,7 @@ def build_queue_prediction() -> dict:
             "predicted_wait_30min": state.latest_state["predicted_wait_30min"],
         }
 
-    queue_state = queue_tracker.get_state()
-    active_queue = queue_state.get("active_queue", [])
+    active_queue = live_or_db_active_queue()
     queue_count = len(active_queue)
     config = runtime_config()
     counters = config["active_counters"]
@@ -541,7 +766,7 @@ def _analytics_recommendation(
 def build_queue_analytics() -> dict:
     prediction = build_queue_prediction()
     queue_state = queue_tracker.get_state()
-    active_queue = queue_state.get("active_queue", [])
+    active_queue = live_or_db_active_queue()
     completed_all = list(queue_tracker.completed_queue)
     recent_completed = completed_all[-10:]
 
@@ -690,6 +915,7 @@ def build_queue_analytics() -> dict:
             for record in reversed(recent_completed)
         ],
         "noshow_alerts": noshow_alerts,
+        "on_way_notifications": queue_state.get("on_way_notifications", []),
         "appearance_rejections": queue_state.get("appearance_rejections", []),
         "zone": zone_dict(),
         "recommendation": _analytics_recommendation(
