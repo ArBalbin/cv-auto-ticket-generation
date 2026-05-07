@@ -1,0 +1,800 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Queue Analytics | QueueFlow</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --ink: #1f2937;
+      --muted: #667085;
+      --line: #e5e7eb;
+      --brand: #2563eb;
+      --brand-soft: #eff6ff;
+      --teal: #0f766e;
+      --teal-soft: #ecfdf5;
+      --amber: #b45309;
+      --amber-soft: #fffbeb;
+      --red: #b42318;
+      --red-soft: #fef3f2;
+      --green: #027a48;
+      --green-soft: #ecfdf3;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    header {
+      min-height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 32px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--brand);
+      white-space: nowrap;
+    }
+
+    nav {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    nav a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 14px;
+      padding: 8px 10px;
+      border-radius: 6px;
+    }
+
+    nav a.active {
+      color: var(--brand);
+      background: var(--brand-soft);
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 28px auto 40px;
+    }
+
+    .topline {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.2;
+    }
+
+    .subtle {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 14px;
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+
+    .dot.stale { background: var(--amber); }
+    .dot.error { background: var(--red); }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      min-height: 116px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-bottom: 12px;
+    }
+
+    .metric-value {
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .metric-note {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .counter-control {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .counter-button {
+      width: 32px;
+      height: 32px;
+      border: 1px solid #bfdbfe;
+      border-radius: 6px;
+      background: var(--brand-soft);
+      color: var(--brand);
+      font-size: 20px;
+      font-weight: 700;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .counter-button:disabled {
+      cursor: not-allowed;
+      opacity: .45;
+    }
+
+    .counter-value {
+      min-width: 28px;
+      text-align: center;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(320px, .65fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .panel-body {
+      padding: 18px;
+    }
+
+    .stack {
+      display: grid;
+      gap: 14px;
+    }
+
+    .recommendation {
+      padding: 14px 16px;
+      border: 1px solid #bfdbfe;
+      border-radius: 8px;
+      background: var(--brand-soft);
+      color: #1e3a8a;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .bar-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .bar-row {
+      display: grid;
+      grid-template-columns: 64px minmax(0, 1fr) 54px;
+      gap: 10px;
+      align-items: center;
+      font-size: 13px;
+    }
+
+    .bar-row strong {
+      text-align: right;
+      font-size: 13px;
+    }
+
+    .bar-track {
+      height: 12px;
+      border-radius: 999px;
+      background: #eef2f7;
+      overflow: hidden;
+    }
+
+    .bar {
+      height: 100%;
+      min-width: 2px;
+      border-radius: inherit;
+      background: var(--brand);
+    }
+
+    .bar.teal { background: var(--teal); }
+    .bar.amber { background: var(--amber); }
+
+    .breakdown {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .mini-stat {
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fafafa;
+    }
+
+    .mini-stat span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+
+    .mini-stat strong {
+      display: block;
+      font-size: 20px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 680px;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      font-size: 14px;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      background: #fafafa;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .badge {
+      display: inline-flex;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--green-soft);
+      color: var(--green);
+      font-size: 12px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .badge.missing,
+    .badge.no-show {
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .badge.served {
+      background: var(--brand-soft);
+      color: var(--brand);
+    }
+
+    .empty {
+      padding: 20px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 14px;
+    }
+
+    .alert-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .alert {
+      padding: 12px;
+      border: 1px solid #fedf89;
+      border-radius: 8px;
+      background: var(--amber-soft);
+      color: var(--amber);
+      font-size: 14px;
+    }
+
+    .error-box {
+      padding: 14px 16px;
+      border: 1px solid #fecdca;
+      border-radius: 8px;
+      background: var(--red-soft);
+      color: var(--red);
+      display: none;
+      margin-bottom: 14px;
+    }
+
+    @media (max-width: 960px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 18px;
+      }
+
+      nav {
+        justify-content: flex-start;
+      }
+
+      .topline {
+        flex-direction: column;
+      }
+
+      .metric-grid,
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .metric-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .breakdown {
+        grid-template-columns: 1fr;
+      }
+
+      .bar-row {
+        grid-template-columns: 54px minmax(0, 1fr) 46px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">QueueFlow</div>
+    <nav>
+      <a href="/dashboard/computer-vision">Computer Vision</a>
+      <a href="/dashboard/queueflow">QueueFlow</a>
+      <a class="active" href="/dashboard/queue-analytics">Analytics</a>
+      <a href="/dashboard/profile">Profile</a>
+      <a href="/logout">Logout</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="topline">
+      <div>
+        <h1>Queue Analytics</h1>
+        <div class="subtle">Live queue performance, wait forecasts, and no-show signals.</div>
+      </div>
+      <div class="status-pill">
+        <span id="statusDot" class="dot"></span>
+        <span id="statusText">Connecting</span>
+      </div>
+    </section>
+
+    <div id="errorBox" class="error-box"></div>
+
+    <section class="metric-grid">
+      <div class="metric">
+        <div class="metric-label">Queue Now</div>
+        <div id="queueNow" class="metric-value">0</div>
+        <div id="queueNote" class="metric-note">waiting people</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Average Active Wait</div>
+        <div id="avgWait" class="metric-value">0 min</div>
+        <div id="maxWait" class="metric-note">max 0 min</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">New Arrival Wait</div>
+        <div id="newWait" class="metric-value">0 min</div>
+        <div id="counterNote" class="metric-note">0 counters active</div>
+        <div class="counter-control" aria-label="Active counters">
+          <button id="counterMinus" class="counter-button" type="button" aria-label="Decrease active counters">-</button>
+          <span id="counterValue" class="counter-value">0</span>
+          <button id="counterPlus" class="counter-button" type="button" aria-label="Increase active counters">+</button>
+        </div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">No-show Rate</div>
+        <div id="noshowRate" class="metric-value">0%</div>
+        <div id="servedNote" class="metric-note">0 completed</div>
+      </div>
+    </section>
+
+    <section class="layout">
+      <div class="stack">
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Wait Forecast</h2>
+            <span id="updatedAt" class="subtle">Waiting for data</span>
+          </div>
+          <div class="panel-body">
+            <div id="recommendation" class="recommendation">Loading queue analytics...</div>
+            <div id="forecastBars" class="bar-list" style="margin-top: 16px;"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Active Queue</h2>
+            <span id="activeCount" class="subtle">0 people</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Queue</th>
+                  <th>Position</th>
+                  <th>Status</th>
+                  <th>Waiting</th>
+                  <th>Predicted Start</th>
+                </tr>
+              </thead>
+              <tbody id="activeRows"></tbody>
+            </table>
+            <div id="activeEmpty" class="empty">No active queue right now.</div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Recent Completed</h2>
+            <span id="completedCount" class="subtle">0 records</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Queue</th>
+                  <th>Result</th>
+                  <th>Total Wait</th>
+                  <th>Completed At</th>
+                </tr>
+              </thead>
+              <tbody id="completedRows"></tbody>
+            </table>
+            <div id="completedEmpty" class="empty">No completed queue records yet.</div>
+          </div>
+        </section>
+      </div>
+
+      <aside class="stack">
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Breakdown</h2>
+          </div>
+          <div class="panel-body">
+            <div id="breakdownStats" class="breakdown"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Wait Bands</h2>
+          </div>
+          <div class="panel-body">
+            <div id="waitBands" class="bar-list"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">No-show Alerts</h2>
+          </div>
+          <div class="panel-body">
+            <div id="alertList" class="alert-list"></div>
+            <div id="alertEmpty" class="empty">No no-show alerts.</div>
+          </div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <script>
+    const els = {
+      statusDot: document.getElementById("statusDot"),
+      statusText: document.getElementById("statusText"),
+      errorBox: document.getElementById("errorBox"),
+      queueNow: document.getElementById("queueNow"),
+      queueNote: document.getElementById("queueNote"),
+      avgWait: document.getElementById("avgWait"),
+      maxWait: document.getElementById("maxWait"),
+      newWait: document.getElementById("newWait"),
+      counterNote: document.getElementById("counterNote"),
+      counterMinus: document.getElementById("counterMinus"),
+      counterValue: document.getElementById("counterValue"),
+      counterPlus: document.getElementById("counterPlus"),
+      noshowRate: document.getElementById("noshowRate"),
+      servedNote: document.getElementById("servedNote"),
+      updatedAt: document.getElementById("updatedAt"),
+      recommendation: document.getElementById("recommendation"),
+      forecastBars: document.getElementById("forecastBars"),
+      activeRows: document.getElementById("activeRows"),
+      activeEmpty: document.getElementById("activeEmpty"),
+      activeCount: document.getElementById("activeCount"),
+      completedRows: document.getElementById("completedRows"),
+      completedEmpty: document.getElementById("completedEmpty"),
+      completedCount: document.getElementById("completedCount"),
+      breakdownStats: document.getElementById("breakdownStats"),
+      waitBands: document.getElementById("waitBands"),
+      alertList: document.getElementById("alertList"),
+      alertEmpty: document.getElementById("alertEmpty"),
+    };
+
+    let currentCounters = 0;
+    let adjustingCounters = false;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    function number(value, fallback = 0) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    function oneDecimal(value) {
+      const parsed = number(value);
+      return parsed % 1 === 0 ? String(parsed.toFixed(0)) : String(parsed.toFixed(1));
+    }
+
+    function counterLabel(count) {
+      return `${count} ${count === 1 ? "counter" : "counters"} active`;
+    }
+
+    function syncCounterControls(count) {
+      currentCounters = Math.max(1, Math.min(10, Math.trunc(number(count, 1))));
+      els.counterNote.textContent = counterLabel(currentCounters);
+      els.counterValue.textContent = currentCounters;
+      els.counterMinus.disabled = adjustingCounters || currentCounters <= 1;
+      els.counterPlus.disabled = adjustingCounters || currentCounters >= 10;
+    }
+
+    function setStatus(status, generatedAt) {
+      els.statusDot.classList.remove("stale", "error");
+      if (status === "stale") {
+        els.statusDot.classList.add("stale");
+        els.statusText.textContent = "Stale detector data";
+      } else {
+        els.statusText.textContent = "Live";
+      }
+      if (generatedAt) {
+        els.updatedAt.textContent = `Updated ${new Date(generatedAt).toLocaleTimeString()}`;
+      }
+    }
+
+    function renderBars(target, items, valueKey, barClass = "") {
+      const max = Math.max(1, ...items.map((item) => number(item[valueKey])));
+      target.innerHTML = items.map((item) => {
+        const value = number(item[valueKey]);
+        const width = Math.max(2, Math.min(100, (value / max) * 100));
+        return `
+          <div class="bar-row">
+            <span>${escapeHtml(item.label)}</span>
+            <div class="bar-track">
+              <div class="bar ${barClass}" style="width: ${width}%"></div>
+            </div>
+            <strong>${oneDecimal(value)}</strong>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderBreakdown(items) {
+      els.breakdownStats.innerHTML = items.map((item) => `
+        <div class="mini-stat">
+          <span>${escapeHtml(item.label)}</span>
+          <strong>${escapeHtml(item.count)}</strong>
+        </div>
+      `).join("");
+    }
+
+    function renderActive(rows) {
+      els.activeCount.textContent = `${rows.length} ${rows.length === 1 ? "person" : "people"}`;
+      els.activeEmpty.style.display = rows.length ? "none" : "block";
+      els.activeRows.innerHTML = rows.map((row) => `
+        <tr>
+          <td>${escapeHtml(row.queue_label || `Q${String(row.queue_number).padStart(3, "0")}`)}</td>
+          <td>${escapeHtml(row.position || row.position_in_line || "-")}</td>
+          <td><span class="badge ${escapeHtml(row.status)}">${escapeHtml(row.status || "waiting")}</span></td>
+          <td>${escapeHtml(row.wait_time || "-")}</td>
+          <td>${escapeHtml(row.estimated_wait_time_label || "-")}</td>
+        </tr>
+      `).join("");
+    }
+
+    function renderCompleted(rows) {
+      els.completedCount.textContent = `${rows.length} ${rows.length === 1 ? "record" : "records"}`;
+      els.completedEmpty.style.display = rows.length ? "none" : "block";
+      els.completedRows.innerHTML = rows.map((row) => {
+        const reason = row.bump_reason || "served";
+        return `
+          <tr>
+            <td>${escapeHtml(row.queue_label || row.queue_number || "-")}</td>
+            <td><span class="badge ${reason === "no_show" ? "no-show" : "served"}">${escapeHtml(reason.replace("_", " "))}</span></td>
+            <td>${escapeHtml(row.total_wait_time || row.wait_time || "-")}</td>
+            <td>${escapeHtml(row.completed_at || "-")}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function renderAlerts(alerts) {
+      els.alertEmpty.style.display = alerts.length ? "none" : "block";
+      els.alertList.innerHTML = alerts.map((alert) => `
+        <div class="alert">
+          ${escapeHtml(alert.queue_number)} has ${escapeHtml(alert.seconds_remaining)}s before no-show bump.
+        </div>
+      `).join("");
+    }
+
+    function render(data) {
+      const overview = data.overview || {};
+      const waits = data.wait_times || {};
+      const charts = data.charts || {};
+
+      setStatus(overview.data_status, data.generated_at);
+      els.errorBox.style.display = "none";
+      els.queueNow.textContent = overview.queue_length ?? 0;
+      els.queueNote.textContent = `${overview.waiting ?? 0} waiting, ${overview.missing ?? 0} missing`;
+      els.avgWait.textContent = waits.active_average_wait_label || "0 min";
+      els.maxWait.textContent = `max ${waits.active_max_wait_label || "0 min"}`;
+      els.newWait.textContent = data.new_arrival?.estimated_wait_time_label || "0 min";
+      syncCounterControls(overview.active_counters ?? 1);
+      els.noshowRate.textContent = `${oneDecimal(overview.no_show_rate_percent)}%`;
+      els.servedNote.textContent = `${overview.total_completed ?? 0} completed`;
+      els.recommendation.textContent = data.recommendation || "Queue analytics loaded.";
+
+      renderBars(els.forecastBars, charts.forecast_wait || [], "wait_minutes", "");
+      renderBreakdown(charts.status_breakdown || []);
+      renderBars(els.waitBands, charts.wait_bands || [], "count", "teal");
+      renderActive(data.active_queue || []);
+      renderCompleted(data.recent_completed || []);
+      renderAlerts(data.noshow_alerts || []);
+    }
+
+    async function adjustCounters(delta) {
+      if (adjustingCounters) {
+        return;
+      }
+
+      const nextCounters = Math.max(1, Math.min(10, currentCounters + delta));
+      if (nextCounters === currentCounters) {
+        syncCounterControls(currentCounters);
+        return;
+      }
+
+      adjustingCounters = true;
+      syncCounterControls(currentCounters);
+
+      try {
+        const response = await fetch("/api/queue/adjust_counters", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {"Content-Type": "application/json"},
+          cache: "no-store",
+          body: JSON.stringify({counters: nextCounters}),
+        });
+        if (response.status === 401 || response.status === 403) {
+          window.location.href = "/login";
+          return;
+        }
+        if (!response.ok) {
+          const detail = await response.json().catch(() => ({}));
+          throw new Error(detail.detail || `Request failed with ${response.status}`);
+        }
+        const result = await response.json();
+        syncCounterControls(result.counters ?? nextCounters);
+        await loadAnalytics();
+      } catch (error) {
+        els.errorBox.textContent = error.message || "Unable to update active counters.";
+        els.errorBox.style.display = "block";
+      } finally {
+        adjustingCounters = false;
+        syncCounterControls(currentCounters);
+      }
+    }
+
+    async function loadAnalytics() {
+      try {
+        const response = await fetch("/api/queue/analytics", {
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        if (response.status === 401 || response.status === 403) {
+          window.location.href = "/login";
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`Request failed with ${response.status}`);
+        }
+        render(await response.json());
+      } catch (error) {
+        els.statusDot.classList.add("error");
+        els.statusText.textContent = "Disconnected";
+        els.errorBox.textContent = "Unable to load queue analytics. Make sure the API is running.";
+        els.errorBox.style.display = "block";
+      }
+    }
+
+    els.counterMinus.addEventListener("click", () => adjustCounters(-1));
+    els.counterPlus.addEventListener("click", () => adjustCounters(1));
+
+    loadAnalytics();
+    setInterval(loadAnalytics, 2500);
+  </script>
+</body>
+</html>

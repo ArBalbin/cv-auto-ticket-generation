@@ -1,21 +1,4 @@
-# app/prediction_service.py
-"""
-Prediction Service
-==================
-All wait-time prediction logic for the QueueFlow dashboard.
-
-Three forecast horizons — each uses a genuinely different model:
-
-  SHORT-TERM  (5–15 min)  — M/M/c baseline + linear trend projection
-  MEDIUM-TERM (15–30 min) — Holt's double exponential smoothing (damped)
-  LONG-TERM   (1–4 hours) — Growth-ratio extrapolation + mean-reversion
-
-Also owns:
-  - density calculation
-  - arrival rate calculation
-  - the shared historical deques
-  - update_queue_metrics() — called once per video frame
-"""
+# app/services/prediction_service.py
 
 import time
 import numpy as np
@@ -28,22 +11,12 @@ historical_timestamps: deque = deque(maxlen=60)
 
 
 class PredictionService:
-    """
-    Stateless prediction helpers — all data comes from the shared deques above.
-
-    Instantiate once and pass your QUEUE_CONFIG dict:
-        predictor = PredictionService(QUEUE_CONFIG)
-
-    Then call:
-        metrics = predictor.update(count, current_data, data_lock)
-    """
 
     def __init__(self, queue_config: dict):
         self.cfg = queue_config
 
-    # =========================================================================
+    
     # DENSITY
-    # =========================================================================
 
     def calculate_density(self, persons: list, width: int, height: int,
                           grid=(3, 3)) -> tuple[float, float]:
@@ -62,9 +35,9 @@ class PredictionService:
             counts[r, c] += 1
         return float(np.mean(counts)), float(np.max(counts))
 
-    # =========================================================================
+    
     # ARRIVAL RATE
-    # =========================================================================
+    
 
     def calculate_arrival_rate(self) -> float:
         """
@@ -78,9 +51,8 @@ class PredictionService:
         dt = (historical_timestamps[-1] - historical_timestamps[-n]) / 60.0
         return max(0.0, (counts[-1] - counts[-n]) / dt) if dt > 0 else 0.0
 
-    # =========================================================================
+    
     # M/M/c BASELINE
-    # =========================================================================
 
     def mmch_wait(self, arrival_rate: float, service_rate: float,
                   num_counters: int, queue: int) -> float:
@@ -98,9 +70,9 @@ class PredictionService:
             return queue * avg_svc / nc
         return max(0.0, (queue / max(arrival_rate, 0.1)) + avg_svc)
 
-    # =========================================================================
+    
     # TREND SLOPE (shared utility)
-    # =========================================================================
+    
 
     def _trend_slope(self) -> float:
         """
@@ -128,9 +100,9 @@ class PredictionService:
         elapsed = times[-1] - times[-n - 1]
         return n / elapsed if elapsed > 0 else 15.0
 
-    # =========================================================================
+    
     # SHORT-TERM  (5–15 min)
-    # =========================================================================
+    
 
     def predict_short_term(self, base_wait: float, slope: float,
                            nc: int) -> float:
@@ -153,9 +125,9 @@ class PredictionService:
             return max(1.0, projected_queue * avg_svc / max(nc, 1))
         return max(1.0, (projected_queue / max(arrival, 0.1)) + avg_svc)
 
-    # =========================================================================
+    
     # MEDIUM-TERM  (15–30 min)
-    # =========================================================================
+    
 
     def predict_medium_term(self, base_wait: float, slope: float,
                             nc: int) -> float:
@@ -191,9 +163,8 @@ class PredictionService:
             return max(1.0, forecast_queue * avg_svc / max(nc, 1))
         return max(1.0, (forecast_queue / max(arrival, 0.1)) + avg_svc)
 
-    # =========================================================================
-    # LONG-TERM  (1–4 hours)
-    # =========================================================================
+    
+    # LONG-TERM  (1–4 hours
 
     def predict_long_term(self, base_wait: float, slope: float,
                           nc: int) -> float:
@@ -224,10 +195,9 @@ class PredictionService:
             raw = (long_queue / max(arrival, 0.1)) + avg_svc
 
         return max(1.0, min(raw, 60.0))
-
-    # =========================================================================
+    
     # MAIN UPDATE — called once per video frame
-    # =========================================================================
+
 
     def update(self, count: int, current_data: dict, data_lock) -> None:
         """

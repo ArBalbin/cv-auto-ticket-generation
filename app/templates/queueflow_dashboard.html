@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QueueFlow Dashboard | QueueFlow</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --ink: #1f2937;
+      --muted: #667085;
+      --line: #e5e7eb;
+      --brand: #2563eb;
+      --brand-soft: #eff6ff;
+      --green: #027a48;
+      --green-soft: #ecfdf3;
+      --amber: #b45309;
+      --amber-soft: #fffbeb;
+      --red: #b42318;
+      --red-soft: #fef3f2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    header {
+      min-height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 32px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    .brand {
+      color: var(--brand);
+      font-size: 18px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    nav {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    nav a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 14px;
+      padding: 8px 10px;
+      border-radius: 6px;
+    }
+    nav a.active {
+      color: var(--brand);
+      background: var(--brand-soft);
+    }
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 28px auto 40px;
+    }
+    .topline {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.2;
+    }
+    .subtle {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--ink);
+      padding: 8px 12px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary {
+      border-color: var(--brand);
+      background: var(--brand);
+      color: #ffffff;
+    }
+    button.danger {
+      border-color: #fecdca;
+      background: var(--red-soft);
+      color: var(--red);
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: .45;
+    }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .metric {
+      min-height: 116px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-bottom: 12px;
+    }
+    .metric-value {
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .metric-note {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .counter-control {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .counter-control button {
+      width: 32px;
+      height: 32px;
+      min-height: 32px;
+      padding: 0;
+      border-color: #bfdbfe;
+      background: var(--brand-soft);
+      color: var(--brand);
+      font-size: 20px;
+      line-height: 1;
+    }
+    .counter-control span {
+      min-width: 28px;
+      text-align: center;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .table-wrap {
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+    }
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      font-size: 14px;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      background: #fafafa;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .badge {
+      display: inline-flex;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--green-soft);
+      color: var(--green);
+      font-size: 12px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .badge.missing,
+    .badge.no-show {
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+    .empty {
+      padding: 20px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 14px;
+    }
+    .error-box {
+      display: none;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      border: 1px solid #fecdca;
+      border-radius: 8px;
+      background: var(--red-soft);
+      color: var(--red);
+    }
+    @media (max-width: 960px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 18px;
+      }
+      nav,
+      .actions {
+        justify-content: flex-start;
+      }
+      .topline {
+        flex-direction: column;
+      }
+      .metric-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+    @media (max-width: 640px) {
+      .metric-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">QueueFlow</div>
+    <nav>
+      <a href="/dashboard/computer-vision">Computer Vision</a>
+      <a class="active" href="/dashboard/queueflow">QueueFlow</a>
+      <a href="/dashboard/queue-analytics">Analytics</a>
+      <a href="/dashboard/profile">Profile</a>
+      <a href="/logout">Logout</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="topline">
+      <div>
+        <h1>QueueFlow Dashboard</h1>
+        <div class="subtle">Live queue list, counter control, and staff actions.</div>
+      </div>
+      <div class="actions">
+        <button id="refreshBtn" type="button">Refresh</button>
+        <button id="resetBtn" class="danger" type="button">Reset Queue</button>
+      </div>
+    </section>
+
+    <div id="errorBox" class="error-box"></div>
+
+    <section class="metric-grid">
+      <div class="metric">
+        <div class="metric-label">Queue Now</div>
+        <div id="queueNow" class="metric-value">0</div>
+        <div id="queueNote" class="metric-note">waiting people</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Next Number</div>
+        <div id="nextNumber" class="metric-value">Q001</div>
+        <div id="assignedNote" class="metric-note">0 assigned today</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">New Arrival Wait</div>
+        <div id="newWait" class="metric-value">0 min</div>
+        <div id="counterNote" class="metric-note">0 counters active</div>
+        <div class="counter-control" aria-label="Active counters">
+          <button id="counterMinus" type="button" aria-label="Decrease active counters">-</button>
+          <span id="counterValue">0</span>
+          <button id="counterPlus" type="button" aria-label="Increase active counters">+</button>
+        </div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Completed</div>
+        <div id="completed" class="metric-value">0</div>
+        <div id="completedNote" class="metric-note">served or no-show</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">Active Queue</h2>
+        <span id="updatedAt" class="subtle">Waiting for data</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Queue</th>
+              <th>Position</th>
+              <th>Status</th>
+              <th>Waiting</th>
+              <th>Predicted Start</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="activeRows"></tbody>
+        </table>
+        <div id="activeEmpty" class="empty">No active queue right now.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const els = {
+      errorBox: document.getElementById("errorBox"),
+      queueNow: document.getElementById("queueNow"),
+      queueNote: document.getElementById("queueNote"),
+      nextNumber: document.getElementById("nextNumber"),
+      assignedNote: document.getElementById("assignedNote"),
+      newWait: document.getElementById("newWait"),
+      counterNote: document.getElementById("counterNote"),
+      counterMinus: document.getElementById("counterMinus"),
+      counterValue: document.getElementById("counterValue"),
+      counterPlus: document.getElementById("counterPlus"),
+      completed: document.getElementById("completed"),
+      completedNote: document.getElementById("completedNote"),
+      updatedAt: document.getElementById("updatedAt"),
+      activeRows: document.getElementById("activeRows"),
+      activeEmpty: document.getElementById("activeEmpty"),
+      refreshBtn: document.getElementById("refreshBtn"),
+      resetBtn: document.getElementById("resetBtn"),
+    };
+
+    let currentCounters = 1;
+    let adjustingCounters = false;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    function number(value, fallback = 0) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    function queueLabel(value) {
+      return `Q${String(number(value, 1)).padStart(3, "0")}`;
+    }
+
+    function showError(message) {
+      els.errorBox.textContent = message;
+      els.errorBox.style.display = "block";
+    }
+
+    function clearError() {
+      els.errorBox.style.display = "none";
+    }
+
+    function syncCounterControls(count) {
+      currentCounters = Math.max(1, Math.min(10, Math.trunc(number(count, 1))));
+      els.counterNote.textContent = `${currentCounters} ${currentCounters === 1 ? "counter" : "counters"} active`;
+      els.counterValue.textContent = currentCounters;
+      els.counterMinus.disabled = adjustingCounters || currentCounters <= 1;
+      els.counterPlus.disabled = adjustingCounters || currentCounters >= 10;
+    }
+
+    function renderRows(rows) {
+      els.activeEmpty.style.display = rows.length ? "none" : "block";
+      els.activeRows.innerHTML = rows.map((row) => {
+        const queueNumber = number(row.queue_number, 0);
+        const label = row.queue_label || queueLabel(queueNumber);
+        return `
+          <tr>
+            <td>${escapeHtml(label)}</td>
+            <td>${escapeHtml(row.position || row.position_in_line || "-")}</td>
+            <td><span class="badge ${escapeHtml(row.status)}">${escapeHtml(row.status || "waiting")}</span></td>
+            <td>${escapeHtml(row.wait_time || "-")}</td>
+            <td>${escapeHtml(row.estimated_wait_time_label || "-")}</td>
+            <td>
+              <button class="primary" type="button" data-done="${queueNumber}">Mark Done</button>
+            </td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function render(data) {
+      const overview = data.overview || {};
+      const rows = data.active_queue || [];
+
+      clearError();
+      els.queueNow.textContent = overview.queue_length ?? 0;
+      els.queueNote.textContent = `${overview.waiting ?? 0} waiting, ${overview.missing ?? 0} missing`;
+      els.nextNumber.textContent = queueLabel(overview.next_number ?? 1);
+      els.assignedNote.textContent = `${overview.total_assigned ?? 0} assigned today`;
+      els.newWait.textContent = data.new_arrival?.estimated_wait_time_label || "0 min";
+      syncCounterControls(overview.active_counters ?? 1);
+      els.completed.textContent = overview.total_completed ?? 0;
+      els.completedNote.textContent = `${overview.total_served ?? 0} served, ${overview.total_no_show ?? 0} no-show`;
+      els.updatedAt.textContent = data.generated_at
+        ? `Updated ${new Date(data.generated_at).toLocaleTimeString()}`
+        : "Updated just now";
+      renderRows(rows);
+    }
+
+    async function requestJson(url, options = {}) {
+      const response = await fetch(url, {
+        credentials: "same-origin",
+        cache: "no-store",
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          ...(options.headers || {}),
+        },
+      });
+      if (response.status === 401 || response.status === 403) {
+        window.location.href = "/login";
+        return null;
+      }
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.detail || detail.message || `Request failed with ${response.status}`);
+      }
+      return response.json();
+    }
+
+    async function loadQueue() {
+      try {
+        const data = await requestJson("/api/queue/analytics");
+        if (data) {
+          render(data);
+        }
+      } catch (error) {
+        showError(error.message || "Unable to load queue data.");
+      }
+    }
+
+    async function adjustCounters(delta) {
+      if (adjustingCounters) {
+        return;
+      }
+      const nextCounters = Math.max(1, Math.min(10, currentCounters + delta));
+      if (nextCounters === currentCounters) {
+        syncCounterControls(currentCounters);
+        return;
+      }
+
+      adjustingCounters = true;
+      syncCounterControls(currentCounters);
+      try {
+        await requestJson("/api/queue/adjust_counters", {
+          method: "POST",
+          body: JSON.stringify({counters: nextCounters}),
+        });
+        await loadQueue();
+      } catch (error) {
+        showError(error.message || "Unable to update active counters.");
+      } finally {
+        adjustingCounters = false;
+        syncCounterControls(currentCounters);
+      }
+    }
+
+    async function markDone(queueNumber) {
+      try {
+        await requestJson("/api/queue/done", {
+          method: "POST",
+          body: JSON.stringify({queue_number: queueNumber}),
+        });
+        await loadQueue();
+      } catch (error) {
+        showError(error.message || "Unable to mark queue as done.");
+      }
+    }
+
+    async function resetQueue() {
+      const confirmed = window.confirm("Reset the entire active queue?");
+      if (!confirmed) {
+        return;
+      }
+      try {
+        await requestJson("/api/queue/reset", {method: "POST", body: "{}"});
+        await loadQueue();
+      } catch (error) {
+        showError(error.message || "Unable to reset queue.");
+      }
+    }
+
+    els.counterMinus.addEventListener("click", () => adjustCounters(-1));
+    els.counterPlus.addEventListener("click", () => adjustCounters(1));
+    els.refreshBtn.addEventListener("click", loadQueue);
+    els.resetBtn.addEventListener("click", resetQueue);
+    els.activeRows.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-done]");
+      if (button) {
+        markDone(number(button.dataset.done));
+      }
+    });
+
+    loadQueue();
+    setInterval(loadQueue, 2500);
+  </script>
+</body>
+</html>

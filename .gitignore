@@ -1,5 +1,11 @@
 # Environment
 .env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+*.log
 
 # Model weights
 *.pt
@@ -19,3 +25,6 @@ data/
 *.png
 *.mp4
 *.avi
+
+# Generated runtime files
+app/tickets/

@@ -1,11 +1,26 @@
-flask
+# Web framework
+fastapi
+uvicorn[standard]
+
+# Computer vision
 opencv-python
 ultralytics
 numpy
-scipy
-Pillow
-pyyaml
-pyserial
-reportlab
+
+# Database
 mysql-connector-python
-Werkzeug
+redis>=5.0.0
+
+# Auth / security
+PyJWT
+werkzeug
+
+# PDF + QR ticket
+reportlab
+qrcode[pil]>=7.4.0
+Pillow
+
+# Utilities
+python-dotenv
+python-multipart
+requests

@@ -1,27 +1,8 @@
-"""
-Queue Tracker Module
-====================
-
-CORE PHILOSOPHY (v4 — pragmatic hybrid matching):
-Hybrid matching strategy in priority order:
-  1. Same track_id → always restore (YOLO maintained continuity)
-  2. Time + zone recency → single missing person = restore by recency (no appearance needed)
-  3. Appearance scoring → tiebreaker for 2+ missing persons
-  4. Done blacklist → prevents served people from stealing missing slots
-
-v4.1 — Static object / picture rejection:
-  - Increased MIN_MOTION_PIXELS (8) and MIN_CONFIRM_FRAMES (15)
-  - Added centre-position stdev check: rejects near-zero-variance detections
-    (wall pictures, signs, static objects have stdev ≈ 0 across all frames)
-  - Added portrait aspect-ratio guard: standing people are always taller than
-    wide; landscape/square boxes are rejected before candidate accumulation
-"""
-
 import cv2
 import numpy as np
 import secrets
 import statistics
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from datetime import datetime, timedelta
 
 
@@ -29,7 +10,8 @@ class QueuePerson:
     __slots__ = (
         'queue_number', 'track_id', 'bbox', 'entered_at', 'last_seen',
         'went_missing_at', 'status', 'missing_frames', 'position_in_line',
-        'access_token', 'appearance_signature', 'appearance_history'
+        'access_token', 'short_code', 'pdf_path',
+        'appearance_signature', 'appearance_history'
     )
 
     def __init__(self, queue_number: int, track_id: int, bbox: tuple):
@@ -43,6 +25,8 @@ class QueuePerson:
         self.missing_frames       = 0
         self.position_in_line     = 0
         self.access_token         = secrets.token_urlsafe(8)
+        self.short_code           = None
+        self.pdf_path             = None
         self.appearance_signature = None
         self.appearance_history   = []
 
@@ -89,7 +73,7 @@ class QueuePerson:
             'joined_at_full':    self.joined_at_full,
             'joined_at_iso':     self.entered_at.isoformat(),
             'bbox':              self.bbox,
-            'access_token':      self.access_token,
+            'access_token':      self.short_code if self.short_code else self.access_token,
         }
 
 
@@ -110,58 +94,70 @@ class QueueZone:
 
 
 class QueueTracker:
-    # ── Raised from 8 → 15: static objects accumulate frames effortlessly;
-    #    a higher bar means a picture must be "seen" across more frames before
-    #    it could ever get a queue number (combined with stdev / motion checks
-    #    it will be eliminated well before this count is reached).
     MAX_MISSING_FRAMES            = 300
-    MIN_CONFIRM_FRAMES            = 15   # ↑ was 8
+    MIN_CONFIRM_FRAMES            = 15
     DONE_COOLDOWN_FRAMES          = 150
     NOSHOW_WINDOW_SECONDS         = 60
     RECENCY_WINDOW_SECONDS        = 600
+    RECENCY_SINGLE_MATCH_SECONDS  = 20
     APPEARANCE_TIEBREAK_THRESHOLD = 0.35
     DONE_BLACKLIST_THRESH         = 0.70
-    # ── Raised from 3 → 8: camera shake / JPEG compression can produce ~3 px
-    #    of apparent movement even for a perfectly static object; 8 px is a
-    #    more reliable floor for genuine human micro-movement.
-    MIN_MOTION_PIXELS             = 8    # ↑ was 3
+    MIN_MOTION_PIXELS             = 8
     MOTION_HISTORY_LEN            = 20
     _DONE_APP_MAX                 = 20
     _HIST_SHAPE                   = (16, 16)
-
-    # ── NEW: stdev threshold for static-object rejection.
-    #    A real person standing still still has ~2–5 px of natural micro-sway;
-    #    a framed picture on a wall will have stdev < 1.5 px in both axes.
-    STATIC_STDEV_THRESHOLD        = 1.5  # px — below this = likely not a person
-
-    # ── NEW: minimum portrait aspect ratio (height / width).
-    #    Standing people are always taller than wide (ratio > 1.0).
-    #    We allow a slack down to 0.65 for partial / crouching detections.
-    #    Landscape or square boxes (framed pictures, signs) will be < 0.65.
-    MIN_PORTRAIT_ASPECT           = 0.65
-
-    # Duplicate-detection thresholds
-    DEDUP_IOU_THRESH  = 0.15
-    DEDUP_CENTRE_FRAC = 0.55
+    STATIC_STDEV_THRESHOLD        = 1.5
+    STATIC_CONF_BYPASS_THRESHOLD  = 0.45
+    MIN_PORTRAIT_ASPECT           = 0.50
+    DEDUP_IOU_THRESH              = 0.15
+    DEDUP_CENTRE_FRAC             = 0.55
 
     def __init__(self, zone: QueueZone = None):
-        self.zone                   = zone or QueueZone()
+        self.zone                        = zone or QueueZone()
         self.active_queue: OrderedDict[int, QueuePerson] = OrderedDict()
-        self._candidates: dict      = {}
-        self._used_numbers: set     = set()
-        self._highest_assigned      = 0
-        self._done_cooldowns: list  = []
-        self.completed_queue: list  = []
-        self.total_served           = 0
-        self._noshow_timers: dict   = {}
+        self._candidates: dict           = {}
+        self._used_numbers: set          = set()
+        self._highest_assigned           = 0
+        self._done_cooldowns: list       = []
+        self.completed_queue: list       = []
+        self.total_served                = 0
+        self._noshow_timers: dict        = {}
         self.appearance_rejections: list = []
-        self.on_new_person          = None
-        self._done_appearances: list = []
-        self._claimed_this_frame: dict = {}
+        self.on_new_person               = None
+        self.on_noshow                   = None
+        self._done_appearances: list     = []
+        self._claimed_this_frame: dict   = {}
 
-    # =========================================================================
-    # APPEARANCE HELPERS
-    # =========================================================================
+
+    # SHORT CODE INTEGRATION 
+
+    def set_short_code(self, queue_number: int, short_code: str) -> bool:
+        for p in self.active_queue.values():
+            if p.queue_number == queue_number:
+                p.short_code = short_code
+                print(f"[QueueTracker] 🔑 Q{queue_number:03d} short_code set: {short_code}")
+                return True
+        print(f"[QueueTracker] ⚠️  set_short_code: Q{queue_number:03d} not found in active queue")
+        return False
+
+    def set_pdf_path(self, queue_number: int, pdf_path: str) -> bool:
+        import os as _os
+        for p in self.active_queue.values():
+            if p.queue_number == queue_number:
+                p.pdf_path = pdf_path
+                print(f"[QueueTracker] 📄 Q{queue_number:03d} pdf_path=" + _os.path.basename(pdf_path))
+                return True
+        print(f"[QueueTracker] ⚠️  set_pdf_path: Q{queue_number:03d} not found")
+        return False
+
+    def get_position(self, queue_number: int) -> int:
+        for p in self.active_queue.values():
+            if p.queue_number == queue_number:
+                return p.position_in_line
+        return 0
+
+
+    # APPEARANCE HELPERS 
 
     @staticmethod
     def _extract_appearance(frame, bbox) -> np.ndarray | None:
@@ -228,9 +224,8 @@ class QueueTracker:
         if len(history) > 5:
             history.pop(0)
 
-    # =========================================================================
-    # HYBRID RE-ENTRY MATCHING
-    # =========================================================================
+
+    # HYBRID RE-ENTRY MATCHING 
 
     def _get_missing_persons(self, current_track_ids: set) -> list:
         claimed = self._claimed_this_frame
@@ -239,7 +234,7 @@ class QueueTracker:
             if tid not in current_track_ids
             and p.status != 'done_pending'
             and tid not in claimed
-            and (p.status == 'missing' or (p.status == 'waiting' and p.went_missing_at is not None))
+            and p.missing_frames > 0
         ]
         absent.sort(key=lambda x: x[1].went_missing_at or datetime.min, reverse=True)
         return absent
@@ -279,16 +274,59 @@ class QueueTracker:
         if len(missing) == 1:
             tid, p = missing[0]
             secs = p.seconds_missing
-            if secs <= recency:
-                print(f"✅ Single absent Q{p.queue_number:03d} ({secs:.1f}s) — recency restore")
-                return tid, p, 1.0
+
+            if secs <= self.RECENCY_SINGLE_MATCH_SECONDS:
+                # Appearance available — it is the final word.
+                # Do NOT fall through to spatial if appearance disagrees;
+                # a different person standing in the same spot must get
+                # a new number, not inherit the old one.
+                if new_sig is not None and p.appearance_signature is not None:
+                    score = self._best_score_against_person(p, new_sig)
+
+                    if score >= tbreak:
+                        print(f"✅ Single absent Q{p.queue_number:03d} ({secs:.1f}s) "
+                              f"— appearance restore (score={score:.2f})")
+                        return tid, p, score
+
+                    # Appearance below threshold — different person.
+                    print(f"⚠️  Q{p.queue_number:03d} ({secs:.1f}s) appearance={score:.2f} "
+                          f"< {tbreak} — different person → new number")
+                    return None, None, 0.0
+
+                # No appearance data on either side — spatial is the only signal.
+                sp_score = self._spatial_score(p.bbox, bbox)
+                if sp_score < 0.60:
+                    print(f"✅ Single absent Q{p.queue_number:03d} ({secs:.1f}s) "
+                          f"— recency+spatial restore (dist={sp_score:.2f}, no appearance)")
+                    return tid, p, 0.8
+
+                # Far away and no appearance — do not blindly restore
+                print(f"⚠️  Q{p.queue_number:03d} ({secs:.1f}s) too far (dist={sp_score:.2f}) "
+                      f"and no appearance data — new number")
+                return None, None, 0.0
+
+            # Gone longer than 20s — require appearance evidence
             score = self._best_score_against_person(p, new_sig)
             if score >= tbreak:
                 print(f"✅ Q{p.queue_number:03d} matched by appearance (score={score:.2f})")
                 return tid, p, score
-            print(f"⚠️  Q{p.queue_number:03d} {secs:.0f}s missing, app={score:.2f} — new number")
+
+            # Appearance unavailable (frame=None path) — tight spatial only
+            if secs <= recency and new_sig is None:
+                sp_score = self._spatial_score(p.bbox, bbox)
+                if sp_score < 0.40:
+                    print(f"✅ Q{p.queue_number:03d} spatial-only restore "
+                          f"(norm_dist={sp_score:.2f}, no appearance data)")
+                    return tid, p, 0.5
+                print(f"⚠️  Q{p.queue_number:03d} {secs:.0f}s missing, "
+                      f"spatial={sp_score:.2f} too far — new number")
+                return None, None, 0.0
+
+            print(f"⚠️  Q{p.queue_number:03d} {secs:.0f}s missing, "
+                  f"app={score:.2f} insufficient — new number")
             return None, None, 0.0
 
+        # multi-person matching 
         app_scored = sorted(
             ((self._best_score_against_person(p, new_sig), tid, p) for tid, p in missing),
             reverse=True
@@ -328,10 +366,8 @@ class QueueTracker:
             return rr_tid, rr_p, 0.4
         return None, None, 0.0
 
-    # =========================================================================
-    # NO-SHOW HANDLING
-    # =========================================================================
 
+    #NO-SHOW HANDLING 
     def _check_noshow(self):
         now     = datetime.now()
         to_bump = []
@@ -352,6 +388,14 @@ class QueueTracker:
             qn = p.queue_number
             print(f"🚫 Q{qn:03d} NO-SHOW bumped")
             self._noshow_timers.pop(qn, None)
+
+            if p.pdf_path:
+                try:
+                    from services.ticket_printer import delete_ticket
+                    delete_ticket(p.pdf_path)
+                except Exception as e:
+                    print(f"[QueueTracker] ⚠️  PDF delete error (no-show) Q{qn:03d}: {e}")
+
             completed = p.to_dict()
             completed.update({
                 'completed_at':      now.strftime("%I:%M:%S %p"),
@@ -366,6 +410,12 @@ class QueueTracker:
             p.missing_frames = self.MAX_MISSING_FRAMES + 1
             self._done_cooldowns.append({'bbox': p.bbox, 'frames_left': self.DONE_COOLDOWN_FRAMES})
             self._recalculate_positions()
+
+            if self.on_noshow:
+                try:
+                    self.on_noshow(qn)
+                except Exception as e:
+                    print(f"⚠️  on_noshow callback error Q{qn:03d}: {e}")
 
     def get_noshow_alerts(self) -> list:
         now = datetime.now()
@@ -384,9 +434,8 @@ class QueueTracker:
                 })
         return alerts
 
-    # =========================================================================
-    # INTERNAL HELPERS
-    # =========================================================================
+
+    # INTERNAL HELPERS 
 
     @staticmethod
     def _iou(b1, b2) -> float:
@@ -416,8 +465,8 @@ class QueueTracker:
 
     @staticmethod
     def _x_column_overlap(b1, b2) -> float:
-        ox     = max(0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
-        min_w  = min(b1[2]-b1[0], b2[2]-b2[0])
+        ox    = max(0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
+        min_w = min(b1[2]-b1[0], b2[2]-b2[0])
         return ox / min_w if min_w > 0 else 0.0
 
     @staticmethod
@@ -442,6 +491,8 @@ class QueueTracker:
         for p in self.active_queue.values():
             if p.status == 'done_pending':
                 continue
+            if p.missing_frames > 0:
+                continue
             if self._is_duplicate_of(p.bbox, bbox):
                 return True
         return False
@@ -461,38 +512,22 @@ class QueueTracker:
         self._candidates.pop(track_id, None)
         self._claimed_this_frame[ret_tid] = track_id
 
-    def _has_sufficient_motion(self, centers: list) -> bool:
-        """
-        Reject static objects (pictures, signs, furniture) that YOLO detects
-        consistently but that never actually move.
+    def _has_sufficient_motion(self, centers: list, avg_conf: float = 0.0) -> bool:
+        if avg_conf >= self.STATIC_CONF_BYPASS_THRESHOLD:
+            return True
 
-        Two independent checks:
-
-        1. Range check (original): max displacement across the history window
-           must exceed MIN_MOTION_PIXELS.  Raised to 8 px so that camera
-           shake / JPEG compression artefacts don't inflate the score.
-
-        2. Standard-deviation check (new): even if a camera wobble briefly
-           displaces the box by >8 px, a static object's centre positions will
-           cluster very tightly over time (stdev << 1 px).  A real person
-           standing "still" still has 2–5 px of natural micro-sway in both
-           axes.  If stdev_x < STATIC_STDEV_THRESHOLD AND
-           stdev_y < STATIC_STDEV_THRESHOLD, the detection is rejected.
-        """
         if len(centers) < 8:
-            return True  # not enough data yet — give benefit of the doubt
+            return True
 
         xs = [c[0] for c in centers]
         ys = [c[1] for c in centers]
 
-        # Check 1: range
         movement = max(max(xs) - min(xs), max(ys) - min(ys))
         if movement < self.MIN_MOTION_PIXELS:
             print(f"🖼️  Static rejection — range={movement}px "
                   f"(need >{self.MIN_MOTION_PIXELS}px) — likely a picture/object")
             return False
 
-        # Check 2: standard deviation (requires ≥ 10 samples for reliability)
         if len(centers) >= 10:
             x_stdev = statistics.stdev(xs)
             y_stdev = statistics.stdev(ys)
@@ -505,20 +540,6 @@ class QueueTracker:
         return True
 
     def _is_plausible_person_bbox(self, bbox: tuple) -> bool:
-        """
-        Reject bounding boxes whose shape is inconsistent with a standing person.
-
-        A standing or slightly crouching person is always taller than wide
-        (portrait orientation).  Framed pictures and signs hanging on walls
-        are typically landscape or square (wide >= tall).
-
-        Aspect ratio = height / width.
-          ≥ 0.65  → plausible person (standing, partial, or crouching)
-          < 0.65  → likely a non-person object → reject
-
-        This is applied BEFORE candidate accumulation so the object never
-        even starts collecting confirmation frames.
-        """
         x1, y1, x2, y2 = bbox
         w = max(1, x2 - x1)
         h = max(1, y2 - y1)
@@ -540,9 +561,8 @@ class QueueTracker:
         })
         return entry
 
-    # =========================================================================
-    # MAIN FRAME PROCESSOR
-    # =========================================================================
+
+    # MAIN FRAME PROCESSOR 
 
     def process_frame(self, tracked_persons: list, frame=None) -> dict:
         self._tick_done_cooldowns()
@@ -554,11 +574,10 @@ class QueueTracker:
             bbox     = person['bbox']
             in_zone  = self.zone.is_person_inside(bbox)
 
-            # ── Already tracked ────────────────────────────────────────────────
             if track_id in self.active_queue:
-                p            = self.active_queue[track_id]
-                p.bbox       = bbox
-                p.last_seen  = datetime.now()
+                p                = self.active_queue[track_id]
+                p.bbox           = bbox
+                p.last_seen      = datetime.now()
                 p.missing_frames = 0
                 if frame is not None and p.wait_time_seconds % 30 == 0:
                     self._update_appearance(p, frame, bbox)
@@ -575,53 +594,50 @@ class QueueTracker:
                 self._candidates.pop(track_id, None)
                 continue
 
-            # ── NEW: Portrait aspect-ratio guard ──────────────────────────────
-            # Reject landscape/square boxes before they enter the candidate
-            # pool.  Pictures on walls, signs, and other static rectangular
-            # objects are almost always wider than tall.  This check is fast
-            # and runs before any appearance extraction.
             if not self._is_plausible_person_bbox(bbox):
                 self._candidates.pop(track_id, None)
                 continue
 
             current_in_zone.add(track_id)
-            new_sig = self._extract_appearance(frame, bbox)
+            _raw_sig = person.get('appearance')
+            new_sig  = (np.array(_raw_sig, dtype=np.float32)
+            if _raw_sig is not None
+            else self._extract_appearance(frame, bbox))
 
-            # ── Hybrid re-entry check ──────────────────────────────────────────
-            ret_tid, ret_person, ret_score = self._find_returning_person(
-                bbox, new_sig, current_in_zone)
-            if ret_person is not None:
-                print(f"✅ Q{ret_person.queue_number:03d} re-entry "
-                      f"(score={ret_score:.2f}, track {ret_tid}→{track_id})")
-                self._restore_missing_person(ret_person, ret_tid, track_id, frame, bbox, new_sig)
-                continue
+            # First-sight re-entry check 
+            if new_sig is not None:
+                ret_tid, ret_person, ret_score = self._find_returning_person(
+                    bbox, new_sig, current_in_zone)
+                if ret_person is not None:
+                    print(f"✅ Q{ret_person.queue_number:03d} re-entry "
+                          f"(score={ret_score:.2f}, track {ret_tid}→{track_id})")
+                    self._restore_missing_person(
+                        ret_person, ret_tid, track_id, frame, bbox, new_sig)
+                    continue
 
-            # ── Done cooldown block ────────────────────────────────────────────
             if self._is_in_done_cooldown(bbox):
                 self._candidates.pop(track_id, None)
                 continue
 
-            # ── Active queue duplicate guard ───────────────────────────────────
             if self._is_duplicate_of_active(bbox):
                 self._candidates.pop(track_id, None)
                 print(f"🔁 track {track_id} suppressed — duplicate of active person")
                 continue
 
-            # ── Candidate pool duplicate / flicker dedup ──────────────────────
             cand_tid = self._find_overlapping_candidate(bbox)
             if cand_tid is not None and cand_tid != track_id:
                 info = self._candidates.pop(cand_tid)
                 info['bbox'] = bbox
                 if new_sig is not None:
                     info.setdefault('sigs', []).append(new_sig)
+                info.setdefault('confs', []).append(float(person.get('conf', 0.0)))
                 cx, cy = (bbox[0] + bbox[2]) >> 1, (bbox[1] + bbox[3]) >> 1
                 info.setdefault('centers', []).append((cx, cy))
                 self._candidates[track_id] = info
                 continue
 
-            # ── Accumulate confirmation frames ─────────────────────────────────
             cand = self._candidates.setdefault(track_id, {
-                'count': 0, 'bbox': bbox, 'sigs': [], 'centers': []
+                'count': 0, 'bbox': bbox, 'sigs': [], 'centers': [], 'confs': []
             })
             cx, cy = (bbox[0] + bbox[2]) >> 1, (bbox[1] + bbox[3]) >> 1
             cand['count'] += 1
@@ -630,34 +646,38 @@ class QueueTracker:
             centers.append((cx, cy))
             if len(centers) > self.MOTION_HISTORY_LEN:
                 centers.pop(0)
+            confs = cand['confs']
+            confs.append(float(person.get('conf', 0.0)))
+            if len(confs) > self.MOTION_HISTORY_LEN:
+                confs.pop(0)
             if new_sig is not None:
                 sigs = cand['sigs']
                 sigs.append(new_sig)
                 if len(sigs) > 8:
                     sigs.pop(0)
 
-            # Re-check re-entry every frame during accumulation
-            early_tid, early_person, early_score = self._find_returning_person(
-                bbox, new_sig, current_in_zone)
-            if early_person is not None:
-                print(f"✅ Q{early_person.queue_number:03d} re-entry (accumulation "
-                      f"frame {cand['count']}, score={early_score:.2f})")
-                self._restore_missing_person(
-                    early_person, early_tid, track_id, frame, bbox, new_sig)
-                continue
+            # Mid-accumulation re-entry check 
+            if new_sig is not None:
+                early_tid, early_person, early_score = self._find_returning_person(
+                    bbox, new_sig, current_in_zone)
+                if early_person is not None:
+                    print(f"✅ Q{early_person.queue_number:03d} re-entry (accumulation "
+                          f"frame {cand['count']}, score={early_score:.2f})")
+                    self._restore_missing_person(
+                        early_person, early_tid, track_id, frame, bbox, new_sig)
+                    continue
 
-            # ── Assign new number once confirmed ──────────────────────────────
             if cand['count'] < self.MIN_CONFIRM_FRAMES:
                 continue
 
-            # Motion + stdev check — rejects pictures/signs that accumulate
-            # frames without ever moving.  Runs at confirmation time so the
-            # full centre history is available for a reliable stdev reading.
-            if not self._has_sufficient_motion(cand.get('centers', [])):
+            avg_conf = (
+                sum(cand.get('confs', [])) / max(1, len(cand.get('confs', [])))
+            )
+            if not self._has_sufficient_motion(cand.get('centers', []), avg_conf):
                 self._candidates.pop(track_id)
                 continue
 
-            # Final gate re-entry check
+            # Final gate re-entry check 
             final_tid, final_person, final_score = self._find_returning_person(
                 bbox, new_sig, current_in_zone)
             if final_person is not None:
@@ -667,7 +687,7 @@ class QueueTracker:
                     final_person, final_tid, track_id, frame, bbox, new_sig)
                 continue
 
-            # Genuinely new person
+            # Confirmed new person 
             self._highest_assigned += 1
             num   = self._highest_assigned
             new_p = QueuePerson(queue_number=num, track_id=track_id, bbox=bbox)
@@ -691,7 +711,7 @@ class QueueTracker:
                 except Exception as e:
                     print(f"⚠️  on_new_person callback error: {e}")
 
-        # ── Handle persons not seen this frame ────────────────────────────────
+        # Absent person handling 
         to_remove = []
         for tid, p in self.active_queue.items():
             if tid in current_in_zone:
@@ -718,20 +738,24 @@ class QueueTracker:
         for tid in to_remove:
             del self.active_queue[tid]
 
-        # ── Post-frame active-queue dedup pass ────────────────────────────────
         self._dedup_active_queue()
-
         self._recalculate_positions()
         self._check_noshow()
         return self.get_state()
 
-    # =========================================================================
-    # MARK DONE
-    # =========================================================================
+
+    # MARK DONE 
 
     def mark_transaction_done(self, queue_number: int) -> bool:
         for tid, p in self.active_queue.items():
             if p.queue_number == queue_number and p.status in ('waiting', 'missing'):
+                if p.pdf_path:
+                    try:
+                        from services.ticket_printer import delete_ticket
+                        delete_ticket(p.pdf_path)
+                    except Exception as e:
+                        print(f"[QueueTracker] ⚠️  PDF delete error for Q{queue_number:03d}: {e}")
+
                 p.status           = 'done_pending'
                 p.position_in_line = 0
                 self.total_served  += 1
@@ -745,15 +769,15 @@ class QueueTracker:
                 return True
         return False
 
-    # =========================================================================
-    # TOKEN LOOKUP
-    # =========================================================================
+
+    # TOKEN LOOKUP 
 
     def lookup_by_token(self, queue_number: int, token: str) -> dict | None:
         for p in self.active_queue.values():
             if p.queue_number != queue_number:
                 continue
-            if p.access_token != token:
+            expected = p.short_code if p.short_code is not None else p.access_token
+            if expected != token:
                 return {'error': 'invalid_token'}
             result = p.to_dict()
             qn = p.queue_number
@@ -766,9 +790,8 @@ class QueueTracker:
             return result
         return None
 
-    # =========================================================================
-    # HELPERS
-    # =========================================================================
+
+    #HELPERS 
 
     def _dedup_active_queue(self):
         tids    = list(self.active_queue.keys())
@@ -780,12 +803,16 @@ class QueueTracker:
             p_i = self.active_queue[tids[i]]
             if p_i.status == 'done_pending':
                 continue
+            if p_i.missing_frames > 0:
+                continue
 
             for j in range(i + 1, len(tids)):
                 if tids[j] in to_drop:
                     continue
                 p_j = self.active_queue[tids[j]]
                 if p_j.status == 'done_pending':
+                    continue
+                if p_j.missing_frames > 0:
                     continue
 
                 if self._is_duplicate_of(p_i.bbox, p_j.bbox):
@@ -826,34 +853,30 @@ class QueueTracker:
             'appearance_rejections': self.appearance_rejections[-5:],
         }
 
-    # =========================================================================
-    # DRAW ON FRAME
-    # =========================================================================
+
+    # DRAW ON FRAME 
 
     def draw_on_frame(self, frame):
         h, w = frame.shape[:2]
         z    = self.zone
         FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-        # Zone rectangle
         cv2.rectangle(frame, (z.x1, z.y1), (z.x2, z.y2), (0, 255, 255), 2)
         lbl = "QUEUE ZONE"
-        (lw, lh), _ = cv2.getTextSize(lbl, FONT, 0.55, 2)
+        (lw, lh), _ = cv2.getTextSize(lbl, FONT, 0.55, 1)
         lx, ly = z.x1 + 6, z.y1 + lh + 8
         cv2.rectangle(frame, (lx-2, ly-lh-4), (lx+lw+2, ly+4), (0, 0, 0), -1)
-        cv2.putText(frame, lbl, (lx, ly), FONT, 0.55, (0, 255, 255), 2)
+        cv2.putText(frame, lbl, (lx, ly), FONT, 0.55, (0, 255, 255), 1)
 
-        # No-show warnings
         for i, alert in enumerate(self.get_noshow_alerts()):
             color    = (0, 0, 255) if alert['status'] == 'critical' else (0, 165, 255)
             warn_txt = (f"{alert['queue_number']} NO-SHOW WARNING "
                         f"Bumping in {alert['seconds_remaining']}s")
-            (aw, ah), _ = cv2.getTextSize(warn_txt, FONT, 0.5, 2)
+            (aw, ah), _ = cv2.getTextSize(warn_txt, FONT, 0.5, 1)
             ay = h - 20 - i * 28
             cv2.rectangle(frame, (8, ay-ah-4), (aw+16, ay+4), (0, 0, 0), -1)
-            cv2.putText(frame, warn_txt, (12, ay), FONT, 0.5, color, 2)
+            cv2.putText(frame, warn_txt, (12, ay), FONT, 0.5, color, 1)
 
-        # Person boxes
         for person in self.active_queue.values():
             x1, y1, x2, y2 = person.bbox
             x1 = max(0, x1); y1 = max(0, y1)
@@ -887,13 +910,12 @@ class QueueTracker:
             cv2.rectangle(frame, (x1, info_y-ih-3), (x1+iw+4, info_y+3), (0,0,0), -1)
             cv2.putText(frame, info_text, (x1+2, info_y), FONT, 0.45, text_color, 1)
 
-        # Summary
         waiting = sum(1 for p in self.active_queue.values()
                       if p.status in ('waiting', 'missing'))
         summary = f"Queue: {waiting} waiting"
-        (sw, sh), _ = cv2.getTextSize(summary, FONT, 0.6, 2)
+        (sw, sh), _ = cv2.getTextSize(summary, FONT, 0.6, 1)
         sx = w - sw - 12
         cv2.rectangle(frame, (sx-4, 4), (sx+sw+4, sh+14), (0,0,0), -1)
-        cv2.putText(frame, summary, (sx, sh+10), FONT, 0.6, (0,255,255), 2)
+        cv2.putText(frame, summary, (sx, sh+10), FONT, 0.6, (0,255,255), 1)
 
         return frame

@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Computer Vision | QueueFlow</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --ink: #1f2937;
+      --muted: #667085;
+      --line: #e5e7eb;
+      --brand: #2563eb;
+      --brand-soft: #eff6ff;
+      --green: #027a48;
+      --amber: #b45309;
+      --red: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    header {
+      min-height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 32px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    .brand {
+      color: var(--brand);
+      font-size: 18px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    nav {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    nav a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 14px;
+      padding: 8px 10px;
+      border-radius: 6px;
+    }
+    nav a.active {
+      color: var(--brand);
+      background: var(--brand-soft);
+    }
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 28px auto 40px;
+    }
+    .topline {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.2;
+    }
+    .subtle {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 14px;
+      white-space: nowrap;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+    .dot.stale { background: var(--amber); }
+    .dot.error { background: var(--red); }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(280px, .5fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .video-wrap {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #111827;
+    }
+    .video-wrap img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .stat {
+      min-height: 92px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .stat:nth-child(odd) {
+      border-right: 1px solid var(--line);
+    }
+    .stat span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-bottom: 10px;
+    }
+    .stat strong {
+      display: block;
+      font-size: 28px;
+      line-height: 1;
+    }
+    .stack {
+      display: grid;
+      gap: 14px;
+    }
+    .body {
+      padding: 16px 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    @media (max-width: 920px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 18px;
+      }
+      nav {
+        justify-content: flex-start;
+      }
+      .topline {
+        flex-direction: column;
+      }
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+    @media (max-width: 560px) {
+      .stats {
+        grid-template-columns: 1fr;
+      }
+      .stat:nth-child(odd) {
+        border-right: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">QueueFlow</div>
+    <nav>
+      <a class="active" href="/dashboard/computer-vision">Computer Vision</a>
+      <a href="/dashboard/queueflow">QueueFlow</a>
+      <a href="/dashboard/queue-analytics">Analytics</a>
+      <a href="/dashboard/profile">Profile</a>
+      <a href="/logout">Logout</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="topline">
+      <div>
+        <h1>Computer Vision</h1>
+        <div class="subtle">Live detector stream and current crowd measurements.</div>
+      </div>
+      <div class="status-pill">
+        <span id="statusDot" class="dot stale"></span>
+        <span id="statusText">Connecting</span>
+      </div>
+    </section>
+
+    <section class="layout">
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Live Camera Feed</h2>
+          <span id="updatedAt" class="subtle">Waiting for frames</span>
+        </div>
+        <div class="video-wrap">
+          <img src="/video" alt="Live annotated camera feed">
+        </div>
+      </section>
+
+      <aside class="stack">
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Crowd Metrics</h2>
+          </div>
+          <div class="stats">
+            <div class="stat">
+              <span>People</span>
+              <strong id="count">0</strong>
+            </div>
+            <div class="stat">
+              <span>Queue Length</span>
+              <strong id="queueLength">0</strong>
+            </div>
+            <div class="stat">
+              <span>Avg Density</span>
+              <strong id="avgDensity">0</strong>
+            </div>
+            <div class="stat">
+              <span>Max Density</span>
+              <strong id="maxDensity">0</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Detector Health</h2>
+          </div>
+          <div id="healthText" class="body">Checking detector snapshot and API health.</div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <script>
+    const els = {
+      statusDot: document.getElementById("statusDot"),
+      statusText: document.getElementById("statusText"),
+      updatedAt: document.getElementById("updatedAt"),
+      count: document.getElementById("count"),
+      queueLength: document.getElementById("queueLength"),
+      avgDensity: document.getElementById("avgDensity"),
+      maxDensity: document.getElementById("maxDensity"),
+      healthText: document.getElementById("healthText"),
+    };
+
+    function num(value, fallback = 0) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    function fmt(value) {
+      const parsed = num(value);
+      return parsed % 1 === 0 ? parsed.toFixed(0) : parsed.toFixed(2);
+    }
+
+    function setStatus(kind, text) {
+      els.statusDot.classList.remove("stale", "error");
+      if (kind) {
+        els.statusDot.classList.add(kind);
+      }
+      els.statusText.textContent = text;
+    }
+
+    async function loadData() {
+      try {
+        const [dataResponse, healthResponse] = await Promise.all([
+          fetch("/api/data", {credentials: "same-origin", cache: "no-store"}),
+          fetch("/health", {cache: "no-store"}),
+        ]);
+        if (dataResponse.status === 401 || dataResponse.status === 403) {
+          window.location.href = "/login";
+          return;
+        }
+        if (!dataResponse.ok) {
+          throw new Error(`Data request failed with ${dataResponse.status}`);
+        }
+
+        const data = await dataResponse.json();
+        const health = healthResponse.ok ? await healthResponse.json() : {};
+        const age = Math.max(0, (Date.now() / 1000) - num(data.timestamp, Date.now() / 1000));
+
+        els.count.textContent = fmt(data.count);
+        els.queueLength.textContent = fmt(data.queue_length);
+        els.avgDensity.textContent = fmt(data.avg_density);
+        els.maxDensity.textContent = fmt(data.max_density);
+        els.updatedAt.textContent = `Updated ${new Date(num(data.timestamp) * 1000).toLocaleTimeString()}`;
+        els.healthText.textContent = health.snapshot
+          ? "API is reachable and detector snapshots are available."
+          : "API is reachable. Start the detector process to send live snapshots.";
+        setStatus(age > 15 ? "stale" : "", age > 15 ? "Stale detector data" : "Live");
+      } catch (error) {
+        setStatus("error", "Disconnected");
+        els.healthText.textContent = "Unable to load detector data. Check the backend and detector process.";
+      }
+    }
+
+    loadData();
+    setInterval(loadData, 2500);
+  </script>
+</body>
+</html>

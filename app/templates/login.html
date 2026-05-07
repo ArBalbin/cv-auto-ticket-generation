@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login | QueueFlow</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --ink: #1f2937;
+      --muted: #667085;
+      --line: #e5e7eb;
+      --brand: #4f46e5;
+      --brand-soft: #eef2ff;
+      --danger: #b42318;
+      --danger-soft: #fef3f2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    main {
+      width: min(420px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .head {
+      padding: 26px 28px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand {
+      color: var(--brand);
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 26px;
+      line-height: 1.2;
+    }
+    .subtle {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    form {
+      display: grid;
+      gap: 16px;
+      padding: 24px 28px 28px;
+    }
+    label {
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    input {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      color: var(--ink);
+      font-size: 15px;
+      outline: none;
+    }
+    input:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 3px var(--brand-soft);
+    }
+    button {
+      min-height: 44px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--brand);
+      color: white;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .error {
+      padding: 12px 14px;
+      border: 1px solid #fecdca;
+      border-radius: 6px;
+      background: var(--danger-soft);
+      color: var(--danger);
+      font-size: 14px;
+    }
+    .foot {
+      padding: 0 28px 28px;
+      color: var(--muted);
+      font-size: 14px;
+      text-align: center;
+    }
+    .foot a {
+      color: var(--brand);
+      font-weight: 700;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="head">
+      <div class="brand">QueueFlow</div>
+      <h1>Staff Login</h1>
+      <div class="subtle">Sign in to monitor the live queue dashboard.</div>
+    </section>
+
+    <form method="post" action="/login">
+      {% if error %}
+        <div class="error">{{ error }}</div>
+      {% endif %}
+      <label>
+        Username
+        <input name="username" autocomplete="username" required>
+      </label>
+      <label>
+        Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Login</button>
+    </form>
+    {% if registration_enabled %}
+      <div class="foot">
+        New staff member? <a href="/register">Create an account</a>
+      </div>
+    {% endif %}
+  </main>
+</body>
+</html>
