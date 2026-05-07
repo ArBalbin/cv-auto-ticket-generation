@@ -106,6 +106,16 @@ CACHE_HISTORY_TTL_SECONDS = env_int("CACHE_HISTORY_TTL_SECONDS", 3600)
 REDIS_SOCKET_TIMEOUT = env_float("REDIS_SOCKET_TIMEOUT", 0.25)
 REDIS_CONNECT_TIMEOUT = env_float("REDIS_CONNECT_TIMEOUT", 0.25)
 
+OBJECT_STORAGE_ENABLED = env_bool("OBJECT_STORAGE_ENABLED", False)
+OBJECT_STORAGE_ENDPOINT_URL = os.getenv("OBJECT_STORAGE_ENDPOINT_URL", "").strip()
+OBJECT_STORAGE_BUCKET = os.getenv("OBJECT_STORAGE_BUCKET", "").strip()
+OBJECT_STORAGE_REGION = os.getenv("OBJECT_STORAGE_REGION", "").strip() or None
+OBJECT_STORAGE_ACCESS_KEY_ID = os.getenv("OBJECT_STORAGE_ACCESS_KEY_ID", "").strip() or None
+OBJECT_STORAGE_SECRET_ACCESS_KEY = os.getenv("OBJECT_STORAGE_SECRET_ACCESS_KEY", "").strip() or None
+OBJECT_STORAGE_PREFIX = os.getenv("OBJECT_STORAGE_PREFIX", "tickets").strip().strip("/")
+OBJECT_STORAGE_PUBLIC_BASE_URL = os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+OBJECT_STORAGE_ADDRESSING_STYLE = os.getenv("OBJECT_STORAGE_ADDRESSING_STYLE", "auto").strip()
+
 TEMPLATES_DIR = APP_ROOT / "templates"
 
 MJPEG_HEADERS = {
@@ -126,5 +136,7 @@ def validate_cloud_config() -> None:
         raise RuntimeError("PORTAL_BASE_URL must be your public cloud URL when APP_ENV=production")
     if STAFF_REGISTRATION_ENABLED and not STAFF_REGISTRATION_CODE:
         raise RuntimeError("STAFF_REGISTRATION_CODE must be set when staff registration is enabled in production")
+    if OBJECT_STORAGE_ENABLED and not OBJECT_STORAGE_BUCKET:
+        raise RuntimeError("OBJECT_STORAGE_BUCKET must be set when object storage is enabled")
     if SESSION_COOKIE_SAMESITE == "none" and not SESSION_COOKIE_SECURE:
         raise RuntimeError("SESSION_COOKIE_SECURE=1 is required when SESSION_COOKIE_SAMESITE=none")

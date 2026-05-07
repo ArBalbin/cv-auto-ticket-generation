@@ -84,7 +84,27 @@ REDIS_URL=redis://...
 
 When enabled, Redis stores recent detector state, snapshots, history, and staff sessions. If Redis is not configured, the app falls back to process memory.
 
-## 4. Ticket QR Codes
+## 4. Optional Ticket Object Storage
+
+The prototype still generates a local PDF ticket first. In cloud, local files may disappear after restart/redeploy, so object storage is recommended if you need to keep ticket PDFs.
+
+QueueFlow supports S3-compatible storage:
+
+```env
+OBJECT_STORAGE_ENABLED=1
+OBJECT_STORAGE_ENDPOINT_URL=https://your-s3-compatible-endpoint
+OBJECT_STORAGE_BUCKET=your-bucket-name
+OBJECT_STORAGE_REGION=your-region
+OBJECT_STORAGE_ACCESS_KEY_ID=your-access-key
+OBJECT_STORAGE_SECRET_ACCESS_KEY=your-secret-key
+OBJECT_STORAGE_PREFIX=tickets
+OBJECT_STORAGE_PUBLIC_BASE_URL=
+OBJECT_STORAGE_ADDRESSING_STYLE=auto
+```
+
+If `OBJECT_STORAGE_PUBLIC_BASE_URL` is set, the database stores URLs using that base URL. Otherwise it stores an endpoint-based URL, or an `s3://bucket/key` URL for AWS-style storage.
+
+## 5. Ticket QR Codes
 
 Set:
 
@@ -94,7 +114,7 @@ PORTAL_BASE_URL=https://your-cloud-domain.com
 
 After changing this value, generate new tickets. Old tickets may still point to the old local IP.
 
-## 5. Detector / Camera Deployment
+## 6. Detector / Camera Deployment
 
 The cloud server cannot directly access your local webcam. Run `app/detector.py` on the computer connected to the camera and set this on that computer:
 
@@ -105,7 +125,7 @@ CAM_TOKEN=the-same-token-used-by-the-cloud-api
 
 The detector will push `/yolo/push-frame` and `/yolo/update` to the cloud backend.
 
-## 6. Ticket Output
+## 7. Ticket Output
 
 In the actual queue area, this system is intended to print tickets through a thermal printer. For the current prototype, tickets are generated as PDF files instead because no thermal printer is available.
 
@@ -115,9 +135,9 @@ By default, prototype PDF tickets are written to:
 TICKETS_OUTPUT_DIR=app/tickets
 ```
 
-Many cloud platforms erase local files on restart/redeploy. Use persistent disk storage if you need to keep generated PDFs, or keep PDF generation on the local queue-area computer that runs the detector.
+Many cloud platforms erase local files on restart/redeploy. Use persistent disk storage or the object storage settings above if you need to keep generated PDFs.
 
-## 7. Start Command
+## 8. Start Command
 
 Generic start command:
 
@@ -131,17 +151,19 @@ For providers that support a `Procfile`, this repository includes:
 web: uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
 ```
 
-## 8. Smoke Test
+## 9. Smoke Test
 
 After deployment:
 
 1. Open `https://your-cloud-domain.com/health`.
 2. Confirm `"status": "ok"`.
 3. Confirm `"db": true` after your database is configured.
-4. Login at `https://your-cloud-domain.com/login`.
-5. Start the local detector and confirm `"snapshot": true` in `/health`.
-6. Generate a new ticket and scan the QR with the mobile app.
+4. If Redis is configured, confirm `"cache": {"configured": true, "available": true}`.
+5. If ticket storage is configured, confirm `"object_storage": {"configured": true}`.
+6. Login at `https://your-cloud-domain.com/login`.
+7. Start the local detector and confirm `"snapshot": true` in `/health`.
+8. Generate a new ticket and scan the QR with the mobile app.
 
-## 9. GitHub Safety
+## 10. GitHub Safety
 
 Do not commit `.env`, generated ticket PDFs, logs, local virtual environments, or model weights. The `.gitignore` now excludes those runtime files.

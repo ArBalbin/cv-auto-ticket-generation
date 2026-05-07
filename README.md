@@ -123,6 +123,8 @@ Staff registration is available at `/register` when `STAFF_REGISTRATION_ENABLED=
 
 For cloud MySQL, use `database/schema_cloud_ready.sql` for a fresh database. If your database already uses the older `queue_number INT NOT NULL UNIQUE` table, run `database/migrations/001_queue_records_cloud_ready.sql` as a MySQL admin/root user.
 
+Redis caching is enabled by setting `REDIS_URL`. Ticket PDF object storage is optional and S3-compatible; enable it with `OBJECT_STORAGE_ENABLED=1` and the `OBJECT_STORAGE_*` environment variables shown in `.env.example`.
+
 ---
 
 ## 🔄 How It Works

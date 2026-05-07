@@ -13,6 +13,7 @@ from reportlab.lib.colors import HexColor
 from reportlab.lib.utils import ImageReader
 
 from core.config import JWT_SECRET_KEY, PORTAL_BASE_URL, TICKETS_OUTPUT_DIR
+from services import object_storage_service
 
 
 # CONFIGURATION
@@ -404,12 +405,18 @@ def issue_ticket(
             service       = service,
             counters_open = counters_open,
         )
+        storage = object_storage_service.upload_ticket_pdf(
+            pdf_path,
+            queue_number,
+        ) or {}
         return {
             "queue_number" : queue_number,
             "short_code"   : short_code,
             "jwt_token"    : jwt_token,
             "expires_at"   : expires_at,
             "pdf_path"     : pdf_path,
+            "storage_key"   : storage.get("storage_key"),
+            "storage_url"   : storage.get("storage_url"),
         }
     except Exception as e:
         print(f"[TicketPrinter] ❌ Failed: {e}")

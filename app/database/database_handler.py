@@ -186,7 +186,7 @@ def save_ticket_record(ticket: dict) -> bool:
                     ticket["queue_number"],
                     ticket["short_code"],
                     ticket["jwt_token"],
-                    ticket["pdf_path"],
+                    ticket.get("storage_url") or ticket["pdf_path"],
                     ticket["expires_at"],
                 ),
             )
@@ -208,7 +208,7 @@ def save_ticket_record(ticket: dict) -> bool:
                     ticket["queue_number"],
                     ticket["short_code"],
                     ticket["jwt_token"],
-                    ticket["pdf_path"],
+                    ticket.get("storage_url") or ticket["pdf_path"],
                     ticket["expires_at"],
                 ),
             )
