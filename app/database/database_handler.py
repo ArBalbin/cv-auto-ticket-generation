@@ -564,3 +564,67 @@ def record_counter_config_change(
         print(f"[DB] Error recording counter config change: {exc}")
     finally:
         close_db_resources(cursor, conn)
+
+
+def measure_avg_service_time(num_counters: int, window_minutes: int = 120,
+                              min_samples: int = 5) -> float | None:
+    """Estimate avg service time (minutes/person/counter) from recent served records.
+
+    Uses consecutive inter-departure gaps from served_at timestamps.
+    With c parallel counters all busy: inter_departure ≈ avg_service_time / c,
+    so avg_service_time = mean(gap) * c.
+
+    Gaps > 15 min are excluded (idle counter, not a service completion).
+    Returns None when there are fewer than min_samples valid gaps.
+    """
+    pool = _ensure_db_pool()
+    if pool is None:
+        return None
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if not _table_exists(cursor, "queue_records"):
+            return None
+
+        cursor.execute(
+            """
+            SELECT served_at
+            FROM queue_records
+            WHERE status = 'served'
+              AND served_at IS NOT NULL
+              AND served_at >= DATE_SUB(NOW(), INTERVAL %s MINUTE)
+            ORDER BY served_at ASC
+            """,
+            (window_minutes,),
+        )
+        rows = cursor.fetchall() or []
+        timestamps = [
+            row["served_at"].timestamp() if hasattr(row["served_at"], "timestamp")
+            else float(row["served_at"])
+            for row in rows
+            if row.get("served_at") is not None
+        ]
+
+        if len(timestamps) < min_samples + 1:
+            return None
+
+        gaps = []
+        for i in range(1, len(timestamps)):
+            delta_min = (timestamps[i] - timestamps[i - 1]) / 60.0
+            if 0.1 <= delta_min <= 15.0:
+                gaps.append(delta_min)
+
+        if len(gaps) < min_samples:
+            return None
+
+        measured = (sum(gaps) / len(gaps)) * max(1, num_counters)
+        measured = max(0.5, min(measured, 30.0))
+        return round(measured, 2)
+
+    except Exception as exc:
+        print(f"[DB] measure_avg_service_time error: {exc}")
+        return None
+    finally:
+        close_db_resources(cursor, conn)

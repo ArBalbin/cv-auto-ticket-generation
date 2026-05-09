@@ -75,7 +75,7 @@ FRAME_SCALE   = float(os.getenv("FRAME_SCALE", "0.50"))
 SNAPSHOT_SCALE = float(os.getenv("SNAPSHOT_SCALE", "1.0"))
 
 # YOLO inference image size - smaller = faster, less accurate
-YOLO_IMGSZ    = int(os.getenv("YOLO_IMGSZ", "320"))
+YOLO_IMGSZ    = int(os.getenv("YOLO_IMGSZ", "480"))
 
 # Camera capture resolution
 CAM_WIDTH     = int(os.getenv("CAM_WIDTH",  "1280"))
@@ -89,16 +89,17 @@ QUEUE_CONFIG = {
     "num_counters":     int(os.getenv("NUM_COUNTERS",       "3")),
 }
 
-NMS_IOU_THRESH = float(os.getenv("NMS_IOU_THRESH", "0.40"))
-NMS_DIST_FRAC  = float(os.getenv("NMS_DIST_FRAC",  "0.25"))
+NMS_IOU_THRESH = float(os.getenv("NMS_IOU_THRESH", "0.55"))
+NMS_DIST_FRAC  = float(os.getenv("NMS_DIST_FRAC",  "0.20"))
 PUSH_TIMEOUT   = float(os.getenv("PUSH_TIMEOUT",   "5.0"))
 SNAPSHOT_TIMEOUT = float(os.getenv("SNAPSHOT_TIMEOUT", str(min(PUSH_TIMEOUT, 1.0))))
 SNAPSHOT_FAILURE_DISABLE_AFTER = int(os.getenv("SNAPSHOT_FAILURE_DISABLE_AFTER", "3"))
 SNAPSHOT_FAILURE_BACKOFF_SECONDS = float(os.getenv("SNAPSHOT_FAILURE_BACKOFF_SECONDS", "15"))
 YOLO_CONF      = float(os.getenv("YOLO_CONF",      "0.50"))
-MIN_BBOX_AREA  = int(os.getenv("MIN_BBOX_AREA",    "2000"))
+MIN_BBOX_AREA  = int(os.getenv("MIN_BBOX_AREA",    "1500"))
 MAX_BBOX_FRAC  = float(os.getenv("MAX_BBOX_FRAC",  "0.70"))
 DETECTION_DEBUG_EVERY = int(os.getenv("DETECTION_DEBUG_EVERY", "30"))
+BBOX_EMA_ALPHA  = float(os.getenv("BBOX_EMA_ALPHA",  "0.50"))
 
 
 CAMERA_BACKEND_CODES = {
@@ -613,6 +614,7 @@ def run() -> None:
 
     _fallback: dict = {}
     _next_id        = [1000]
+    _ema_bboxes: dict = {}  # track_id -> smoothed (x1,y1,x2,y2)
 
     def _fallback_id(cx: int, cy: int, bucket: int = 80) -> int:
         key = (cx // bucket, cy // bucket)
@@ -710,6 +712,26 @@ def run() -> None:
             raw = kept
 
             persons, tracked_persons = _run_nms(raw)
+
+            # EMA bbox smoothing — reduces per-frame jitter without hiding real movement
+            _active_tids: set = set()
+            for i, tp in enumerate(tracked_persons):
+                tid = tp["track_id"]
+                x1, y1, x2, y2 = tp["bbox"]
+                _active_tids.add(tid)
+                if tid in _ema_bboxes:
+                    px1, py1, px2, py2 = _ema_bboxes[tid]
+                    x1 = int(BBOX_EMA_ALPHA * x1 + (1 - BBOX_EMA_ALPHA) * px1)
+                    y1 = int(BBOX_EMA_ALPHA * y1 + (1 - BBOX_EMA_ALPHA) * py1)
+                    x2 = int(BBOX_EMA_ALPHA * x2 + (1 - BBOX_EMA_ALPHA) * px2)
+                    y2 = int(BBOX_EMA_ALPHA * y2 + (1 - BBOX_EMA_ALPHA) * py2)
+                    tp["bbox"] = (x1, y1, x2, y2)
+                    persons[i] = (x1, y1, x2, y2)
+                _ema_bboxes[tid] = tp["bbox"]
+            for _tid in list(_ema_bboxes):
+                if _tid not in _active_tids:
+                    del _ema_bboxes[_tid]
+
             if (DETECTION_DEBUG_EVERY > 0 and
                     yolo_frame_idx[0] % DETECTION_DEBUG_EVERY == 0):
                 print("[Detector] detections "

@@ -26,6 +26,7 @@ from core.config import (
 )
 from database.database_handler import (
     fetch_waiting_queue_records,
+    measure_avg_service_time,
     record_counter_config_change,
     record_queue_reset,
     update_queue_status,
@@ -72,6 +73,25 @@ def _on_noshow(queue_number: int) -> None:
     ).start()
 
 
+def _service_time_refresh_loop() -> None:
+    """Background thread: re-measure avg_service_time from DB every 5 minutes."""
+    while True:
+        time.sleep(300)
+        try:
+            num_counters = max(1, int(QUEUE_CONFIG.get("num_counters", 3)))
+            measured = measure_avg_service_time(num_counters)
+            if measured is not None:
+                with _config_lock:
+                    old = QUEUE_CONFIG.get("avg_service_time", 3.0)
+                    # Blend: 70% measured, 30% previous to avoid sudden jumps
+                    blended = round(0.7 * measured + 0.3 * old, 2)
+                    QUEUE_CONFIG["avg_service_time"] = blended
+                print(f"[QueueService] avg_service_time updated: "
+                      f"{old:.2f} → {blended:.2f} min (measured={measured:.2f})")
+        except Exception as exc:
+            print(f"[QueueService] service time refresh error: {exc}")
+
+
 def wire_callbacks() -> None:
     queue_tracker.on_new_person = _on_new_person
     queue_tracker.on_noshow = _on_noshow
@@ -87,6 +107,18 @@ def wire_callbacks() -> None:
     queue_tracker.RECENCY_SINGLE_MATCH_SECONDS = QUEUE_RECENCY_SINGLE_MATCH_SECONDS
     queue_tracker.DEDUP_IOU_THRESH = QUEUE_DEDUP_IOU_THRESH
     queue_tracker.DEDUP_CENTRE_FRAC = QUEUE_DEDUP_CENTRE_FRAC
+
+    queue_tracker._num_counters = max(1, int(QUEUE_CONFIG.get('num_counters', 3)))
+
+    # Store the .env default so build_queue_prediction can label the source.
+    QUEUE_CONFIG.setdefault("_default_avg_service_time",
+                            QUEUE_CONFIG.get("avg_service_time", 3.0))
+
+    threading.Thread(
+        target=_service_time_refresh_loop,
+        daemon=True,
+        name="ServiceTimeRefresh",
+    ).start()
 
 
 def _bbox_iou(a: tuple, b: tuple) -> float:
@@ -303,6 +335,11 @@ def mark_done(queue_number: int, actor_username: str | None = None) -> dict | No
     return queue_tracker.get_state()
 
 
+def force_new_person() -> dict:
+    """Staff manual override — bypass CV confirmation and assign the next queue number."""
+    return queue_tracker.force_new_person()
+
+
 def mark_on_the_way(queue_number: int) -> dict | None:
     return queue_tracker.mark_on_the_way(queue_number)
 
@@ -394,6 +431,7 @@ def set_active_counters(
         )
 
     state.set_active_counters(counters)
+    queue_tracker._num_counters = counters
     threading.Thread(
         target=record_counter_config_change,
         args=(old_counters, counters, avg_service_time, actor_username),
@@ -641,10 +679,17 @@ def build_queue_prediction() -> dict:
             **prediction_for_position(position, avg_service_time, counters),
         })
 
+    _default_svc_time = float(QUEUE_CONFIG.get("_default_avg_service_time",
+                                               QUEUE_CONFIG.get("avg_service_time", 3.0)))
+    service_time_source = (
+        "measured" if abs(avg_service_time - _default_svc_time) > 0.05 else "default"
+    )
+
     return {
         "queue_length": queue_count,
         "active_counters": counters,
-        "avg_service_time_min": round(avg_service_time, 1),
+        "avg_service_time_min": round(avg_service_time, 2),
+        "service_time_source": service_time_source,
         "arrival_rate_per_min": as_float(metrics["arrival_rate"], 0.0),
         "system_utilization": as_float(metrics["system_utilization"], 0.0),
         "data_age_seconds": round(data_age_seconds, 1),

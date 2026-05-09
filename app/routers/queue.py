@@ -40,6 +40,21 @@ def queue_list():
     return queue_service.queue_tracker.get_state()
 
 
+@router.get("/api/queue/display", summary="Queue display board data - PUBLIC", tags=["Queue"])
+def queue_display():
+    state = queue_service.queue_tracker.get_state()
+    config = queue_service.runtime_config()
+    return {
+        "counter_assignments": state["counter_assignments"],
+        "active_queue":        state["active_queue"],
+        "newly_called":        state["newly_called"],
+        "num_counters":        state["num_counters"],
+        "queue_count":         state["queue_count"],
+        "total_served":        state["total_served"],
+        "active_counters":     config.get("active_counters", state["num_counters"]),
+    }
+
+
 @router.get("/api/queue/status", summary="Ticket holder check - PUBLIC", tags=["Queue"])
 def queue_status(q: int, token: str):
     db_pool = get_db_pool()
@@ -187,6 +202,16 @@ def queue_data(username: str = Depends(require_staff)):
     return {
         **state.crowd_prediction_fields(),
         **queue_service.queue_tracker.get_state(),
+    }
+
+
+@router.post("/api/queue/force-new", summary="Staff - manually add a queue entry (twin/CV-miss override)", tags=["Queue"])
+def queue_force_new(username: str = Depends(require_staff)):
+    entry = queue_service.force_new_person()
+    return {
+        "success": True,
+        "message": f"Q{entry['queue_number']:03d} manually added",
+        "person": entry,
     }
 
 

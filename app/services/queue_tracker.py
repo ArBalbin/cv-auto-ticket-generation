@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import secrets
 import statistics
+import threading
 from collections import OrderedDict
 from datetime import datetime, timedelta
 
@@ -12,7 +13,7 @@ class QueuePerson:
         'went_missing_at', 'status', 'missing_frames', 'position_in_line',
         'access_token', 'short_code', 'pdf_path',
         'appearance_signature', 'appearance_history',
-        'on_the_way', 'on_the_way_at'
+        'on_the_way', 'on_the_way_at', 'is_manual', 'counter_number',
     )
 
     def __init__(self, queue_number: int, track_id: int, bbox: tuple):
@@ -32,6 +33,8 @@ class QueuePerson:
         self.appearance_history   = []
         self.on_the_way           = False
         self.on_the_way_at        = None
+        self.is_manual            = False
+        self.counter_number       = None
 
     @property
     def wait_duration(self) -> timedelta:
@@ -80,6 +83,8 @@ class QueuePerson:
             'on_the_way':        self.on_the_way,
             'on_the_way_at':     self.on_the_way_at.isoformat() if self.on_the_way_at else None,
             'on_the_way_at_display': self.on_the_way_at.strftime("%I:%M:%S %p") if self.on_the_way_at else None,
+            'is_manual':         self.is_manual,
+            'counter_number':    self.counter_number,
         }
 
 
@@ -113,10 +118,12 @@ class QueueTracker:
     _DONE_APP_MAX                 = 20
     _HIST_SHAPE                   = (16, 16)
     STATIC_STDEV_THRESHOLD        = 1.5
-    STATIC_CONF_BYPASS_THRESHOLD  = 0.45
+    STATIC_CONF_BYPASS_THRESHOLD  = 0.70
     MIN_PORTRAIT_ASPECT           = 0.50
     DEDUP_IOU_THRESH              = 0.15
     DEDUP_CENTRE_FRAC             = 0.55
+    BBOX_SMOOTH_ALPHA             = 0.45
+    TWIN_LOOKALIKE_SCORE          = 0.85
 
     def __init__(self, zone: QueueZone = None):
         self.zone                        = zone or QueueZone()
@@ -134,6 +141,10 @@ class QueueTracker:
         self.on_noshow                   = None
         self._done_appearances: list     = []
         self._claimed_this_frame: dict   = {}
+        self._lock                       = threading.RLock()
+        self._num_counters               = 3
+        self._announced_numbers: set     = set()
+        self._newly_called: list         = []
 
 
     # SHORT CODE INTEGRATION 
@@ -175,21 +186,42 @@ class QueueTracker:
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w_f - 1, x2), min(h_f - 1, y2)
         crop = frame[y1:y2, x1:x2]
-        if crop.size == 0 or crop.shape[0] < 10 or crop.shape[1] < 10:
+        if crop.size == 0 or crop.shape[0] < 20 or crop.shape[1] < 10:
             return None
-        hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-        cv2.normalize(hist, hist)
-        return hist.flatten()
+
+        def _part_hist(part: np.ndarray) -> np.ndarray:
+            if part.shape[0] < 8 or part.shape[1] < 8:
+                return np.zeros(256, dtype=np.float32)
+            hsv = cv2.cvtColor(part, cv2.COLOR_BGR2HSV)
+            h   = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+            cv2.normalize(h, h)
+            return h.flatten()
+
+        mid_y = crop.shape[0] // 2
+        return np.concatenate([_part_hist(crop[:mid_y, :]), _part_hist(crop[mid_y:, :])])
 
     @staticmethod
     def _compare_sigs(sig1: np.ndarray, sig2: np.ndarray) -> float:
         if sig1 is None or sig2 is None:
             return 0.0
+        if sig1.shape[0] == 512 and sig2.shape[0] == 512:
+            upper = float(cv2.compareHist(
+                sig1[:256].reshape(16, 16).astype(np.float32),
+                sig2[:256].reshape(16, 16).astype(np.float32),
+                cv2.HISTCMP_CORREL,
+            ))
+            lower = float(cv2.compareHist(
+                sig1[256:].reshape(16, 16).astype(np.float32),
+                sig2[256:].reshape(16, 16).astype(np.float32),
+                cv2.HISTCMP_CORREL,
+            ))
+            # Upper body (shirt) is more discriminative — weight it more
+            return 0.6 * upper + 0.4 * lower
+        # fallback for legacy 256-value signatures
         return float(cv2.compareHist(
             sig1.reshape(16, 16).astype(np.float32),
             sig2.reshape(16, 16).astype(np.float32),
-            cv2.HISTCMP_CORREL
+            cv2.HISTCMP_CORREL,
         ))
 
     def _best_score_against_person(self, person: QueuePerson, sig: np.ndarray) -> float:
@@ -266,9 +298,36 @@ class QueueTracker:
                 best_score, best_tid, best_p = s, tid, p
         return best_tid, best_p, best_score
 
+    def _has_active_lookalike(self, new_sig: np.ndarray, current_track_ids: set) -> bool:
+        """True when the incoming signature already closely matches a person currently in frame.
+
+        This catches the twin scenario: twin B enters while twin A (Q001) is missing.
+        If the candidate looks like twin B who is already tracked, block re-match to Q001
+        so the new entrant gets their own number instead of inheriting Q001.
+        """
+        if new_sig is None:
+            return False
+        thresh = self.TWIN_LOOKALIKE_SCORE
+        for tid, p in self.active_queue.items():
+            if tid not in current_track_ids:
+                continue
+            if p.status == 'done_pending':
+                continue
+            score = self._best_score_against_person(p, new_sig)
+            if score >= thresh:
+                print(f"⚠️  Twin ambiguity: candidate matches active Q{p.queue_number:03d} "
+                      f"(score={score:.2f}) — new number will be assigned")
+                return True
+        return False
+
     def _find_returning_person(self, bbox, new_sig, current_track_ids):
         if self._matches_done_person(new_sig):
             print("🚫 Matches done blacklist — new number will be assigned")
+            return None, None, 0.0
+
+        # Twin/lookalike guard: if this candidate already strongly matches someone
+        # currently in frame, they are a different person — don't re-use a missing number.
+        if self._has_active_lookalike(new_sig, current_track_ids):
             return None, None, 0.0
 
         missing = self._get_missing_persons(current_track_ids)
@@ -410,13 +469,13 @@ class QueueTracker:
                 'total_wait_time':   p.wait_time_str,
                 'bump_reason':       'no_show',
             })
-            self.completed_queue.append(completed)
-            self.total_served += 1
+            with self._lock:
+                self.completed_queue.append(completed)
+                self.total_served += 1
             self._register_done_appearance(p)
             p.status         = 'done_pending'
             p.missing_frames = self.MAX_MISSING_FRAMES + 1
             self._done_cooldowns.append({'bbox': p.bbox, 'frames_left': self.DONE_COOLDOWN_FRAMES})
-            self._recalculate_positions()
 
             if self.on_noshow:
                 try:
@@ -595,7 +654,13 @@ class QueueTracker:
 
             if track_id in self.active_queue:
                 p                = self.active_queue[track_id]
-                p.bbox           = bbox
+                a = self.BBOX_SMOOTH_ALPHA
+                p.bbox           = (
+                    int(a * bbox[0] + (1 - a) * p.bbox[0]),
+                    int(a * bbox[1] + (1 - a) * p.bbox[1]),
+                    int(a * bbox[2] + (1 - a) * p.bbox[2]),
+                    int(a * bbox[3] + (1 - a) * p.bbox[3]),
+                )
                 p.last_seen      = datetime.now()
                 p.missing_frames = 0
                 if frame is not None and p.wait_time_seconds % 30 == 0:
@@ -713,9 +778,11 @@ class QueueTracker:
                     final_person, final_tid, track_id, frame, bbox, new_sig)
                 continue
 
-            # Confirmed new person 
-            self._highest_assigned += 1
-            num   = self._highest_assigned
+            # Confirmed new person
+            with self._lock:
+                self._highest_assigned += 1
+                num = self._highest_assigned
+                self._used_numbers.add(num)
             new_p = QueuePerson(queue_number=num, track_id=track_id, bbox=bbox)
 
             cand_sigs = cand.get('sigs', [])
@@ -727,7 +794,6 @@ class QueueTracker:
 
             self._candidates.pop(track_id)
             self.active_queue[track_id] = new_p
-            self._used_numbers.add(num)
             print(f"🆕 Q{num:03d} NEW person (track_id={track_id})")
 
             if self.on_new_person:
@@ -737,11 +803,13 @@ class QueueTracker:
                 except Exception as e:
                     print(f"⚠️  on_new_person callback error: {e}")
 
-        # Absent person handling 
+        # Absent person handling
         to_remove = []
         for tid, p in self.active_queue.items():
             if tid in current_in_zone:
                 continue
+            if p.is_manual:
+                continue  # manual entries never auto-expire
             p.missing_frames += 1
 
             if p.status == 'done_pending':
@@ -765,8 +833,8 @@ class QueueTracker:
             del self.active_queue[tid]
 
         self._dedup_active_queue()
-        self._recalculate_positions()
         self._check_noshow()
+        self._recalculate_positions()
         return self.get_state()
 
 
@@ -784,16 +852,47 @@ class QueueTracker:
 
                 p.status           = 'done_pending'
                 p.position_in_line = 0
-                self.total_served  += 1
                 self._register_done_appearance(p)
                 self._done_cooldowns.append(
                     {'bbox': p.bbox, 'frames_left': self.DONE_COOLDOWN_FRAMES})
-                self.completed_queue.append(self._make_completed_entry(p, 'served'))
-                self._noshow_timers.pop(queue_number, None)
+                with self._lock:
+                    self.total_served += 1
+                    self.completed_queue.append(self._make_completed_entry(p, 'served'))
+                    self._noshow_timers.pop(queue_number, None)
                 self._recalculate_positions()
                 print(f"✅ Q{queue_number:03d} DONE | Wait: {p.wait_time_str}")
                 return True
         return False
+
+    def force_new_person(self) -> dict:
+        """Staff override: assign the next queue number without waiting for CV confirmation.
+
+        Use this when the camera fails to detect someone or when identical twins enter
+        simultaneously and one is not auto-assigned a ticket.
+        The created entry persists in the active queue until staff marks it done; it is
+        never expired automatically by the missing-frames timeout.
+        """
+        with self._lock:
+            self._highest_assigned += 1
+            num = self._highest_assigned
+            self._used_numbers.add(num)
+
+        fake_tid = -(num)
+        new_p            = QueuePerson(queue_number=num, track_id=fake_tid, bbox=(0, 0, 1, 1))
+        new_p.is_manual  = True
+
+        self.active_queue[fake_tid] = new_p
+        self._recalculate_positions()
+
+        if self.on_new_person:
+            try:
+                self.on_new_person(num, new_p.wait_time_str,
+                                   new_p.joined_at_str, new_p.access_token)
+            except Exception as e:
+                print(f"⚠️  on_new_person callback error (force): {e}")
+
+        print(f"👤 Q{num:03d} FORCE-NEW by staff (manual override)")
+        return new_p.to_dict()
 
     def _append_on_the_way_notification(self, queue_number: int, when: datetime) -> dict:
         notification = {
@@ -899,8 +998,21 @@ class QueueTracker:
             (p for p in self.active_queue.values() if p.status in ('waiting', 'missing')),
             key=lambda x: x.queue_number
         )
+        newly_called = []
         for i, p in enumerate(active_line):
             p.position_in_line = i + 1
+            if (i + 1) <= self._num_counters:
+                p.counter_number = i + 1
+                if p.queue_number not in self._announced_numbers:
+                    self._announced_numbers.add(p.queue_number)
+                    newly_called.append({
+                        'queue_number':  p.queue_number,
+                        'queue_label':   f"Q{p.queue_number:03d}",
+                        'counter_number': i + 1,
+                    })
+            else:
+                p.counter_number = None
+        self._newly_called = newly_called
 
     def get_state(self) -> dict:
         active = sorted(
@@ -908,6 +1020,11 @@ class QueueTracker:
              if p.status in ('waiting', 'missing')),
             key=lambda x: x['queue_number']
         )
+        counter_assignments = [
+            p for p in active if p.get('counter_number') is not None
+        ]
+        newly_called = list(self._newly_called)
+        self._newly_called = []
         return {
             'active_queue':          active,
             'queue_count':           len(active),
@@ -917,6 +1034,9 @@ class QueueTracker:
             'noshow_alerts':         self.get_noshow_alerts(),
             'on_way_notifications':  self.on_way_notifications[-10:],
             'appearance_rejections': self.appearance_rejections[-5:],
+            'counter_assignments':   counter_assignments,
+            'newly_called':          newly_called,
+            'num_counters':          self._num_counters,
         }
 
 

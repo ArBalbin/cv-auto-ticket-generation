@@ -1,10 +1,3 @@
--- QueueFlow clean Aiven schema.
---
--- Use this when you want to reset the Aiven database and recreate all
--- QueueFlow tables cleanly.
---
--- WARNING:
--- This deletes existing QueueFlow data in defaultdb.
 
 USE defaultdb;
 
@@ -53,6 +46,8 @@ CREATE TABLE queue_records (
     INDEX idx_status (status),
     INDEX idx_expires_at (expires_at),
     INDEX idx_queue_status_created (queue_number, status, created_at),
+    INDEX idx_service_date_status (service_date, status),
+    INDEX idx_created_at (created_at),
     INDEX idx_created_by_user_id (created_by_user_id),
     INDEX idx_served_by_user_id (served_by_user_id),
     CONSTRAINT fk_queue_records_created_by
@@ -72,7 +67,8 @@ CREATE TABLE crowd_snapshots (
     queue_length     INT      NOT NULL DEFAULT 0,
     active_counters  INT      NOT NULL DEFAULT 3,
     est_wait_minutes FLOAT    NOT NULL DEFAULT 0.0,
-    INDEX idx_recorded_at (recorded_at)
+    INDEX idx_recorded_at (recorded_at),
+    INDEX idx_recorded_at_counts (recorded_at, person_count, queue_length)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE queue_events (
