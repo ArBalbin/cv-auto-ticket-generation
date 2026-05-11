@@ -137,12 +137,6 @@ def queue_on_way(body: OnWayBody):
             status_code=403,
             detail="Invalid token. Please check your ticket.",
         )
-    if queue_service.as_int(result.get("position_in_line"), 0) > 1:
-        raise HTTPException(
-            status_code=409,
-            detail="You can notify staff when you are next in line.",
-        )
-
     person = queue_service.mark_on_the_way(body.queue_number)
     if person is None:
         notification = queue_service.record_on_the_way_signal(body.queue_number)
