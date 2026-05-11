@@ -342,10 +342,6 @@ class QueueTracker:
             secs = p.seconds_missing
 
             if secs <= self.RECENCY_SINGLE_MATCH_SECONDS:
-                # Appearance available — it is the final word.
-                # Do NOT fall through to spatial if appearance disagrees;
-                # a different person standing in the same spot must get
-                # a new number, not inherit the old one.
                 if new_sig is not None and p.appearance_signature is not None:
                     score = self._best_score_against_person(p, new_sig)
 
@@ -354,19 +350,25 @@ class QueueTracker:
                               f"— appearance restore (score={score:.2f})")
                         return tid, p, score
 
-                    # Appearance below threshold — different person.
+                    # Appearance below threshold — try spatial as fallback
+                    # (low-quality camera produces unreliable colour histograms)
+                    sp_score = self._spatial_score(p.bbox, bbox)
+                    if sp_score < 0.55:
+                        print(f"✅ Single absent Q{p.queue_number:03d} ({secs:.1f}s) "
+                              f"— spatial fallback (app={score:.2f}, dist={sp_score:.2f})")
+                        return tid, p, 0.6
+
                     print(f"⚠️  Q{p.queue_number:03d} ({secs:.1f}s) appearance={score:.2f} "
-                          f"< {tbreak} — different person → new number")
+                          f"< {tbreak} and too far (dist={sp_score:.2f}) → new number")
                     return None, None, 0.0
 
                 # No appearance data on either side — spatial is the only signal.
                 sp_score = self._spatial_score(p.bbox, bbox)
-                if sp_score < 0.60:
+                if sp_score < 0.70:
                     print(f"✅ Single absent Q{p.queue_number:03d} ({secs:.1f}s) "
                           f"— recency+spatial restore (dist={sp_score:.2f}, no appearance)")
                     return tid, p, 0.8
 
-                # Far away and no appearance — do not blindly restore
                 print(f"⚠️  Q{p.queue_number:03d} ({secs:.1f}s) too far (dist={sp_score:.2f}) "
                       f"and no appearance data — new number")
                 return None, None, 0.0
