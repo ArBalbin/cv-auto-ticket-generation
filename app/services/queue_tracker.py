@@ -1000,20 +1000,34 @@ class QueueTracker:
             (p for p in self.active_queue.values() if p.status in ('waiting', 'missing')),
             key=lambda x: x.queue_number
         )
-        newly_called = []
+
+        # Recalculate positions
         for i, p in enumerate(active_line):
             p.position_in_line = i + 1
-            if (i + 1) <= self._num_counters:
-                p.counter_number = i + 1
+
+        # Keep existing counter assignments sticky — find which counters are free
+        occupied = {p.counter_number for p in active_line if p.counter_number is not None}
+        free_counters = sorted(
+            c for c in range(1, self._num_counters + 1) if c not in occupied
+        )
+
+        # Assign free counters only to unassigned people within counter range
+        newly_called = []
+        free_idx = 0
+        for p in active_line:
+            if p.counter_number is not None:
+                continue
+            if p.position_in_line <= self._num_counters and free_idx < len(free_counters):
+                p.counter_number = free_counters[free_idx]
+                free_idx += 1
                 if p.queue_number not in self._announced_numbers:
                     self._announced_numbers.add(p.queue_number)
                     newly_called.append({
-                        'queue_number':  p.queue_number,
-                        'queue_label':   f"Q{p.queue_number:03d}",
-                        'counter_number': i + 1,
+                        'queue_number':   p.queue_number,
+                        'queue_label':    f"Q{p.queue_number:03d}",
+                        'counter_number': p.counter_number,
                     })
-            else:
-                p.counter_number = None
+
         self._newly_called = newly_called
 
     def get_state(self) -> dict:
