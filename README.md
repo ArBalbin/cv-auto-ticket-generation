@@ -1,208 +1,201 @@
-# 🎫 Queue Auto Ticket Generation using Computer Vision
+# QueueFlow
 
-![Python](https://img.shields.io/badge/Python-3.12-blue) ![YOLOv8](https://img.shields.io/badge/YOLOv8-Ultralytics-brightgreen) ![OpenCV](https://img.shields.io/badge/OpenCV-4.x-red) ![License](https://img.shields.io/badge/License-MIT-yellow)
+QueueFlow is a computer-vision-based queue monitoring and automated queue ticket
+prototype for campus service offices. It uses a local camera and YOLOv8n person
+detection to identify people entering a queue zone, assigns queue numbers,
+generates QR-enabled queue tickets, stores queue records in MySQL, and exposes
+staff dashboard and student queue-status APIs through a FastAPI backend.
 
-## 📌 Overview
+The target deployment uses a thermal printer for physical queue tickets. The
+current prototype generates PDF tickets with the same queue number, short code,
+QR link, and JWT-backed validation flow so the ticket workflow can be demonstrated
+without printer hardware.
 
-The **Queue Auto Ticket Generation System** is an AI-powered solution that uses computer vision to detect when a person joins a queue and automatically generates and prints a ticket via a **thermal printer** — eliminating the need for manual ticket dispensing.
+## Current Progress
 
-The system uses YOLOv8 to detect people in real-time from a camera feed. Once a person is detected entering the queue, a ticket is automatically issued and printed, streamlining the queuing process for public services, hospitals, government offices, and similar environments.
+Last updated: May 12, 2026
 
----
+Implemented:
 
-## ⚠️ Important: Files Not Included in This Repository
+- FastAPI backend with dashboard routes, auth routes, detector upload routes,
+  queue APIs, crowd APIs, and health check.
+- Separate OpenCV + YOLOv8n detector process that reads a camera feed, performs
+  person detection/tracking, sends metadata to the backend, and uploads annotated
+  snapshots for the dashboard.
+- Queue tracker with queue-zone filtering, candidate confirmation, duplicate
+  suppression, hybrid re-entry matching, no-show handling, manual force-new
+  override, and staff done/reset actions.
+- Ticket worker that generates PDF queue tickets with QR codes, short codes, JWT
+  tokens, and MySQL persistence.
+- Wait-time prediction using an M/M/c baseline, short trend projection, Holt's
+  double exponential smoothing, and growth-ratio mean reversion for current,
+  5-minute, 15-minute, and 30-minute estimates.
+- MySQL schemas for users, queue records, queue events, counter configuration
+  history, and crowd snapshots.
+- Optional Redis cache for live state/snapshot mirroring in cloud deployments.
+- Optional S3-compatible object storage support for generated ticket PDFs.
+- Render/cloud deployment files and production environment examples.
 
-To keep this repository lightweight, the following large files have been **excluded** and must be downloaded separately before running the system:
+In progress / demo-limited:
 
-### 1. 🤖 Trained Model Weights (`best.pt`)
-Our custom-trained YOLOv8 model weights are stored on Google Drive.
+- Thermal printer integration is planned for final deployment; PDF ticket
+  generation is the current demo fallback.
+- Detector still runs on the camera-connected local machine even when the
+  FastAPI backend is cloud-hosted.
+- Mobile app integration is documented as a consuming client for QR/status lookup;
+  this repository contains the backend, detector, dashboard, and ticket services.
+- Live testing depends on available camera position, queue-zone calibration, and
+  local service-office conditions.
 
-📥 **Download here:** `[INSERT GOOGLE DRIVE LINK]`
+## Repository Structure
 
-After downloading, place the file here:
+```text
+Crowd_Monitoring/
+|-- app/
+|   |-- main.py                    # FastAPI app entry point
+|   |-- detector.py                # Camera + YOLOv8n detector process
+|   |-- state.py                   # Runtime state and snapshot helpers
+|   |-- core/
+|   |   |-- config.py              # Environment/config validation
+|   |   `-- security.py            # Auth, sessions, staff registration
+|   |-- database/
+|   |   `-- database_handler.py    # MySQL pool and persistence helpers
+|   |-- routers/
+|   |   |-- auth.py                # /api/auth/*
+|   |   |-- crowd.py               # /api/stats, snapshot, history, video
+|   |   |-- detector_api.py        # /yolo/push-frame, /yolo/update
+|   |   |-- health.py              # /health
+|   |   |-- pages.py               # HTML dashboard/login routes
+|   |   `-- queue.py               # /api/queue/*
+|   |-- services/
+|   |   |-- cache_service.py       # Optional Redis cache
+|   |   |-- object_storage_service.py
+|   |   |-- prediction_service.py  # M/M/c + trend/Holt/mean-reversion forecasts
+|   |   |-- queue_service.py       # Queue business logic
+|   |   |-- queue_tracker.py       # Queue number tracking and re-entry matching
+|   |   |-- ticket_printer.py      # PDF ticket, QR, JWT, short code
+|   |   `-- ticket_service.py      # Background ticket worker
+|   `-- templates/                 # Dashboard/login/register pages
+|-- database_sql/                  # Local/cloud database schemas
+|-- ML/                            # Training-related files
+|-- Model/                         # Place YOLO weights here
+|-- CURRENT_PROGRESS.md            # Current implementation progress
+|-- ALGORITHMS.md                  # Algorithm reference
+|-- SYSTEM_ARCHITECTURE_DOCUMENTATION.md
+|-- SYSTEM_DATAFLOW_DOCUMENTATION.md
+|-- SYSTEM_FLOW_DOCUMENTATION.md
+|-- DATABASE_RELATIONSHIPS_DOCUMENTATION.md
+|-- CLOUD_DEPLOYMENT_CHECKLIST.md
+|-- CLOUD_CACHE_SETUP.md
+|-- Dockerfile
+|-- Procfile
+|-- render.yaml
+`-- requirements.txt
 ```
-cv-auto-ticket-generation/
-└── weights/
-    └── best.pt
-```
 
----
+## Requirements
 
-### 2. 📦 Base YOLOv8 Model (`yolov8n.pt`)
-The base YOLOv8n model can be downloaded directly from Ultralytics:
+- Python 3.12
+- MySQL database
+- Camera connected to the detector machine
+- YOLOv8n weights at `Model/yolov8n.pt`
+- Optional Redis instance for cloud cache
+- Optional S3-compatible object storage for ticket PDFs
+- Thermal printer for final deployment, or PDF output for prototype demo
 
-📥 **Download here:** https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt
+Install Python dependencies:
 
-Place it in the root of the project:
-```
-cv-auto-ticket-generation/
-└── yolov8n.pt
-```
-
-Or simply run the app — Ultralytics will auto-download it on first run.
-
----
-
-### 3. 🗂️ Dataset (`data/`)
-The training dataset (images + labels) is not included due to its large size.
-
-📥 **Download here:** `[INSERT GOOGLE DRIVE LINK]`
-
-After downloading and extracting, place the folder here:
-```
-cv-auto-ticket-generation/
-└── data/
-    ├── images/
-    │   ├── train/
-    │   └── val/
-    └── labels/
-        ├── train/
-        └── val/
-```
-
----
-
-## 🚀 Setup & Installation
-
-### 1. Clone the repository
-```bash
-git clone https://github.com/ArBalbin/cv-auto-ticket-generation.git
-cd cv-auto-ticket-generation
-```
-
-### 2. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Set up environment variables
-Create a `.env` file in the root directory:
+## Environment Setup
+
+Copy `.env.example` to `.env`, then fill in values for:
+
+- `APP_ENV`
+- `PORTAL_BASE_URL`
+- `CAM_TOKEN`
+- `JWT_SECRET_KEY`
+- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
+- `STAFF_REGISTRATION_ENABLED`
+- `STAFF_REGISTRATION_CODE`
+- camera and YOLO tuning values as needed
+
+For production/cloud setup, use `.env.production.example` as the starting point.
+
+## Database Setup
+
+For a fresh cloud database, import:
+
+```text
+database_sql/schema_cloud_ready.sql
 ```
-EMAIL_SENDER=your_email@gmail.com
-EMAIL_PASSWORD=your_app_password
-EMAIL_RECEIVER=receiver_email@gmail.com
-PRINTER_NAME=your_thermal_printer_name
+
+For a clean Aiven reset that drops and recreates QueueFlow tables, use:
+
+```text
+database_sql/aiven_clean_full_schema.sql
 ```
 
-### 4. Connect your Thermal Printer
-- Install your thermal printer driver
-- Make sure it is set as the **default printer** on your system
-- Update `PRINTER_NAME` in your `.env` to match your printer's name
+## Running Locally
 
-### 5. Download missing files
-heres the link: 
-Follow the **⚠️ Important** section above to download: 
-- `best.pt` → place in `weights/`
-- `yolov8n.pt` → place in root
-- `data/` → place in root
+Start the FastAPI backend:
 
-### 6. Run the application
 ```bash
-cd app
-python main.py
+python app/main.py
 ```
 
-Queue analytics is available at:
-- Page: `http://localhost:5000/dashboard/queue-analytics`
-- API: `http://localhost:5000/api/queue/analytics`
+Or with Uvicorn:
 
-### Cloud deployment
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 5000
+```
 
-For cloud deployment, use the checklist in `CLOUD_DEPLOYMENT_CHECKLIST.md`.
+Start the detector in a separate terminal on the camera-connected machine:
+
+```bash
+python app/detector.py
+```
+
+Common local URLs:
+
+- Login: `http://localhost:5000/login`
+- Queue dashboard: `http://localhost:5000/dashboard/queueflow`
+- Queue analytics: `http://localhost:5000/dashboard/queue-analytics`
+- Computer vision dashboard: `http://localhost:5000/dashboard/computer-vision`
+- Health check: `http://localhost:5000/health`
+- Queue list API: `http://localhost:5000/api/queue/list`
+- Queue prediction API: `http://localhost:5000/api/queue/prediction`
+
+## Cloud Deployment
+
+Cloud deployment is supported for the FastAPI backend. The detector should still
+run on the local machine connected to the camera, with `API_BASE_URL` pointed to
+the hosted backend URL.
 
 Minimum cloud start command:
+
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
 ```
 
-Set `PORTAL_BASE_URL` to your public cloud URL before generating tickets so QR codes point to the hosted backend. The detector should still run on the computer connected to the camera, with `API_BASE_URL` set to the cloud URL.
+Use these docs for deployment:
 
-Ticket output note: the target deployment uses a thermal printer at the queue area, but this prototype currently generates PDF tickets as a temporary replacement while no thermal printer is available.
+- `CLOUD_DEPLOYMENT_CHECKLIST.md`
+- `CLOUD_CACHE_SETUP.md`
 
-Staff registration is available at `/register` when `STAFF_REGISTRATION_ENABLED=1`. For cloud deployments, set `STAFF_REGISTRATION_CODE` so only authorized staff can create dashboard accounts.
+## Important Documentation
 
-For cloud MySQL, use `database_sql/schema_cloud_ready.sql` for a fresh database. For a clean Aiven reset that drops and recreates all QueueFlow tables, use `database_sql/aiven_clean_full_schema.sql`.
+- `CURRENT_PROGRESS.md` - current progress, completed work, remaining work
+- `SYSTEM_ARCHITECTURE_DOCUMENTATION.md` - component architecture
+- `SYSTEM_FLOW_DOCUMENTATION.md` - end-to-end runtime flow
+- `SYSTEM_DATAFLOW_DOCUMENTATION.md` - data movement and storage
+- `DATABASE_RELATIONSHIPS_DOCUMENTATION.md` - database entities and relations
+- `ALGORITHMS.md` - detection, queue tracking, re-ID, no-show, prediction
 
-Redis caching is enabled by setting `REDIS_URL`. Ticket PDF object storage is optional and S3-compatible; enable it with `OBJECT_STORAGE_ENABLED=1` and the `OBJECT_STORAGE_*` environment variables shown in `.env.example`.
-
----
-
-## 🔄 How It Works
-
-```
-Camera Feed
-    ↓
-YOLOv8 detects person entering queue
-    ↓
-System assigns queue number
-    ↓
-Ticket is auto-generated
-    ↓
-Thermal printer prints the ticket
-    ↓
-Person receives their queue number
-```
-
----
-
-## 📂 Project Structure
-
-```
-cv-auto-ticket-generation/
-├── app/
-│   ├── main.py                  # FastAPI app entry point
-│   ├── detector.py              # Camera + YOLO detector process
-│   ├── state.py                 # Shared API state
-│   ├── core/
-│   │   ├── config.py            # Environment/config values
-│   │   └── security.py          # Auth/session/camera-token helpers
-│   ├── database/
-│   │   └── database_handler.py  # DB pool and DB helpers
-│   ├── routers/
-│   │   ├── auth.py              # /api/auth/*
-│   │   ├── crowd.py             # /api/stats, snapshot, history
-│   │   ├── detector_api.py      # /yolo/*
-│   │   ├── health.py            # /health
-│   │   ├── pages.py             # HTML dashboard routes
-│   │   └── queue.py             # /api/queue/*
-│   ├── services/
-│   │   ├── prediction_service.py # Wait-time prediction helpers
-│   │   ├── queue_service.py      # Queue API business logic
-│   │   ├── queue_tracker.py      # Queue number tracking
-│   │   ├── ticket_printer.py     # Ticket PDF/QR generation
-│   │   └── ticket_service.py     # Background ticket worker
-│   └── tickets/                 # Generated ticket PDFs
-├── ML/                          # Model training files
-├── Model/                       # Place model weights here
-├── .env                         # Create this locally
-├── requirements.txt
-└── README.md
-```
-
----
-
-## ⚙️ Technologies Used
-
-| Technology | Purpose |
-|---|---|
-| Python 3.12 | Core programming language |
-| YOLOv8 (Ultralytics) | Real-time person detection |
-| OpenCV | Camera feed processing |
-| Thermal Printer | Auto ticket printing |
-| Arduino | IoT buzzer/alert integration |
-| NumPy | Numerical operations |
-
----
-
-## 👥 Team
+## Team
 
 | Name | GitHub |
 |---|---|
 | Archie Balbin | [@ArBalbin](https://github.com/ArBalbin) |
-| *(more members coming soon)* | — |
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License. See the [License](License) file for details.

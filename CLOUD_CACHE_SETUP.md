@@ -3,6 +3,15 @@
 Use Redis for temporary live data when deploying QueueFlow to cloud.
 Permanent records still belong in MySQL.
 
+## Current Progress Snapshot
+
+Last updated: May 12, 2026
+
+Redis cache support is implemented but optional. When `REDIS_URL` is set, live
+queue state, recent history, and the latest annotated snapshot can be mirrored to
+Redis so a cloud-hosted backend can serve dashboard data more reliably. When
+Redis is not configured or unavailable, QueueFlow falls back to process memory.
+
 ## What Redis Stores
 
 - `queueflow:snapshot:latest`: latest annotated JPEG snapshot, short TTL

@@ -1,5 +1,19 @@
 # QueueFlow System Flow Documentation
 
+## Current Progress Snapshot
+
+Last updated: May 12, 2026
+
+The current flow is functional for prototype demonstration: the detector reads a
+camera feed, YOLOv8n tracks persons, detection metadata is pushed to the FastAPI
+backend, the queue tracker confirms entrants, ticket jobs are generated in a
+background worker, PDF tickets are created with QR/short-code credentials, and
+queue records are stored in MySQL.
+
+Thermal printer output is the intended final ticket channel. PDF ticket
+generation is the current substitute so the queue-ticket workflow can be tested
+without printer hardware.
+
 ## 1. System Overview
 
 QueueFlow is a computer-vision-based queue monitoring and ticket tracking system.

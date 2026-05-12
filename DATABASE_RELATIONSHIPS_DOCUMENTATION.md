@@ -2,6 +2,20 @@
 
 This document explains the cloud-ready database structure used by QueueFlow.
 
+## Current Progress Snapshot
+
+Last updated: May 12, 2026
+
+The current schema supports staff users, queue ticket records, queue event
+history, counter-configuration history, and crowd snapshots. Queue ticket records
+store the queue number, short code, JWT token, PDF path, status, expiration, and
+served/no-show timing. The database also supports measuring average service time
+from served records so the prediction module can refresh service-time assumptions.
+
+The active schema for new cloud databases is `database_sql/schema_cloud_ready.sql`.
+For a full Aiven reset during development, use
+`database_sql/aiven_clean_full_schema.sql`.
+
 ## Main Entities
 
 ### users

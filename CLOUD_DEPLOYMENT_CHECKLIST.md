@@ -2,6 +2,19 @@
 
 This checklist covers the app/cloud setup only. Database schema, users, and records are intentionally left for your own database setup.
 
+## Current Progress Snapshot
+
+Last updated: May 12, 2026
+
+The backend is cloud-ready through `Dockerfile`, `Procfile`, `render.yaml`, and
+`.env.production.example`. The cloud deployment hosts the FastAPI backend,
+dashboard routes, queue APIs, ticket/status APIs, database access, optional Redis
+cache, and optional object storage. The YOLO detector still runs on the local
+camera-connected machine and pushes to the cloud backend through `API_BASE_URL`.
+
+PDF ticket generation is currently the active demo output. Thermal printing is
+the target production output and still needs hardware integration/testing.
+
 ## 1. Required Cloud Environment Variables
 
 Copy `.env.example` into your cloud provider's environment variable settings and replace the placeholders.

@@ -1,5 +1,18 @@
 # QueueFlow System Dataflow Documentation
 
+## Current Progress Snapshot
+
+Last updated: May 12, 2026
+
+The implemented dataflow covers live detector metadata, annotated snapshots,
+queue records, ticket credentials, staff dashboard data, student status lookup,
+and wait-time prediction outputs. MySQL is used for durable queue/ticket records
+and event history. Process memory stores the latest live state, and Redis can
+mirror live state and snapshots when configured for cloud deployment.
+
+Generated ticket PDFs are local by default. Optional S3-compatible object storage
+can upload ticket PDFs for cloud/demo environments.
+
 ## 1. Purpose
 
 This document explains how data moves through the QueueFlow system.

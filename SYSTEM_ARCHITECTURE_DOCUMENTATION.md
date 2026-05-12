@@ -1,5 +1,20 @@
 # QueueFlow System Architecture Documentation
 
+## Current Progress Snapshot
+
+Last updated: May 12, 2026
+
+QueueFlow is currently implemented as a FastAPI backend plus a separate local
+YOLOv8n/OpenCV detector process. The backend, queue tracker, ticket worker,
+MySQL persistence, dashboard routes, detector upload endpoints, prediction
+service, optional Redis cache, and optional S3-compatible ticket object storage
+are already present in the codebase.
+
+The production target is thermal-printer ticket output at the queue area. The
+current prototype uses PDF tickets as a demo fallback while printer hardware is
+not yet attached. Cloud deployment supports the backend, but the detector still
+runs on the camera-connected local machine and pushes frames to the hosted API.
+
 ## 1. Architecture Overview
 
 QueueFlow is designed as a modular computer-vision queue monitoring system.

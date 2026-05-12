@@ -1,8 +1,27 @@
-# QueueFlow — Core Algorithm Reference
+# QueueFlow - Core Algorithm Reference
 
 This document describes the algorithms powering the five core subsystems of QueueFlow:
 person detection, appearance-based re-identification, queue management, wait-time forecasting,
 and the public display board. Every code sample is taken directly from the production source.
+
+---
+
+## Current Progress Snapshot
+
+Last updated: May 12, 2026
+
+The algorithms in this document reflect the current prototype implementation.
+The active detector uses YOLOv8n with OpenCV camera capture. Queue tracking
+includes queue-zone filtering, candidate confirmation, static rejection,
+duplicate suppression, hybrid re-entry matching, no-show handling, manual
+force-new override, and done/reset support. Wait-time prediction currently uses
+an M/M/c baseline, short trend projection, Holt's double exponential smoothing,
+and growth-ratio mean reversion for the current, 5-minute, 15-minute, and
+30-minute dashboard estimates.
+
+Thermal printer output is not yet the active runtime output. Ticket generation
+currently produces PDF tickets with QR codes and short-code/JWT credentials as a
+demo replacement.
 
 ---
 
