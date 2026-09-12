@@ -33,7 +33,7 @@ from core.config import (
     validate_cloud_config,
 )
 from database.database_handler import warm_up_db_pool
-from routers import auth, crowd, detector_api, health, pages, queue
+from routers import auth, crowd, detector_api, health, queue, students
 
 
 @asynccontextmanager
@@ -99,11 +99,11 @@ async def unhandled_error_handler(request: Request, exc: Exception):
     )
 
 
-app.include_router(pages.router)
 app.include_router(auth.router)
 app.include_router(detector_api.router)
 app.include_router(crowd.router)
 app.include_router(queue.router)
+app.include_router(students.router)
 app.include_router(health.router)
 
 
@@ -126,6 +126,18 @@ if __name__ == "__main__":
         print("[API] Close the previous backend terminal, then run main.py again.")
         print(f"[API] To find the process: Get-NetTCPConnection -LocalPort {api_port} -State Listen")
         sys.exit(1)
+
+    # Say which URL goes into every printed ticket's QR code, because getting
+    # it wrong is invisible until a student scans a ticket and nothing loads.
+    from core.config import PORTAL_BASE_URL, _portal_autodetected
+
+    print(f"[API] Ticket QR codes will point to: {PORTAL_BASE_URL}")
+    if _portal_autodetected:
+        print("[API]   (auto-detected LAN address — phones on this same Wi-Fi")
+        print("[API]    can reach it; set PORTAL_BASE_URL in .env to override)")
+    elif "localhost" in PORTAL_BASE_URL or "127.0.0.1" in PORTAL_BASE_URL:
+        print("[API]   WARNING: loopback address. A student scanning a printed")
+        print("[API]   ticket will hit their OWN phone, not this server.")
 
     reload_enabled = os.getenv("API_RELOAD", "0").strip() == "1"
     reload_options = {}

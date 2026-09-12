@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 
 from reportlab.lib.units import mm as mmUnit
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.colors import HexColor
 from reportlab.lib.utils import ImageReader
@@ -21,10 +22,14 @@ from services import object_storage_service
 # through a thermal printer. For the prototype/cloud demo, it generates a PDF
 # ticket with the same queue number, QR code, and access token.
 TICKET_WIDTH_MM  = 80
-TICKET_HEIGHT_MM = 175   # taller than before to fit QR + manual input
+# 120mm, down from 175mm. The ticket now carries only what a student needs in
+# their hand; the rows that were removed were either stale the moment the
+# paper was cut (position, estimated wait, counters open — all of which keep
+# changing while the student waits, which is exactly what the QR code is for)
+# or internal plumbing they cannot act on ("JWT SECURED", token expiry).
+TICKET_HEIGHT_MM = 120
 
 INSTITUTION = "Naga College Foundation, Inc."
-SYSTEM_NAME = "QueueFlow"
 
 # Base URL for QR code — student scans and lands on their live status page.
 # Set PORTAL_BASE_URL in .env for your server IP or domain.
@@ -32,12 +37,13 @@ SYSTEM_NAME = "QueueFlow"
 JWT_ALGORITHM    = "HS256"
 JWT_EXPIRY_HOURS = 4
 
-COLOR_DARK   = HexColor("#1A1A2E")
-COLOR_PURPLE = HexColor("#7F77DD")
-COLOR_LIGHT  = HexColor("#A29EF0")
-COLOR_WHITE  = HexColor("#FFFFFF")
-COLOR_GRAY   = HexColor("#AAAAAA")
-COLOR_BG     = HexColor("#F4F4F8")
+# Plain black on white. Beyond looking cleaner, this is the only palette a
+# thermal receipt printer can actually reproduce — the module docstring above
+# names that as the real deployment path, and a dark-background ticket would
+# be unprintable on one.
+COLOR_INK    = HexColor("#000000")   # queue number, short code, student name
+COLOR_MUTED  = HexColor("#666666")   # small labels
+COLOR_RULE   = HexColor("#CCCCCC")   # hairline separators
 
 
 # JWT TOKEN GENERATION
@@ -203,9 +209,13 @@ def _build_qr_image(queue_number: int, short_code: str) -> Image.Image:
     qr.add_data(url)
     qr.make(fit=True)
 
+    # Black on white. The old light-purple-on-navy matched the dark ticket but
+    # fought the scanner: QR decoders are built for dark modules on a light
+    # ground, and low-contrast inverted codes are slower and less reliable to
+    # read — especially on a phone camera in a queue area's mixed lighting.
     img = qr.make_image(
-        fill_color = "#A29EF0",   # light purple — visible on dark background
-        back_color = "#1A1A2E",   # dark navy — matches ticket background
+        fill_color = "black",
+        back_color = "white",
     ).convert("RGB")
 
     return img
@@ -228,173 +238,111 @@ def generate_ticket_pdf(
     est_wait_min : int,
     service      : str = "Enrollment Office",
     counters_open: int = 2,
+    linked_via   : str | None = None,
+    student_display_name: str | None = None,
 ) -> str:
-   
+    """
+    Render the ticket a student carries away from the queue area.
+
+    `position`, `est_wait_min`, `counters_open` and `linked_via` are still
+    accepted — callers in queue_tracker and ticket_service pass them — but are
+    deliberately NOT printed. Each one is a snapshot that goes stale the
+    moment the paper is cut: the queue keeps moving, so a printed "Position 4"
+    or "~12 min" actively misleads the student holding it. Those values are
+    served live through the QR link instead. They stay in the signature so
+    callers keep working and so the data is available if a future revision
+    wants it back.
+    """
+    # Local import to avoid a circular import — queue_tracker.py imports
+    # from this module too (also locally, for the same reason).
+    from services.queue_tracker import queue_label
+    label = queue_label(queue_number)
+
     os.makedirs(TICKETS_OUTPUT_DIR, exist_ok=True)
 
     now       = datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S")
-    filename  = f"ticket_Q{queue_number:03d}_{timestamp}.pdf"
+    filename  = f"ticket_{label}_{timestamp}.pdf"
     filepath  = os.path.join(TICKETS_OUTPUT_DIR, filename)
 
     W = TICKET_WIDTH_MM  * mmUnit
     H = TICKET_HEIGHT_MM * mmUnit
+    MARGIN = 6 * mmUnit
 
     c = pdf_canvas.Canvas(filepath, pagesize=(W, H))
 
-    #1. Background
-    c.setFillColor(COLOR_DARK)
-    c.rect(0, 0, W, H, fill=1, stroke=0)
+    # Layout walks a cursor DOWN from the top edge rather than hard-coding an
+    # absolute offset per element. The student name is optional (walk-in
+    # tickets have no student on file), and with fixed offsets every element
+    # below it needed a second set of magic numbers for the two cases.
+    y = H - 10 * mmUnit
 
-    #2. Institution header
-    c.setFillColor(COLOR_GRAY)
-    c.setFont("Helvetica", 6)
-    c.drawCentredString(W / 2, H - 12 * mmUnit, INSTITUTION.upper())
-    c.setFont("Helvetica", 5.5)
-    c.drawCentredString(W / 2, H - 17 * mmUnit, service.upper())
+    def rule(gap_before=3.0, gap_after=4.0):
+        nonlocal y
+        y -= gap_before * mmUnit
+        c.setStrokeColor(COLOR_RULE)
+        c.setLineWidth(0.5)
+        c.line(MARGIN, y, W - MARGIN, y)
+        y -= gap_after * mmUnit
 
-    # Top divider
-    c.setStrokeColor(HexColor("#333355"))
-    c.setDash(3, 3)
-    c.line(5 * mmUnit, H - 20 * mmUnit, W - 5 * mmUnit, H - 20 * mmUnit)
-    c.setDash()
+    def centred(text, font, size, color, gap_after, shrink_to_fit=False):
+        nonlocal y
+        if shrink_to_fit:
+            # drawCentredString neither wraps nor scales, so a name wider than
+            # the ticket silently bleeds off both edges. Measured: a compound
+            # surname like "VILLANUEVA-RICAFRENTE, Jose Antonio M." is 68.1mm
+            # against 68.0mm of usable width — long names are normal here, not
+            # an edge case. Step the size down until it fits, with a floor so
+            # it never shrinks into something unreadable.
+            usable = W - 2 * MARGIN
+            while size > 5.5 and stringWidth(text, font, size) > usable:
+                size -= 0.25
+        c.setFillColor(color)
+        c.setFont(font, size)
+        c.drawCentredString(W / 2, y, text)
+        y -= gap_after * mmUnit
 
-    #3. Queue number
-    c.setFont("Helvetica", 7)
-    c.drawCentredString(W / 2, H - 27 * mmUnit, "QUEUE NUMBER")
+    # 1. Institution
+    centred(INSTITUTION.upper(), "Helvetica", 6, COLOR_MUTED, 4.0)
+    centred(service.upper(), "Helvetica", 5.5, COLOR_MUTED, 0)
+    rule()
 
-    c.setFillColor(COLOR_LIGHT)
-    c.setFont("Helvetica-Bold", 52)
-    c.drawCentredString(W / 2, H - 48 * mmUnit, f"Q{queue_number:03d}")
+    # 2. Recognized student — omitted entirely for walk-ins, which have no
+    #    student on file.
+    if student_display_name:
+        centred(student_display_name, "Helvetica-Bold", 9, COLOR_INK, 7.0,
+                shrink_to_fit=True)
 
-    # Position badge
-    bw, bh = 38 * mmUnit, 7 * mmUnit
-    bx, by = (W - bw) / 2, H - 54 * mmUnit
-    c.setFillColor(HexColor("#2A2A4A"))
-    c.roundRect(bx, by, bw, bh, 3 * mmUnit, fill=1, stroke=0)
-    c.setFillColor(COLOR_LIGHT)
-    c.setFont("Helvetica-Bold", 7)
-    c.drawCentredString(W / 2, by + 2 * mmUnit, f"Waiting  ·  Position {position}")
+    # 3. Queue number — the one thing the ticket exists to communicate.
+    centred("QUEUE NUMBER", "Helvetica", 6.5, COLOR_MUTED, 16.0)
+    centred(label, "Helvetica-Bold", 46, COLOR_INK, 0)
+    rule(gap_before=6.0)
 
-    # Tear line 
-    c.setDash(3, 3)
-    c.line(5 * mmUnit, H - 62 * mmUnit, W - 5 * mmUnit, H - 62 * mmUnit)
-    c.setDash()
-    c.setFillColor(COLOR_BG)
-    c.circle(0, H - 62 * mmUnit, 3 * mmUnit, fill=1, stroke=0)
-    c.circle(W, H - 62 * mmUnit, 3 * mmUnit, fill=1, stroke=0)
-
-    #4. QR label 
-    c.setFillColor(COLOR_GRAY)
-    c.setFont("Helvetica", 6)
-    c.drawCentredString(W / 2, H - 66 * mmUnit, "SCAN TO CHECK YOUR QUEUE STATUS")
-
-    # 5. QR code 
+    # 4. QR code — the live status link. Everything that changes while the
+    #    student waits lives behind this, not on the paper.
+    centred("SCAN TO CHECK YOUR QUEUE STATUS", "Helvetica", 6, COLOR_MUTED, 3.0)
+    qr_size = 34 * mmUnit
     try:
-        qr_img  = _build_qr_image(queue_number, short_code)
-        qr_rl   = _pil_to_rl(qr_img)
-        qr_size = 36 * mmUnit                  # square QR on ticket
-        qr_x    = (W - qr_size) / 2            # centred
-        qr_y    = H - 104 * mmUnit             # bottom-left corner of QR
-        c.drawImage(qr_rl, qr_x, qr_y, width=qr_size, height=qr_size)
+        qr_rl = _pil_to_rl(_build_qr_image(queue_number, short_code))
+        c.drawImage(qr_rl, (W - qr_size) / 2, y - qr_size,
+                    width=qr_size, height=qr_size)
+        y -= qr_size + 5 * mmUnit
     except Exception as e:
         print(f"[TicketPrinter] ⚠️  QR failed: {e}")
-        c.setFillColor(COLOR_GRAY)
-        c.setFont("Helvetica", 6)
-        c.drawCentredString(W / 2, H - 85 * mmUnit, "[QR unavailable — use code below]")
+        y -= 6 * mmUnit
+        centred("[QR unavailable — use the code below]",
+                "Helvetica", 6, COLOR_MUTED, 6.0)
 
-    # 6. Divider + OR ENTER MANUALLY 
-    c.setStrokeColor(HexColor("#333355"))
-    c.setDash(2, 2)
-    c.line(10 * mmUnit, H - 106 * mmUnit, W - 10 * mmUnit, H - 106 * mmUnit)
-    c.setDash()
+    # 5. Short code — the fallback for a student whose phone will not scan.
+    centred("OR ENTER THIS CODE", "Helvetica", 5.5, COLOR_MUTED, 7.0)
+    centred(short_code, "Helvetica-Bold", 17, COLOR_INK, 0)
 
-    c.setFillColor(HexColor("#555577"))
+    # 6. Footer — issue time only. It is the one detail that stays true after
+    #    printing, and it is what staff ask for when resolving a dispute.
+    c.setFillColor(COLOR_MUTED)
     c.setFont("Helvetica", 5.5)
-    c.drawCentredString(W / 2, H - 110 * mmUnit, "OR ENTER CODE MANUALLY AT THE PORTAL")
-
-    # 7. Token box with short code 
-    c.setFillColor(HexColor("#22224A"))
-    c.roundRect(
-        5 * mmUnit, H - 124 * mmUnit,
-        W - 10 * mmUnit, 12 * mmUnit,
-        3 * mmUnit, fill=1, stroke=0
-    )
-
-    # "ACCESS TOKEN" micro-label
-    c.setFillColor(COLOR_GRAY)
-    c.setFont("Helvetica", 5.5)
-    c.drawCentredString(W / 2, H - 115 * mmUnit, "ACCESS TOKEN")
-
-    # Short code — large, unambiguous font
-    c.setFillColor(COLOR_PURPLE)
-    c.setFont("Helvetica-Bold", 18)
-    c.drawCentredString(W / 2, H - 122 * mmUnit, short_code)
-
-    # 8. Portal URL hint 
-    portal_display = PORTAL_BASE_URL.replace("http://", "").replace("https://", "")
-    c.setFillColor(HexColor("#666688"))
-    c.setFont("Helvetica", 5)
-    c.drawCentredString(W / 2, H - 127 * mmUnit, f"Portal: {portal_display}")
-
-    # 9. JWT secured badge
-    c.setFillColor(HexColor("#1A1A3A"))
-    c.roundRect(
-        W / 2 - 16 * mmUnit, H - 133 * mmUnit,
-        32 * mmUnit, 5 * mmUnit,
-        2 * mmUnit, fill=1, stroke=0
-    )
-    c.setFillColor(HexColor("#534AB7"))
-    c.setFont("Helvetica-Bold", 5)
-    c.drawCentredString(
-        W / 2, H - 131 * mmUnit,
-        f"JWT SECURED  ·  EXPIRES IN {JWT_EXPIRY_HOURS} HOURS"
-    )
-
-    # 10. Detail rows
-    # ── FIX: dt was undefined — set starting Y just below the JWT badge ───────
-    # JWT badge bottom sits at H-133mm; 6mm gap gives dt = H-139mm.
-    # With lg=6mm and 5 rows the last row lands at H-163mm, leaving 7mm
-    # of breathing room before the bottom tear line at H-170mm.
-    lx = 8  * mmUnit
-    rx = W  - 8 * mmUnit
-    lg = 6  * mmUnit
-    dt = H  - 139 * mmUnit   # ← was missing; caused NameError on every ticket
-
-    def row(label, value, y):
-        c.setFillColor(COLOR_GRAY)
-        c.setFont("Helvetica", 6.5)
-        c.drawString(lx, y, label)
-        c.setFillColor(COLOR_WHITE)
-        c.setFont("Helvetica-Bold", 6.5)
-        c.drawRightString(rx, y, value)
-        c.setStrokeColor(HexColor("#2A2A4A"))
-        c.setLineWidth(0.3)
-        c.line(lx, y - 1.5 * mmUnit, rx, y - 1.5 * mmUnit)
-
-    row("Issued",        now.strftime("%b %d, %Y"),       dt)
-    row("Time",          now.strftime("%I:%M %p"),         dt - lg)
-    row("Est. wait",     f"~{est_wait_min} min",           dt - lg * 2)
-    row("Counters open", str(counters_open),               dt - lg * 3)
-    row("Token expires", f"in {JWT_EXPIRY_HOURS} hrs",     dt - lg * 4)
-
-    # 11. Bottom tear line + footer
-    c.setStrokeColor(HexColor("#333355"))
-    c.setDash(3, 3)
-    c.line(5 * mmUnit, H - 170 * mmUnit, W - 5 * mmUnit, H - 170 * mmUnit)
-    c.setDash()
-    c.setFillColor(COLOR_BG)
-    c.circle(0, H - 170 * mmUnit, 3 * mmUnit, fill=1, stroke=0)
-    c.circle(W, H - 170 * mmUnit, 3 * mmUnit, fill=1, stroke=0)
-
-    c.setFillColor(HexColor("#555577"))
-    c.setFont("Helvetica", 5.5)
-    c.drawCentredString(W / 2, H - 174 * mmUnit,
-                        "Please keep this ticket. Scan QR or type code.")
-    c.setFillColor(HexColor("#333355"))
-    c.setFont("Helvetica", 5)
-    c.drawCentredString(W / 2, H - 178 * mmUnit,
-                        f"{SYSTEM_NAME}  |  NCF  |  {now.year}")
+    c.drawCentredString(W / 2, 6 * mmUnit,
+                        now.strftime("%b %d, %Y  ·  %I:%M %p"))
 
     c.save()
     print(f"[TicketPrinter] ✅ Saved → {filepath}")
@@ -407,8 +355,10 @@ def issue_ticket(
     est_wait_min : int,
     service      : str = "Enrollment Office",
     counters_open: int = 2,
+    linked_via   : str | None = None,
+    student_display_name: str | None = None,
 ) -> dict | None:
-    
+
     try:
         jwt_token  = generate_jwt_token(queue_number, service)
         short_code = generate_short_code()
@@ -420,19 +370,21 @@ def issue_ticket(
             est_wait_min  = est_wait_min,
             service       = service,
             counters_open = counters_open,
+            linked_via    = linked_via,
+            student_display_name = student_display_name,
         )
-        storage = object_storage_service.upload_ticket_pdf(
-            pdf_path,
-            queue_number,
-        ) or {}
+        # storage = object_storage_service.upload_ticket_pdf(
+        #     pdf_path,
+        #     queue_number,
+        # ) or {}
         return {
             "queue_number" : queue_number,
             "short_code"   : short_code,
             "jwt_token"    : jwt_token,
             "expires_at"   : expires_at,
             "pdf_path"     : pdf_path,
-            "storage_key"   : storage.get("storage_key"),
-            "storage_url"   : storage.get("storage_url"),
+            "storage_key"  : None,
+            "storage_url"  : None,
         }
     except Exception as e:
         print(f"[TicketPrinter] ❌ Failed: {e}")
@@ -446,7 +398,7 @@ if __name__ == "__main__":
     load_dotenv()
 
     print("=" * 55)
-    print("QueueFlow — Ticket Test (QR + manual code)")
+    print("QueuEx — Ticket Test (QR + manual code)")
     print("=" * 55)
 
     ticket = issue_ticket(

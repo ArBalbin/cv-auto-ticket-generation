@@ -15,6 +15,17 @@ class DoneBody(BaseModel):
     queue_number: int
 
 
+class ForceNewBody(BaseModel):
+    queue_number: int
+    is_walkin: bool = True
+
+
+class LinkPendingBody(BaseModel):
+    track_id: int
+    queue_number: int
+    student_id: int | None = None
+
+
 class OnWayBody(BaseModel):
     queue_number: int
     token: str
@@ -37,7 +48,12 @@ class CountersBody(BaseModel):
 
 @router.get("/api/queue/list", summary="Live queue state - PUBLIC", tags=["Queue"])
 def queue_list():
-    return queue_service.queue_tracker.get_state()
+    state_dict = dict(queue_service.queue_tracker.get_state())
+    # Pending (not-yet-linked) people are a staff-only concern — see
+    # /api/queue/pending and /api/queue/data for that detail.
+    state_dict.pop("pending_queue", None)
+    state_dict.pop("pending_link_alerts", None)
+    return state_dict
 
 
 @router.get("/api/queue/display", summary="Queue display board data - PUBLIC", tags=["Queue"])
@@ -199,13 +215,50 @@ def queue_data(username: str = Depends(require_staff)):
     }
 
 
-@router.post("/api/queue/force-new", summary="Staff - manually add a queue entry (twin/CV-miss override)", tags=["Queue"])
-def queue_force_new(username: str = Depends(require_staff)):
-    entry = queue_service.force_new_person()
+@router.post("/api/queue/force-new", summary="Staff - manually link an already-printed kiosk number (walk-in entry / CV-miss override)", tags=["Queue"])
+def queue_force_new(body: ForceNewBody, username: str = Depends(require_staff)):
+    entry = queue_service.force_new_person(body.queue_number, is_walkin=body.is_walkin)
+    if entry is None:
+        raise HTTPException(status_code=409, detail=f"Q{body.queue_number:03d} is already linked today")
     return {
         "success": True,
         "message": f"Q{entry['queue_number']:03d} manually added",
         "person": entry,
+    }
+
+
+@router.get(
+    "/api/queue/pending",
+    summary="Staff - people confirmed present but not yet linked to a kiosk number",
+    tags=["Queue"],
+)
+def pending_queue(username: str = Depends(require_staff)):
+    state_dict = queue_service.queue_tracker.get_state()
+    return {
+        "pending_queue": state_dict["pending_queue"],
+        "pending_count": state_dict["pending_count"],
+        "pending_link_alerts": state_dict["pending_link_alerts"],
+    }
+
+
+@router.post(
+    "/api/queue/link-pending",
+    summary="Staff - manually resolve a pending person to a printed kiosk number",
+    tags=["Queue"],
+)
+def link_pending(body: LinkPendingBody, username: str = Depends(require_staff)):
+    person = queue_service.link_pending_person(
+        body.track_id, body.queue_number, student_id=body.student_id,
+    )
+    if person is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Could not link - track is not pending, or that number is already linked today",
+        )
+    return {
+        "success": True,
+        "message": f"Q{body.queue_number:03d} linked",
+        "person": person,
     }
 
 

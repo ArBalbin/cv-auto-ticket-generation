@@ -1,0 +1,3 @@
+# Load/pressure testing dependencies only — not part of the deployed
+# backend's requirements.txt.
+locust

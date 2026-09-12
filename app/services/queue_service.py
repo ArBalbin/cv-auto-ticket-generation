@@ -8,7 +8,10 @@ import state
 from core.config import (
     API_HIGH_CONF,
     API_MIN_BBOX_AREA,
+    FACE_MARGIN_THRESHOLD,
+    FACE_MATCH_THRESHOLD,
     LOW_CONF_BOOST,
+    PENDING_LINK_TIMEOUT_SECONDS,
     QUEUE_CONFIG,
     QUEUE_DEDUP_CENTRE_FRAC,
     QUEUE_DEDUP_IOU_THRESH,
@@ -17,7 +20,6 @@ from core.config import (
     QUEUE_MIN_MOTION_PIXELS,
     QUEUE_MIN_PORTRAIT_ASPECT,
     QUEUE_NOSHOW_WINDOW_SECONDS,
-    QUEUE_RECENCY_SINGLE_MATCH_SECONDS,
     QUEUE_REMAP_ABSENT_FRAMES,
     QUEUE_REMAP_DIST_THRESH,
     QUEUE_REMAP_IOU_THRESH,
@@ -26,13 +28,16 @@ from core.config import (
 )
 from database.database_handler import (
     fetch_waiting_queue_records,
+    get_all_active_embeddings,
     measure_avg_service_time,
     record_counter_config_change,
+    record_face_match_event,
+    record_recognition_metric,
     record_queue_reset,
     update_queue_status,
 )
 from services.queue_tracker import QueueTracker, QueueZone
-from services import ticket_service
+from services import face_service, ticket_service
 from services.ticket_printer import delete_all_tickets
 
 
@@ -45,21 +50,31 @@ _MAX_REMAP_ABSENT_FRAMES = QUEUE_REMAP_ABSENT_FRAMES
 _config_lock = threading.Lock()
 
 
-def _on_new_person(
+def _on_number_linked(
     queue_number: int,
     wait_time_str: str,
     joined_at_str: str,
     access_token: str,
+    student_id: int | None = None,
+    linked_via: str = "manual",
+    is_walkin: bool = True,
 ) -> None:
-    """Drop a ticket job into the background worker immediately."""
+    """A printed kiosk number was just linked to a present person (student
+    face+OCR or face-only match, or staff manual entry) — drop a ticket job
+    into the background worker immediately. Ticket generation itself is
+    unchanged; only the trigger event moved from "CV auto-detected someone"
+    to "a real kiosk number was linked.\""""
     position = queue_tracker.get_position(queue_number)
     try:
         ticket_service.enqueue_ticket(
             queue_number=queue_number,
             position=position,
             est_wait_min=0,
+            student_id=student_id,
+            linked_via=linked_via,
+            is_walkin=is_walkin,
         )
-        print(f"[QueueService] Q{queue_number:03d} queued for ticket generation")
+        print(f"[QueueService] Q{queue_number:03d} ({linked_via}) queued for ticket generation")
     except Exception:
         print(f"[QueueService] Ticket queue full - Q{queue_number:03d} skipped")
 
@@ -93,7 +108,7 @@ def _service_time_refresh_loop() -> None:
 
 
 def wire_callbacks() -> None:
-    queue_tracker.on_new_person = _on_new_person
+    queue_tracker.on_number_linked = _on_number_linked
     queue_tracker.on_noshow = _on_noshow
     queue_tracker.MAX_MISSING_FRAMES = QUEUE_MAX_MISSING_FRAMES
     queue_tracker.MIN_CONFIRM_FRAMES = QUEUE_MIN_CONFIRM_FRAMES
@@ -101,12 +116,12 @@ def wire_callbacks() -> None:
     queue_tracker.STATIC_STDEV_THRESHOLD = QUEUE_STATIC_STDEV_THRESHOLD
     queue_tracker.STATIC_CONF_BYPASS_THRESHOLD = QUEUE_STATIC_CONF_BYPASS
     queue_tracker.MIN_PORTRAIT_ASPECT = QUEUE_MIN_PORTRAIT_ASPECT
-    queue_tracker.APPEARANCE_TIEBREAK_THRESHOLD = 0.12
-    queue_tracker.DONE_BLACKLIST_THRESH = 0.55
+    queue_tracker.FACE_MATCH_THRESHOLD = FACE_MATCH_THRESHOLD
+    queue_tracker.FACE_MARGIN_THRESHOLD = FACE_MARGIN_THRESHOLD
+    queue_tracker.PENDING_LINK_TIMEOUT_SECONDS = PENDING_LINK_TIMEOUT_SECONDS
     queue_tracker.NOSHOW_WINDOW_SECONDS = QUEUE_NOSHOW_WINDOW_SECONDS
-    queue_tracker.RECENCY_SINGLE_MATCH_SECONDS = QUEUE_RECENCY_SINGLE_MATCH_SECONDS
-    queue_tracker.DEDUP_IOU_THRESH = QUEUE_DEDUP_IOU_THRESH
-    queue_tracker.DEDUP_CENTRE_FRAC = QUEUE_DEDUP_CENTRE_FRAC
+    queue_tracker.DEDUP_IOU_THRESH = 0.40
+    queue_tracker.DEDUP_CENTRE_FRAC = 0.15
 
     queue_tracker._num_counters = max(1, int(QUEUE_CONFIG.get('num_counters', 3)))
 
@@ -217,10 +232,15 @@ def remap_track_ids(tracked: list, tracker) -> list:
     return remapped
 
 
-def inject_appearances(raw_tracked: list, tracker) -> None:
+def inject_face_embeddings(raw_tracked: list, tracker) -> None:
+    """Refresh a tracked person's stored face embedding from the latest
+    detector payload. Unlike the retired HSV signature (which was EMA-
+    blended to smooth pixel noise), ArcFace embeddings for the same person
+    are already stable frame-to-frame, so the freshest confident read is
+    kept as-is rather than blended across possibly different angles."""
     for p in raw_tracked:
-        app_list = p.get("appearance")
-        if not app_list:
+        embedding = p.get("face_embedding")
+        if not embedding:
             continue
 
         tid = p["track_id"]
@@ -229,19 +249,150 @@ def inject_appearances(raw_tracked: list, tracker) -> None:
             continue
 
         try:
-            new_sig = np.array(app_list, dtype=np.float32)
-            if person.appearance_signature is None:
-                person.appearance_signature = new_sig
-            else:
-                person.appearance_signature = (
-                    0.6 * person.appearance_signature + 0.4 * new_sig
-                )
-            history = person.appearance_history
-            history.append(new_sig)
-            if len(history) > 5:
-                history.pop(0)
+            person.face_embedding = np.array(embedding, dtype=np.float32)
         except Exception as exc:
-            print(f"[QueueService] appearance injection error tid={tid}: {exc}")
+            print(f"[QueueService] face embedding injection error tid={tid}: {exc}")
+
+
+def _try_link_students(raw_tracked: list) -> None:
+    """For each presence-confirmed-but-unlinked person whose track carries a
+    face embedding this frame, resolve their identity against enrolled
+    students (Algorithm 4).
+
+    Per SOP #2 (reconfirmed by the panel after the pre-oral revision
+    meeting): a registered student recognized here gets a queue number
+    minted directly by the system — no kiosk ticket needed. Walk-ins never
+    reach a linked outcome here — an unenrolled face never produces an
+    accepted match, so they're linked via the staff-assisted manual
+    force_new_person() path instead, and the kiosk's own numbering for them
+    is completely untouched by any of this.
+
+    An unmatched (or not-yet-confident) face just stays pending — the same
+    "don't guess, escalate to staff" path already used for anything else
+    ambiguous (see get_pending_link_alerts()).
+
+    A student only ever holds one active entry at a time: if they're
+    recognized while already having a pending/waiting ticket, no new one is
+    minted or linked — staff must mark the existing entry done (served or
+    no-show) first.
+    """
+    for p in raw_tracked:
+        track_id = p["track_id"]
+        person = queue_tracker.active_queue.get(track_id)
+        if person is None or person.identity_status != "pending_link":
+            continue
+
+        embedding = p.get("face_embedding")
+        if not embedding:
+            continue
+
+        try:
+            live_embedding = np.array(embedding, dtype=np.float32)
+            candidates = [
+                (student_id, face_service.embedding_from_json(emb))
+                for student_id, emb in get_all_active_embeddings()
+            ]
+            match = face_service.match_student(
+                live_embedding, candidates,
+                match_threshold=FACE_MATCH_THRESHOLD,
+                margin_threshold=FACE_MARGIN_THRESHOLD,
+            )
+            record_face_match_event(
+                match.student_id, track_id, match.score, match.margin, match.accepted,
+            )
+            if not match.accepted:
+                continue
+
+            # Recognition is not consent. A registered student only gets a
+            # number if they asked for one in the app first — otherwise
+            # anyone merely walking past the camera (accompanying a friend,
+            # passing through, working nearby) would be issued a ticket they
+            # never wanted and silently added to the queue.
+            #
+            # Mark them so they are skipped cheaply on later frames instead
+            # of re-running the match every frame, and so they never appear
+            # as a pending entry or raise a staff alert. Everything that
+            # surfaces pending people filters on 'pending_link'.
+            if not queue_tracker.has_join_intent(match.student_id):
+                # Remember who this is, so arm_join_intent() can find and
+                # revive them the instant they do tap join — otherwise the
+                # bystander mark is a one-way door and someone recognized
+                # *before* tapping join could never get a number for as long
+                # as the camera held that track.
+                person.student_id = match.student_id
+                person.identity_status = "bystander"
+                continue
+
+            # One active entry per student at a time — if they already have a
+            # pending/waiting ticket (from an earlier recognition this
+            # session), don't mint or link another. Staff must mark the
+            # existing one done (served/no-show) before this student can be
+            # queued again.
+            existing = queue_tracker.get_person_by_student_id(match.student_id)
+            if existing is not None:
+                continue
+
+        except Exception as exc:
+            print(f"[QueueService] student link error tid={track_id}: {exc}")
+            continue
+
+        # Read the join-intent timestamp BEFORE minting: minting consumes the
+        # intent, so asking afterwards returns None and the metric silently
+        # falls back to a less meaningful baseline.
+        intent_at = queue_tracker.get_join_intent(match.student_id)
+
+        linked = queue_tracker.mint_face_only_number(track_id, match.student_id)
+
+        if linked is not None:
+            _record_recognition_metric(linked, match, intent_at)
+
+
+def _record_recognition_metric(person, match, intent_at=None) -> None:
+    """
+    Capture how long this recognition took and how many frames it cost, for
+    the evaluation chapter (SOP #2). Never allowed to disturb the queue: a
+    failure here is logged and dropped.
+
+    `seconds_to_link` measures from the moment the system was first ABLE to
+    issue a number, not from when the camera first saw the person. Those are
+    very different once the Join-the-Queue consent gate exists: a student can
+    stand in frame for minutes before opening the app, and measuring from
+    first sighting charges all of that waiting to the system. A real run on
+    2026-09-12 recorded 889 s that way — 14.8 minutes of a person standing in
+    front of the camera during unrelated debugging — which would be a grossly
+    misleading "time to recognition" if quoted.
+
+    The baseline is therefore the later of presence-confirmation and
+    join-intent, whichever happened last. The raw `first_seen_at`,
+    `confirmed_at` and `linked_at` timestamps are still stored, so any other
+    interpretation can be recomputed from the table afterwards.
+    """
+    try:
+        first_seen = person.first_seen_at or person.entered_at
+        confirmed = person.entered_at
+        linked_at = person.linked_at or datetime.now()
+
+        actionable_from = confirmed
+        if intent_at is not None and intent_at > actionable_from:
+            actionable_from = intent_at
+
+        record_recognition_metric({
+            "track_id": person.track_id,
+            "student_id": person.student_id,
+            "queue_number": person.queue_number,
+            "linked_via": person.linked_via,
+            "first_seen_at": first_seen,
+            "confirmed_at": confirmed,
+            "linked_at": linked_at,
+            "seconds_to_confirm": (confirmed - first_seen).total_seconds(),
+            "seconds_to_link": (linked_at - actionable_from).total_seconds(),
+            "embed_attempts": person.embed_attempts,
+            "embed_successes": person.embed_successes,
+            "match_score": match.score,
+            "match_margin": match.margin,
+        })
+    except Exception as exc:
+        print(f"[QueueService] recognition metric skipped: {exc}")
 
 
 def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
@@ -273,20 +424,24 @@ def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
                 "track_id": p["track_id"],
                 "bbox": tuple(p["bbox"]),
                 "conf": p.get("conf", 0.0),
-                "appearance": p.get("appearance"),
+                "face_embedding": p.get("face_embedding"),
             }
             for p in tracked_filtered
         ]
         tracked = remap_track_ids(tracked, queue_tracker)
         try:
-            queue_state = queue_tracker.process_frame(tracked, frame=None)
+            queue_state = queue_tracker.process_frame(tracked)
         except Exception as exc:
             print(f"[QueueService] process_frame error: {exc}")
 
-        inject_appearances(filtered, queue_tracker)
+        inject_face_embeddings(filtered, queue_tracker)
+        try:
+            _try_link_students(filtered)
+        except Exception as exc:
+            print(f"[QueueService] student linking pass error: {exc}")
     else:
         try:
-            queue_state = queue_tracker.process_frame([], frame=None)
+            queue_state = queue_tracker.process_frame([])
         except Exception as exc:
             print(f"[QueueService] process_frame empty error: {exc}")
 
@@ -335,9 +490,27 @@ def mark_done(queue_number: int, actor_username: str | None = None) -> dict | No
     return queue_tracker.get_state()
 
 
-def force_new_person() -> dict:
-    """Staff manual override — bypass CV confirmation and assign the next queue number."""
-    return queue_tracker.force_new_person()
+def link_pending_person(
+    track_id: int,
+    queue_number: int,
+    student_id: int | None = None,
+) -> dict | None:
+    """Staff manual resolution for a person confirmed present but not yet
+    linked (face/OCR match was ambiguous, or the digit read never firmed
+    up) — the "escalate to a human, don't guess" fallback behind the
+    PENDING_LINK_TIMEOUT_SECONDS alerts in get_state()."""
+    person = queue_tracker.link_queue_number(
+        track_id, queue_number, student_id=student_id, linked_via="manual",
+    )
+    return person.to_dict() if person else None
+
+
+def force_new_person(queue_number: int, is_walkin: bool = True) -> dict | None:
+    """Staff manual entry — link an already-printed kiosk number directly.
+    This is the walk-in path (per the panel's directive, walk-ins keep their
+    kiosk number as-is) and the fallback when CV/face/OCR fails for a
+    student. Returns None if that number is already linked today."""
+    return queue_tracker.force_new_person(queue_number, is_walkin=is_walkin)
 
 
 def mark_on_the_way(queue_number: int) -> dict | None:
@@ -837,10 +1010,10 @@ def build_queue_analytics() -> dict:
         1 for record in completed_all
         if record.get("bump_reason") == "served"
     )
-    total_assigned = max(
-        0,
-        as_int(queue_state.get("next_number"), 1) - 1,
-    )
+    # No internal counter mints numbers anymore (they always come from the
+    # kiosk) — "assigned today" is everyone currently active plus everyone
+    # already completed.
+    total_assigned = queue_length + total_completed
 
     data_status = prediction.get("data_status", "live")
     utilization = as_float(prediction.get("system_utilization"), 0.0)
@@ -906,7 +1079,7 @@ def build_queue_analytics() -> dict:
             "missing": missing_count,
             "active_counters": prediction.get("active_counters", 0),
             "avg_service_time_min": prediction.get("avg_service_time_min", 0),
-            "next_number": queue_state.get("next_number"),
+            "pending_count": queue_state.get("pending_count", 0),
             "total_assigned": total_assigned,
             "total_completed": total_completed,
             "total_served": total_served,

@@ -1,3 +1,4 @@
+import json
 from fastapi import HTTPException
 from threading import Lock, Thread
 
@@ -359,13 +360,32 @@ def save_ticket_record(ticket: dict) -> bool:
         cursor = conn.cursor()
         columns = _get_table_columns(cursor, "queue_records")
         record_id = None
+
+        # student_id/is_walkin/linked_via/linked_at only exist on schemas
+        # that have run the face-recognition migration — degrade gracefully
+        # on an older table rather than failing the whole ticket save.
+        has_identity_cols = {"student_id", "is_walkin", "linked_via"} <= columns
+        identity_fields = (
+            ", student_id, is_walkin, linked_via, linked_at" if has_identity_cols else ""
+        )
+        identity_placeholders = ", %s, %s, %s, NOW()" if has_identity_cols else ""
+        identity_values = (
+            (ticket.get("student_id"), ticket.get("is_walkin", True), ticket.get("linked_via", "manual"))
+            if has_identity_cols else ()
+        )
+        identity_update = (
+            ", student_id = VALUES(student_id), is_walkin = VALUES(is_walkin), "
+            "linked_via = VALUES(linked_via), linked_at = VALUES(linked_at)"
+            if has_identity_cols else ""
+        )
+
         if "service_date" in columns:
             cursor.execute(
-                """
+                f"""
                 INSERT INTO queue_records
                     (service_date, queue_number, short_code, jwt_token, pdf_path,
-                     status, expires_at, created_at)
-                VALUES (CURDATE(), %s, %s, %s, %s, 'waiting', %s, NOW())
+                     status, expires_at, created_at{identity_fields})
+                VALUES (CURDATE(), %s, %s, %s, %s, 'waiting', %s, NOW(){identity_placeholders})
                 """,
                 (
                     ticket["queue_number"],
@@ -373,22 +393,23 @@ def save_ticket_record(ticket: dict) -> bool:
                     ticket["jwt_token"],
                     ticket.get("storage_url") or ticket["pdf_path"],
                     ticket["expires_at"],
+                    *identity_values,
                 ),
             )
             record_id = cursor.lastrowid
         else:
             cursor.execute(
-                """
+                f"""
                 INSERT INTO queue_records
                     (queue_number, short_code, jwt_token, pdf_path,
-                     status, expires_at, created_at)
-                VALUES (%s, %s, %s, %s, 'waiting', %s, NOW())
+                     status, expires_at, created_at{identity_fields})
+                VALUES (%s, %s, %s, %s, 'waiting', %s, NOW(){identity_placeholders})
                 ON DUPLICATE KEY UPDATE
                     short_code = VALUES(short_code),
                     jwt_token  = VALUES(jwt_token),
                     pdf_path   = VALUES(pdf_path),
                     expires_at = VALUES(expires_at),
-                    status     = 'waiting'
+                    status     = 'waiting'{identity_update}
                 """,
                 (
                     ticket["queue_number"],
@@ -396,6 +417,7 @@ def save_ticket_record(ticket: dict) -> bool:
                     ticket["jwt_token"],
                     ticket.get("storage_url") or ticket["pdf_path"],
                     ticket["expires_at"],
+                    *identity_values,
                 ),
             )
             record_id = cursor.lastrowid or _latest_queue_record_id(
@@ -626,5 +648,415 @@ def measure_avg_service_time(num_counters: int, window_minutes: int = 120,
     except Exception as exc:
         print(f"[DB] measure_avg_service_time error: {exc}")
         return None
+    finally:
+        close_db_resources(cursor, conn)
+
+
+# STUDENT SELF-REGISTRATION + FACE ENROLLMENT (Algorithm 4 support)
+#
+# Accounts are created via self-service Sign-in-with-Google against the
+# student's NCF Gbox account — there is no staff-operated enrollment path
+# and no password is ever stored here (Google is the credential authority).
+# Registration is two steps: create_student_account() at first Google
+# sign-in, then save_student_face_embedding() once the student captures
+# their face in the app. Only a derived embedding vector is ever persisted
+# — never a face image — matching the system's existing "no raw video
+# stored" stance, extended to biometric data.
+
+def _student_id_by_school_id(cursor, school_id: str) -> int | None:
+    cursor.execute(
+        "SELECT id FROM student_profiles WHERE school_id=%s LIMIT 1",
+        (school_id,),
+    )
+    row = cursor.fetchone()
+    value = _row_value(row, "id")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+_STUDENT_PROFILE_FIELDS = (
+    "id, school_id, gbox_email, google_sub, full_name, is_active, "
+    "num_enrollment_samples, enrolled_at, last_login, face_enrolled_at"
+)
+
+
+def get_student_by_google_sub(google_sub: str) -> dict | None:
+    """Login lookup — google_sub is Google's stable per-account identifier."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return None
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"WHERE google_sub=%s LIMIT 1",
+            (google_sub,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        print(f"[DB] Error fetching student by google_sub: {exc}")
+        return None
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def get_student_by_id(student_id: int) -> dict | None:
+    pool = _ensure_db_pool()
+    if pool is None:
+        return None
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"WHERE id=%s LIMIT 1",
+            (student_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        print(f"[DB] Error fetching student id={student_id}: {exc}")
+        return None
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def get_student_by_gbox_email(gbox_email: str) -> dict | None:
+    pool = _ensure_db_pool()
+    if pool is None:
+        return None
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"WHERE gbox_email=%s LIMIT 1",
+            (gbox_email,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        print(f"[DB] Error fetching student by gbox_email: {exc}")
+        return None
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def create_student_account(
+    school_id: str,
+    gbox_email: str,
+    google_sub: str,
+    full_name: str | None = None,
+) -> int | None:
+    """First-time self-registration. No embedding yet — face capture is a
+    separate later step (save_student_face_embedding)."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        print("[DB] No pool - student account not created")
+        return None
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO student_profiles
+                (school_id, gbox_email, google_sub, full_name, enrolled_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            """,
+            (school_id, gbox_email, google_sub, full_name),
+        )
+        conn.commit()
+        student_id = cursor.lastrowid
+        print(f"[DB] Student account created: school_id={school_id}")
+        return student_id
+    except Exception as exc:
+        if exc.__class__.__name__ == "IntegrityError":
+            print(f"[DB] Student account already exists (school_id={school_id}): {exc}")
+        else:
+            print(f"[DB] Error creating student account ({school_id}): {exc}")
+        return None
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def save_student_face_embedding(
+    student_id: int,
+    embedding_json: list,
+    embedding_model_version: str,
+    num_samples: int,
+) -> bool:
+    pool = _ensure_db_pool()
+    if pool is None:
+        print("[DB] No pool - face embedding not saved")
+        return False
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE student_profiles
+            SET embedding               = %s,
+                embedding_model_version = %s,
+                num_enrollment_samples  = %s,
+                face_enrolled_at        = NOW(),
+                is_active               = TRUE,
+                updated_at              = NOW()
+            WHERE id=%s
+            """,
+            (json.dumps(embedding_json), embedding_model_version, num_samples, student_id),
+        )
+        conn.commit()
+        updated = cursor.rowcount > 0
+        if updated:
+            print(f"[DB] Face embedding saved for student_id={student_id}")
+        return updated
+    except Exception as exc:
+        print(f"[DB] Error saving face embedding (student_id={student_id}): {exc}")
+        return False
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def touch_student_last_login(student_id: int) -> None:
+    pool = _ensure_db_pool()
+    if pool is None:
+        return
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE student_profiles SET last_login=NOW() WHERE id=%s",
+            (student_id,),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def get_student_by_school_id(school_id: str) -> dict | None:
+    pool = _ensure_db_pool()
+    if pool is None:
+        return None
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"WHERE school_id=%s LIMIT 1",
+            (school_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        print(f"[DB] Error fetching student {school_id}: {exc}")
+        return None
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def list_students() -> list[dict]:
+    """Roster for the staff dashboard. Never returns embeddings."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return []
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"ORDER BY enrolled_at DESC"
+        )
+        return list(cursor.fetchall() or [])
+    except Exception as exc:
+        print(f"[DB] Error listing students: {exc}")
+        return []
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def delete_student_profile(student_id: int) -> bool:
+    """Hard delete — supports Data Privacy Act erasure requests."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return False
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM student_profiles WHERE id=%s", (student_id,))
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        if deleted:
+            print(f"[DB] Student profile {student_id} deleted")
+        return deleted
+    except Exception as exc:
+        print(f"[DB] Error deleting student {student_id}: {exc}")
+        return False
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def get_all_active_embeddings() -> list[tuple]:
+    """(student_id, embedding_as_list) pairs for every active enrollment.
+
+    The caller (face_service.match_student, via queue_tracker) is
+    responsible for excluding students already linked today — see
+    is_student_already_queued_today().
+    """
+    pool = _ensure_db_pool()
+    if pool is None:
+        return []
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, embedding FROM student_profiles WHERE is_active=TRUE"
+        )
+        rows = cursor.fetchall() or []
+        result = []
+        for row in rows:
+            try:
+                embedding = json.loads(row["embedding"])
+            except (TypeError, ValueError):
+                continue
+            result.append((int(row["id"]), embedding))
+        return result
+    except Exception as exc:
+        print(f"[DB] Error loading student embeddings: {exc}")
+        return []
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def is_student_already_queued_today(student_id: int) -> bool:
+    """True once a student has been linked to a queue number today —
+    the done-blacklist equivalent: don't re-link the same student twice."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return False
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        columns = _get_table_columns(cursor, "queue_records")
+        if "service_date" in columns:
+            cursor.execute(
+                "SELECT 1 FROM queue_records WHERE student_id=%s AND service_date=CURDATE() LIMIT 1",
+                (student_id,),
+            )
+        else:
+            cursor.execute(
+                "SELECT 1 FROM queue_records WHERE student_id=%s AND created_at >= CURDATE() LIMIT 1",
+                (student_id,),
+            )
+        return cursor.fetchone() is not None
+    except Exception as exc:
+        print(f"[DB] Error checking today's queue state for student {student_id}: {exc}")
+        return False
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def record_face_match_event(
+    student_id: int | None,
+    track_id: int | None,
+    matched_score: float | None,
+    margin: float | None,
+    accepted: bool,
+) -> None:
+    pool = _ensure_db_pool()
+    if pool is None:
+        return
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO face_match_events
+                (student_id, track_id, matched_score, margin, accepted, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            """,
+            (student_id, track_id, matched_score, margin, accepted),
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[DB] Error recording face match event: {exc}")
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def record_recognition_metric(metric: dict) -> None:
+    """
+    One row per successful link — how long recognition took end to end, and
+    how many camera frames were spent getting there (see
+    database_sql/2026_09_recognition_metrics_migration.sql).
+
+    Instrumentation must never be able to break the queue itself, so every
+    failure here is swallowed after logging.
+    """
+    pool = _ensure_db_pool()
+    if pool is None:
+        return
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO recognition_metrics
+                (track_id, student_id, queue_number, linked_via,
+                 first_seen_at, confirmed_at, linked_at,
+                 seconds_to_confirm, seconds_to_link,
+                 embed_attempts, embed_successes, match_score, match_margin)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                metric.get("track_id"),
+                metric.get("student_id"),
+                metric.get("queue_number"),
+                metric.get("linked_via"),
+                metric.get("first_seen_at"),
+                metric.get("confirmed_at"),
+                metric.get("linked_at"),
+                metric.get("seconds_to_confirm"),
+                metric.get("seconds_to_link"),
+                metric.get("embed_attempts", 0),
+                metric.get("embed_successes", 0),
+                metric.get("match_score"),
+                metric.get("match_margin"),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[DB] Error recording recognition metric: {exc}")
     finally:
         close_db_resources(cursor, conn)

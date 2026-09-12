@@ -1,0 +1,101 @@
+{
+  "dataset": {
+    "identities": 17,
+    "probe_photos": 45,
+    "genuine_comparisons": 45,
+    "impostor_comparisons": 720,
+    "people": [
+      "Bagobo",
+      "Baylen",
+      "Bonito",
+      "Cambiado",
+      "Coronado",
+      "De La Torre",
+      "Malate",
+      "Molata",
+      "Namora",
+      "Nayawan",
+      "Ricafrente",
+      "Saycon",
+      "Villanueva",
+      "Vinas",
+      "archie",
+      "rparcero",
+      "sanota"
+    ]
+  },
+  "verification": {
+    "roc_auc": 0.9999074074074074,
+    "eer": 0.004166666666666667,
+    "eer_threshold": 0.32018749999999996,
+    "d_prime": 4.991921470915999,
+    "genuine_mean": 0.6951756808492873,
+    "genuine_sd": 0.13968720469571516,
+    "impostor_mean": 0.10818312559212144,
+    "impostor_sd": 0.09023078887719861
+  },
+  "operating_point": {
+    "match_threshold": 0.3,
+    "margin_threshold": 0.15,
+    "far": 0.008333333333333333,
+    "frr": 0.0
+  },
+  "identification_closed_set": {
+    "total": 45,
+    "rank1_accuracy": 1.0,
+    "correct": 44,
+    "wrong": 0,
+    "refused": 1,
+    "refused_detail": [
+      {
+        "person": "Bonito",
+        "probe": 0,
+        "score": 0.321,
+        "margin": 0.027,
+        "reason": "below margin"
+      }
+    ]
+  },
+  "identification_open_set": {
+    "total": 45,
+    "correctly_refused": 45,
+    "false_accepts": 0,
+    "false_accept_rate": 0.0,
+    "detail": [],
+    "max_stranger_score": 0.35329869389533997,
+    "saved_by_margin": [
+      {
+        "stranger": "archie",
+        "would_be": "Malate",
+        "score": 0.353,
+        "margin": 0.046
+      },
+      {
+        "stranger": "rparcero",
+        "would_be": "Nayawan",
+        "score": 0.326,
+        "margin": 0.056
+      },
+      {
+        "stranger": "rparcero",
+        "would_be": "Nayawan",
+        "score": 0.331,
+        "margin": 0.11
+      },
+      {
+        "stranger": "sanota",
+        "would_be": "Saycon",
+        "score": 0.302,
+        "margin": 0.015
+      },
+      {
+        "stranger": "sanota",
+        "would_be": "Malate",
+        "score": 0.305,
+        "margin": 0.012
+      }
+    ],
+    "score_rule_alone_false_accepts": 5
+  },
+  "limitation": "Probes are cooperative enrollment-style photos, not YOLO crops at queue-zone distance. These figures are an upper bound on live performance; pair them with ML/report_recognition_metrics.py."
+}

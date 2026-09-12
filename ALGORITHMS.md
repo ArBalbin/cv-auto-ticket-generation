@@ -1,690 +1,463 @@
-# QueueFlow - Core Algorithm Reference
+# QueuEx — Core Algorithm Reference
 
-This document describes the algorithms powering the five core subsystems of QueueFlow:
-person detection, appearance-based re-identification, queue management, wait-time forecasting,
-and the public display board. Every code sample is taken directly from the production source.
+QueuEx is an enhancement layer over Naga College Foundation's existing
+queue arrangement, not a replacement for it. The camera watches the queue
+area, recognizes students who have registered their face, and issues their
+queue number automatically. Walk-ins are unaffected: they take a printed
+kiosk ticket exactly as before, and staff enter that number.
 
----
-
-## Current Progress Snapshot
-
-Last updated: May 12, 2026
-
-The algorithms in this document reflect the current prototype implementation.
-The active detector uses YOLOv8n with OpenCV camera capture. Queue tracking
-includes queue-zone filtering, candidate confirmation, static rejection,
-duplicate suppression, hybrid re-entry matching, no-show handling, manual
-force-new override, and done/reset support. Wait-time prediction currently uses
-an M/M/c baseline, short trend projection, Holt's double exponential smoothing,
-and growth-ratio mean reversion for the current, 5-minute, 15-minute, and
-30-minute dashboard estimates.
-
-Thermal printer output is not yet the active runtime output. Ticket generation
-currently produces PDF tickets with QR codes and short-code/JWT credentials as a
-demo replacement.
+The guiding rule throughout is **refuse rather than guess**. Every decision
+below has an explicit "not confident enough" branch that escalates to a
+human instead of inventing an answer, because in a queue a wrong identity
+is far more damaging than a slow one.
 
 ---
 
-## 1. Person Detection (YOLOv8n + ByteTrack)
+## What changed from the pre-oral design
 
-**File:** `app/detector.py`
+This document was rewritten after the panel's revisions. Three structural
+changes matter when comparing against the earlier version:
 
-Each video frame is passed to a YOLOv8n model with ByteTrack multi-object tracking enabled.
-The model returns a bounding box, confidence score, and a persistent `track_id` per person.
+1. **Identity is now face recognition, not colour histograms.** The old
+   design tracked people by a split-body HSV appearance signature, with
+   separate algorithms for comparison, re-identification, and a
+   twin/lookalike guard. All four are retired and replaced by one
+   face-embedding match (Algorithm 4). Colour histograms cannot tell two
+   students in the same uniform apart — the exact failure case a queue at
+   a college produces constantly.
 
-### Pre-filtering
+2. **Queue numbers for registered students are issued by the system**
+   (Algorithm 5), per SOP #2. The kiosk's own numbering for walk-ins is
+   untouched.
 
-Before any detection reaches the queue tracker, five filters are applied:
+3. **Ticket-number OCR was removed.** An earlier revision included a
+   custom-trained digit classifier to read printed kiosk tickets. Once
+   registered students stopped needing kiosk tickets, that code path became
+   unreachable and was deleted rather than left running for no purpose.
 
-```python
-# Minimum bounding-box area (px²)
-area = (x2 - x1) * (y2 - y1)
-if area < API_MIN_BBOX_AREA:          # default 800
-    continue
-
-# Maximum box fraction of the frame
-frac = area / (frame_w * frame_h)
-if frac > MAX_BBOX_FRAC:              # default 0.85
-    continue
-
-# Portrait aspect ratio  (height / width)
-aspect = (y2 - y1) / max(x2 - x1, 1)
-if aspect < QUEUE_MIN_PORTRAIT_ASPECT:   # default 0.60
-    continue
-
-# Motion energy — pixel-level change since last frame
-diff          = cv2.absdiff(gray_now, gray_prev)
-motion_pixels = int(np.count_nonzero(diff > 25))
-if motion_pixels < QUEUE_MIN_MOTION_PIXELS:    # default 8
-    # allow through only if confidence is very high
-    if conf < QUEUE_STATIC_CONF_BYPASS:        # default 0.70
-        continue
-```
-
-### Bounding box smoothing (EMA)
-
-Raw bounding boxes jitter between frames. An exponential moving average with α = 0.45
-is applied per tracked person so the displayed box is stable:
-
-```python
-# QueueTracker class constant
-BBOX_SMOOTH_ALPHA = 0.45
-
-# Applied in process_frame() for every active person
-p.bbox = tuple(
-    int(BBOX_SMOOTH_ALPHA * nb + (1 - BBOX_SMOOTH_ALPHA) * ob)
-    for nb, ob in zip(new_bbox, p.bbox)
-)
-```
+**Algorithm count: 16 → 9.** Ticket generation (JWT/QR/PDF) and TTS
+announcements are documented as *system features* rather than algorithms —
+neither performs CV or predictive reasoning; both are deterministic output
+formatting triggered by decisions made elsewhere.
 
 ---
 
-## 2. Queue Zone Membership
+## Effective parameters
 
-**File:** `app/services/queue_tracker.py` — `QueueZone.is_person_inside()`
+Values are read from `app/core/config.py` and overridden by `.env`. The
+column below is what the deployed system actually runs with; class-level
+defaults inside `QueueTracker` are overwritten at startup by
+`queue_service.wire_callbacks()` and should not be read as authoritative.
 
-A rectangular zone is defined by four pixel coordinates. A person is inside when their
-bounding box **centroid** falls within the rectangle (using the centroid avoids counting
-someone whose arm alone overlaps the boundary):
+| Parameter | Value | Governs |
+|---|---|---|
+| `FRAME_SCALE` | 0.75 | Frame downscale before YOLO |
+| `YOLO_IMGSZ` | 320 | YOLO inference resolution |
+| `YOLO_EVERY` | 3 | Run YOLO every Nth camera frame |
+| `YOLO_CONF` | 0.55 | Minimum person-detection confidence |
+| `MIN_BBOX_AREA` | 1500 px² | Reject specks |
+| `MAX_BBOX_FRAC` | 0.70 | Reject boxes covering most of the frame |
+| `QUEUE_MIN_PORTRAIT_ASPECT` | 0.60 | Reject non-person-shaped boxes |
+| `QUEUE_MIN_CONFIRM_FRAMES` | 20 | Frames before presence is confirmed |
+| `QUEUE_MIN_MOTION_PIXELS` | 8 | Static-object rejection threshold |
+| `QUEUE_STATIC_CONF_BYPASS` | 0.70 | Confidence that skips the motion test |
+| `QUEUE_MAX_MISSING_FRAMES` | 240 | Frames absent before removal |
+| `QUEUE_NOSHOW_WINDOW_SECONDS` | 300 | No-show countdown |
+| `FACE_MODEL_PACK` | `buffalo_s` | InsightFace model pack |
+| `FACE_MATCH_THRESHOLD` | **0.30** | Minimum cosine similarity to accept |
+| `FACE_MARGIN_THRESHOLD` | **0.15** | Required lead over the runner-up |
+| `FACE_MIN_DETECT_CONF` | 0.60 | Minimum face-detector confidence |
+| `FACE_ONLY_QUEUE_NUMBER_START` | 5000 | Start of the system-minted range |
+| `PENDING_LINK_TIMEOUT_SECONDS` | 45 | Before staff are alerted |
 
-```python
-def is_person_inside(self, bbox: tuple) -> bool:
-    x1, y1, x2, y2 = bbox
-    cx, cy = (x1 + x2) >> 1, (y1 + y2) >> 1
-    return self.x1 <= cx <= self.x2 and self.y1 <= cy <= self.y2
-```
-
----
-
-## 3. Candidate Confirmation (Anti-Ghost Filter)
-
-**File:** `QueueTracker.process_frame()`
-
-A detection is not immediately assigned a queue number. It is buffered in `_candidates`
-for `MIN_CONFIRM_FRAMES` (default 14) consecutive frames. Only after that does it graduate
-to a real queue entry, preventing shadows or momentary mis-detections from generating numbers:
-
-```python
-cand['count'] += 1
-# ...
-if cand['count'] < self.MIN_CONFIRM_FRAMES:
-    continue   # still accumulating — not a confirmed person yet
-
-# Motion check over the accumulated frame history
-avg_conf = sum(cand['confs']) / max(1, len(cand['confs']))
-if not self._has_sufficient_motion(cand['centers'], avg_conf):
-    self._candidates.pop(track_id)
-    continue
-
-# Confirmed new person — assign next queue number (thread-safe)
-with self._lock:
-    self._highest_assigned += 1
-    num = self._highest_assigned
-    self._used_numbers.add(num)
-new_p = QueuePerson(queue_number=num, track_id=track_id, bbox=bbox)
-```
+The two face thresholds are **calibrated against real photographs**, not
+chosen by intuition — see `FACE_RECOGNITION_CALIBRATION.md` for the
+methodology and results, and `ACCURACY.md` for the full biometric
+evaluation (FAR/FRR, EER, ROC-AUC, and the open-set rejection test that
+set the margin at 0.15).
 
 ---
 
-## 4. Appearance Signature (HSV Split-Body Histogram)
+## 1. Person Detection and Tracking — YOLOv8n + ByteTrack
 
-**File:** `QueueTracker._extract_appearance()`
+**Where:** `app/detector.py`
 
-When a person enters the queue, a 512-value colour signature is extracted by splitting the
-bounding-box crop into upper and lower halves and computing a 16×16 HSV histogram for each:
+YOLOv8n (pretrained, `Model/yolov8n.pt`) detects people class-0 in each
+sampled frame; ByteTrack assigns a persistent `track_id` across frames so
+the same person keeps one identity while visible.
 
-```python
-@staticmethod
-def _extract_appearance(frame, bbox) -> np.ndarray | None:
-    x1, y1, x2, y2 = bbox
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0 or crop.shape[0] < 20 or crop.shape[1] < 10:
-        return None
+Every detection passes five gates before it is accepted as a person:
 
-    def _part_hist(part: np.ndarray) -> np.ndarray:
-        if part.shape[0] < 8 or part.shape[1] < 8:
-            return np.zeros(256, dtype=np.float32)
-        hsv = cv2.cvtColor(part, cv2.COLOR_BGR2HSV)
-        h   = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-        cv2.normalize(h, h)
-        return h.flatten()   # 256 values
+| Gate | Rejects |
+|---|---|
+| Confidence ≥ `YOLO_CONF` | Weak detections |
+| Area ≥ `MIN_BBOX_AREA` | Distant specks, noise |
+| Area ≤ `MAX_BBOX_FRAC` of frame | Boxes swallowing the whole scene |
+| Aspect ratio h/w ≥ `QUEUE_MIN_PORTRAIT_ASPECT` | Non-person shapes |
+| Non-maximum suppression | The same person detected twice |
 
-    mid_y = crop.shape[0] // 2
-    # Concatenate upper + lower → 512-value signature
-    return np.concatenate([_part_hist(crop[:mid_y, :]), _part_hist(crop[mid_y:, :])])
+Box coordinates are then smoothed by an exponential moving average
+(α = 0.45) so the overlay does not jitter frame to frame:
+
+```
+smoothed = α · new + (1 − α) · previous
 ```
 
-**Signature update (EMA):** The signature is refined across frames to reduce noise:
-
-```python
-def _update_appearance(self, person: QueuePerson, frame, bbox):
-    new_sig = self._extract_appearance(frame, bbox)
-    if new_sig is None:
-        return
-    if person.appearance_signature is None:
-        person.appearance_signature = new_sig
-    else:
-        # 60% weight on the stable running average, 40% on the fresh observation
-        person.appearance_signature = 0.6 * person.appearance_signature + 0.4 * new_sig
-    person.appearance_history.append(new_sig)
-    if len(person.appearance_history) > 5:
-        person.appearance_history.pop(0)
-```
+Running YOLO every 3rd frame rather than every frame is a deliberate
+trade: at ~12.6 fps capture this yields ~4.2 detections/sec, which is
+comfortably faster than a person walks into position, while leaving CPU
+budget for face embedding (Algorithm 4), the far more expensive stage.
 
 ---
 
-## 5. Appearance Comparison
+## 2. Zone Presence and Candidate Confirmation
 
-**File:** `QueueTracker._compare_sigs()`
+**Where:** `queue_tracker.process_frame()`
 
-Two 512-value signatures are compared using Pearson histogram correlation on each body half,
-then combined with a weighted average. Upper body receives more weight (0.60) because
-shirt/jacket colour is more consistently visible than leg colour:
+A detection inside the configured queue rectangle is not yet a person in
+the queue — it is a *candidate*. Promotion to confirmed presence requires
+surviving three tests.
 
-```python
-@staticmethod
-def _compare_sigs(sig1: np.ndarray, sig2: np.ndarray) -> float:
-    if sig1 is None or sig2 is None:
-        return 0.0
-    if sig1.shape[0] == 512 and sig2.shape[0] == 512:
-        upper = float(cv2.compareHist(
-            sig1[:256].reshape(16, 16).astype(np.float32),
-            sig2[:256].reshape(16, 16).astype(np.float32),
-            cv2.HISTCMP_CORREL,
-        ))
-        lower = float(cv2.compareHist(
-            sig1[256:].reshape(16, 16).astype(np.float32),
-            sig2[256:].reshape(16, 16).astype(np.float32),
-            cv2.HISTCMP_CORREL,
-        ))
-        # Upper body (shirt) is more discriminative — weight it more
-        return 0.6 * upper + 0.4 * lower
-    # Fallback for legacy 256-value signatures
-    return float(cv2.compareHist(
-        sig1.reshape(16, 16).astype(np.float32),
-        sig2.reshape(16, 16).astype(np.float32),
-        cv2.HISTCMP_CORREL,
-    ))
+**Zone membership** uses the box centroid, not overlap, so someone merely
+brushing the zone edge is not counted:
+
+```
+inside = zone.x1 ≤ (x1+x2)/2 ≤ zone.x2  AND  zone.y1 ≤ (y1+y2)/2 ≤ zone.y2
 ```
 
-Score range: 0.0 (completely different) → 1.0 (identical).
-The appearance tiebreak threshold is **0.20** — above this, two signatures are the same person.
+**Frame accumulation:** the candidate must be seen for
+`QUEUE_MIN_CONFIRM_FRAMES` (20) frames. This is the anti-ghost filter — a
+person walking past the camera, or a one-frame false positive, never
+reaches 20.
+
+**Static-object rejection:** a candidate whose bounding-box centre moves
+less than `QUEUE_MIN_MOTION_PIXELS` (8 px) across the accumulation window
+is rejected as a poster, reflection, or photograph rather than a live
+person. Two escape hatches exist, because the naive version of this test
+punishes exactly the behaviour the system wants:
+
+- Detection confidence ≥ 0.70 bypasses the test outright.
+- **A successfully extracted face embedding bypasses it.** A student
+  standing deliberately still to be recognized is the *intended* use case,
+  and would otherwise be repeatedly rejected as a static object. A live
+  face detection is stronger evidence of a real person than pixel jitter.
+
+Passing all three yields a `QueuePerson` with `identity_status =
+'pending_link'` — confirmed present, no queue number yet. **This state
+never mints a number.** That happens only in Algorithm 5, or by staff
+entry for walk-ins.
 
 ---
 
-## 6. Re-identification (Returning Person Matching)
+## 3. Track Stability — Remapping and Deduplication
 
-**File:** `QueueTracker._find_returning_person()`
+**Where:** `queue_tracker._find_overlapping_candidate()`, `_dedup_active_queue()`
 
-When the tracker sees an unknown track ID after a brief occlusion, it attempts to match the
-detection back to a known missing queue entry before assigning a new number.
+ByteTrack IDs are not stable across occlusion: a person briefly hidden may
+return with a new `track_id`, producing a phantom second entry. Two
+mechanisms defend against this.
 
-### Single missing person
+**Remapping** merges a new track into an existing one when they plainly
+describe the same body — IoU ≥ 0.10 or centroid distance < 180 px, within
+45 frames of absence.
 
-```python
-if len(missing) == 1:
-    tid, p = missing[0]
-    secs = p.seconds_missing
-
-    if secs <= self.RECENCY_SINGLE_MATCH_SECONDS:   # default 60 s
-        if new_sig is not None and p.appearance_signature is not None:
-            score = self._best_score_against_person(p, new_sig)
-            if score >= tbreak:      # tbreak = 0.20
-                return tid, p, score          # ✅ restore
-            return None, None, 0.0            # ⚠️ different person
-        # No appearance data — fall back to spatial proximity
-        sp_score = self._spatial_score(p.bbox, bbox)
-        if sp_score < 0.60:
-            return tid, p, 0.8                # ✅ close enough
-        return None, None, 0.0               # ⚠️ too far away
-
-    # Gone longer than recency window — appearance is required
-    score = self._best_score_against_person(p, new_sig)
-    if score >= tbreak:
-        return tid, p, score
-    return None, None, 0.0
-```
-
-### Spatial score (normalised centroid distance)
-
-```python
-@staticmethod
-def _spatial_score(last_bbox: tuple, new_bbox: tuple) -> float:
-    cx1 = (last_bbox[0] + last_bbox[2]) / 2
-    cy1 = (last_bbox[1] + last_bbox[3]) / 2
-    cx2 = (new_bbox[0]  + new_bbox[2])  / 2
-    cy2 = (new_bbox[1]  + new_bbox[3])  / 2
-    dist  = ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5
-    d1    = ((last_bbox[2]-last_bbox[0])**2 + (last_bbox[3]-last_bbox[1])**2) ** 0.5
-    d2    = ((new_bbox[2] -new_bbox[0]) **2 + (new_bbox[3] -new_bbox[1]) **2) ** 0.5
-    denom = (d1 + d2) / 2
-    return dist / denom if denom > 0 else 999.0
-```
-
-### Multi-person matching
-
-```python
-# Rank all missing persons by appearance score
-app_scored = sorted(
-    ((self._best_score_against_person(p, new_sig), tid, p) for tid, p in missing),
-    reverse=True
-)
-best_app, best_app_tid, best_app_p = app_scored[0]
-second_app = app_scored[1][0] if len(app_scored) >= 2 else 0.0
-
-# Accept only if top score is good AND clearly better than second
-if best_app >= tbreak and (best_app - second_app) >= 0.10:
-    return best_app_tid, best_app_p, best_app
-
-# Ambiguous appearance — fall back to spatial proximity
-sp_tid, sp_p, sp_score = self._best_spatial_match(bbox, missing)
-if sp_p is not None and sp_score < 0.50:
-    return sp_tid, sp_p, 0.8
-```
+**Deduplication** scans the active queue for entries overlapping at
+IoU ≥ 0.10 or centre distance < 0.50 × box diagonal and drops the younger
+one. Newly restored entries carry 60 frames of *dedup immunity*, so a
+person who just returned is not immediately deleted as a duplicate of
+themselves.
 
 ---
 
-## 7. Twin / Lookalike Guard
+## 4. Face Recognition Identity Validation
 
-**File:** `QueueTracker._has_active_lookalike()`
+**Where:** `app/services/face_service.py`
 
-Before attempting re-identification, the system checks whether the incoming candidate already
-matches someone **currently in frame**. If so, they are a different person and get a new number:
+This replaces the retired HSV appearance signature, appearance comparison,
+re-identification, and twin-guard algorithms — four algorithms collapsed
+into one.
 
-```python
-TWIN_LOOKALIKE_SCORE = 0.85   # class constant
+### The model
 
-def _has_active_lookalike(self, new_sig: np.ndarray, current_track_ids: set) -> bool:
-    if new_sig is None:
-        return False
-    thresh = self.TWIN_LOOKALIKE_SCORE
-    for tid, p in self.active_queue.items():
-        if tid not in current_track_ids:
-            continue              # only check people currently visible
-        if p.status == 'done_pending':
-            continue
-        score = self._best_score_against_person(p, new_sig)
-        if score >= thresh:
-            print(f"⚠️  Twin ambiguity: candidate matches active Q{p.queue_number:03d} "
-                  f"(score={score:.2f}) — new number will be assigned")
-            return True
-    return False
+**InsightFace `buffalo_s`, on ONNX Runtime (CPU).** Two models participate:
 
-# Called at the start of _find_returning_person()
-if self._has_active_lookalike(new_sig, current_track_ids):
-    return None, None, 0.0    # block re-match, assign new number
+- **SCRFD** (`det_500m.onnx`) — locates the face
+- **ArcFace** (`w600k_mbf.onnx`) — converts it to a **512-dimensional
+  embedding**
+
+Both are **pretrained**. This is a deliberate choice, not a shortcut:
+training an ArcFace-quality embedding requires millions of images across
+tens of thousands of identities, a dataset neither obtainable nor
+necessary for this project. The scientific contribution here is not the
+embedding — it is the decision rule built on top of it, and its
+calibration against real data.
+
+### Library, not a cloud service
+
+InsightFace is an **open-source Python library**, installed as an ordinary
+package dependency. It is not a commercial face-recognition API such as
+AWS Rekognition, Azure Face, or Face++, and this distinction has three
+consequences that matter for this deployment:
+
+- **It runs entirely on the local machine.** No internet connection, no API
+  keys, no per-request billing, and no dependence on a vendor's uptime
+  during a queue rush.
+- **No face data ever leaves the premises.** Frames are processed in the
+  detector process and discarded; only the derived 512-value embedding is
+  stored. Nothing is transmitted to a third party. Under the Data Privacy
+  Act, where biometrics are sensitive personal information, keeping the
+  entire pipeline on-site removes a whole category of disclosure risk that
+  a cloud API would introduce.
+- **The model files are fixed and inspectable.** The pack downloads once to
+  `~/.insightface/models/buffalo_s/` and does not change underneath the
+  system, so results stay reproducible — a cloud provider silently
+  upgrading its model could invalidate a calibration overnight.
+
+### Two face libraries, two different jobs
+
+The system uses face-related libraries in two places, and they are
+frequently confused. Only one performs recognition:
+
+| Component | Library | Role |
+|---|---|---|
+| Backend (Python) | **InsightFace** | Recognition — *who is this person?* |
+| Mobile app (Flutter) | **Google ML Kit** | Capture guidance only — *is a face centred, angled correctly, well lit?* |
+
+Google ML Kit never identifies anyone and never sees the enrolled roster.
+It exists solely to drive the guided auto-capture on the registration
+screen (`lib/screens/face_capture_screen.dart`): it reports the head yaw
+angle and face size so the app knows when to take each of the three
+enrollment shots automatically, and it measures frame brightness to prompt
+"too dark" or "too bright." The resulting photographs are uploaded to the
+backend, where InsightFace performs the only identity-bearing computation
+in the system.
+
+### Extraction
+
+The upper **75%** of the YOLO person box is cropped and passed to SCRFD.
+The fraction is deliberately generous. An earlier value of 0.45 assumed a
+full-body standing person, but a student stepping close to the camera to
+be recognized produces a head-and-shoulders box, and 0.45 then sliced
+through the middle of their face. Measured on a real failing frame:
+
+| Crop fraction | Detector confidence | Outcome |
+|---|---|---|
+| 0.45 | 0.572 | **Rejected** (below 0.60) |
+| 0.55 | 0.663 | Accepted |
+| 0.65 | 0.696 | Accepted |
+| **0.75** | **0.722** | Accepted |
+| 1.00 | 0.719 | Accepted |
+
+Latency was flat (~240–290 ms) at every crop size, because InsightFace
+resizes its input to 320×320 internally. A tighter crop buys no speed; it
+only risks cutting the face in half.
+
+### Enrollment
+
+A student registers three guided poses (centre, and two opposite turns).
+Each yields an embedding; the three are averaged and L2-normalised into
+one canonical embedding:
+
+```
+canonical = mean(e₁, e₂, e₃) / ‖mean(e₁, e₂, e₃)‖
 ```
 
-**Done-person blacklist:** Appearance signatures of served/no-show entries are stored and
-checked against every new entrant to prevent a served customer re-joining with the same number:
+Averaging across angles makes the stored signature more robust than any
+single photograph.
 
-```python
-def _matches_done_person(self, sig: np.ndarray) -> bool:
-    if sig is None or not self._done_appearances:
-        return False
-    thresh = self.DONE_BLACKLIST_THRESH   # 0.55
-    return any(self._compare_sigs(d, sig) >= thresh for d in self._done_appearances)
+**Only the embedding is stored — never the photographs.** Under the Data
+Privacy Act biometrics are sensitive personal information; the system
+keeps a non-reversible numeric derivative and discards the images.
+
+### Matching — the decision rule
+
+A live embedding is compared against every enrolled student by cosine
+similarity:
+
+```
+similarity(a, b) = (a · b) / (‖a‖ ‖b‖)
 ```
 
-**Manual override:** For identical twins in identical clothing, staff bypass CV entirely:
+Acceptance requires **both** conditions:
 
-```python
-def force_new_person(self) -> dict:
-    with self._lock:
-        self._highest_assigned += 1
-        num = self._highest_assigned
-        self._used_numbers.add(num)
-    fake_tid = -(num)
-    new_p = QueuePerson(queue_number=num, track_id=fake_tid, bbox=(0, 0, 1, 1))
-    new_p.is_manual = True     # never auto-expires, immune to no-show timer
-    self.active_queue[fake_tid] = new_p
-    return new_p.to_dict()
 ```
+accepted = (best_score ≥ 0.30) AND (best_score − second_best ≥ 0.10)
+```
+
+The second condition is the important one and is original to this system.
+If two enrolled students both score around 0.5, the best match is not
+meaningfully better than the runner-up, so the system **refuses to choose**
+and leaves the person pending for staff resolution. This is the structural
+replacement for the old twin-guard: rather than a special case for
+lookalikes, ambiguity is rejected by construction.
+
+A rejection is not an error. It is the safe outcome — the person stays
+pending and a human resolves it.
+
+### Cost
+
+| Stage | Measured |
+|---|---|
+| Embedding extraction (live path) | **258 ms** mean, p95 308 ms |
+| Match scan, 50 enrolled | 0.76 ms |
+| Match scan, 100 enrolled | 0.96 ms |
+| Match scan, 300 enrolled | 2.9 ms |
+
+Extraction dominates matching by roughly 100×. The brute-force O(N) scan
+is therefore not a scaling concern: growing from 50 to 300 enrolled
+students adds about 2 ms. Recognition speed is bounded by how often a
+frame yields a usable face, not by roster size.
+
+Reproduce with `load_testing/bench_face_pipeline.py`.
 
 ---
 
-## 8. No-Show Detection
+## 5. System-Minted Queue Number
 
-**File:** `QueueTracker._check_noshow()`
+**Where:** `queue_tracker.mint_face_only_number()`
 
-Each queue entry at position 1 that goes `missing` starts a countdown timer. When
-`NOSHOW_WINDOW_SECONDS` (default 300 s) elapses the entry is bumped automatically:
+This is the algorithm that answers SOP #2 — identifying a student and
+issuing their queue number with no manual input.
 
-```python
-def _check_noshow(self):
-    now = datetime.now()
-    win = self.NOSHOW_WINDOW_SECONDS
+When Algorithm 4 accepts a match for a person in `pending_link` state, the
+system issues a queue number directly:
 
-    for tid, p in self.active_queue.items():
-        qn = p.queue_number
-        if p.position_in_line == 1 and p.status == 'missing':
-            if qn not in self._noshow_timers:
-                self._noshow_timers[qn] = now          # start countdown
-            elif (now - self._noshow_timers[qn]).total_seconds() >= win:
-                to_bump.append((tid, p))               # time's up
-        else:
-            self._noshow_timers.pop(qn, None)          # reset if back
-
-    for tid, p in to_bump:
-        completed = p.to_dict()
-        completed['bump_reason'] = 'no_show'
-        with self._lock:
-            self.completed_queue.append(completed)
-            self.total_served += 1
-        self._register_done_appearance(p)
-        p.status = 'done_pending'
-        if self.on_noshow:
-            self.on_noshow(p.queue_number)
+```
+number = next unused value ≥ FACE_ONLY_QUEUE_NUMBER_START (5000)
 ```
 
-Staff warnings are generated in `get_noshow_alerts()`:
+The separate numeric range is what makes this safe to run alongside the
+kiosk. Kiosk tickets occupy ordinary low numbers; system-minted numbers
+start at 5000. The two sequences can never collide, so the kiosk's
+numbering is untouched — satisfying the panel's instruction to leave the
+existing queue flow alone while still allowing automatic issuance for
+registered students.
 
-```python
-def get_noshow_alerts(self) -> list:
-    now = datetime.now()
-    alerts = []
-    for p in self.active_queue.values():
-        qn = p.queue_number
-        if qn in self._noshow_timers:
-            elapsed   = (now - self._noshow_timers[qn]).total_seconds()
-            remaining = max(0, self.NOSHOW_WINDOW_SECONDS - elapsed)
-            alerts.append({
-                'queue_number':      f"Q{qn:03d}",
-                'seconds_remaining': int(remaining),
-                'status': 'critical' if remaining <= 15 else 'warning',
-            })
-    return alerts
-```
+**One active entry per student.** Before minting, the system checks whether
+that student already holds a pending or waiting entry. If so, nothing is
+issued. A student can only obtain a new number after staff mark the
+previous one served or no-show — preventing a recognized student from
+accumulating duplicate numbers by re-entering the camera's view.
+
+Walk-ins never reach this path: an unenrolled face produces no accepted
+match, so they are added by staff via `force_new_person()` using the
+number printed on their kiosk ticket.
 
 ---
 
-## 9. Wait-Time Prediction
+## 6. No-Show Detection
 
-**File:** `app/services/prediction_service.py`
+**Where:** `queue_tracker._check_noshow()`
 
-Four models run every frame, all consuming a rolling history of up to 60 crowd-count samples.
+A person at the front of the queue who disappears from the camera starts a
+countdown of `QUEUE_NOSHOW_WINDOW_SECONDS` (300 s). Staff see a live
+warning and may bump them immediately or let the timer expire.
 
-### 9a. M/M/c Baseline (current snapshot)
+Two guards prevent false no-shows:
 
-```python
-def mmch_wait(self, arrival_rate: float, service_rate: float,
-              num_counters: int, queue: int) -> float:
-    avg_svc = self.cfg['avg_service_time']
-    nc      = max(num_counters, 1)
-    if arrival_rate <= 0:
-        return queue * avg_svc / nc           # no arrivals — pure service time
-    rho = arrival_rate / max(nc * service_rate, 1e-9)
-    if rho >= 1.0:
-        return queue * avg_svc / nc           # saturated system fallback
-    return max(0.0, (queue / max(arrival_rate, 0.1)) + avg_svc)
-```
-
-`ρ = λ / (c × μ)` is the server utilisation. When ρ ≥ 1 the system is overloaded and
-the formula falls back to a simple per-counter division to avoid infinite results.
-
-### 9b. Arrival Rate Estimation
-
-```python
-def calculate_arrival_rate(self) -> float:
-    n      = min(30, len(historical_counts))
-    if n < 2:
-        return 0.0
-    counts = list(historical_counts)
-    dt     = (historical_timestamps[-1] - historical_timestamps[-n]) / 60.0
-    return max(0.0, (counts[-1] - counts[-n]) / dt) if dt > 0 else 0.0
-```
-
-### 9c. Trend Slope (shared utility)
-
-```python
-def _trend_slope(self) -> float:
-    counts = list(historical_counts)
-    if len(counts) < 5:
-        return 0.0
-    window = counts[-20:]          # most recent 20 samples
-    m = len(window)
-    x = np.arange(m, dtype=float)
-    x -= x.mean()
-    y = np.array(window, dtype=float)
-    denom = np.dot(x, x)
-    return float(np.dot(x, y) / denom) if denom > 1e-9 else 0.0
-```
-
-### 9d. Short-Term Forecast (~5 min) — Linear Trend Projection
-
-Projects the queue 10 minutes forward using the current slope, then re-applies M/M/c:
-
-```python
-def predict_short_term(self, base_wait: float, slope: float, nc: int) -> float:
-    counts          = list(historical_counts)
-    fps             = self._estimated_fps()
-    projected_queue = max(0.0, counts[-1] + slope * fps * 600)   # 600 s = 10 min
-    avg_svc         = self.cfg['avg_service_time']
-    arrival         = self.calculate_arrival_rate()
-    if arrival <= 0:
-        return max(1.0, projected_queue * avg_svc / max(nc, 1))
-    return max(1.0, (projected_queue / max(arrival, 0.1)) + avg_svc)
-```
-
-### 9e. Medium-Term Forecast (~15 min) — Holt's Double Exponential Smoothing
-
-Level + trend smoothing with exponential damping to prevent runaway extrapolation:
-
-```python
-def predict_medium_term(self, base_wait: float, slope: float, nc: int) -> float:
-    counts = list(historical_counts)
-    if len(counts) < 4:
-        return base_wait
-
-    alpha, beta = 0.4, 0.2
-    level = float(counts[0])
-    trend = float(counts[1] - counts[0])
-
-    for c in counts[1:]:
-        prev  = level
-        level = alpha * c + (1 - alpha) * (level + trend)
-        trend = beta  * (level - prev)  + (1 - beta)  * trend
-
-    # Damped projection: sum of φ^1 + φ^2 + ... + φ^20  where φ = 0.85
-    horizon  = 20
-    damping  = 0.85
-    damp_sum = sum(damping ** i for i in range(1, horizon + 1))
-    forecast_queue = max(0.0, level + trend * damp_sum)
-
-    arrival = self.calculate_arrival_rate()
-    if arrival <= 0:
-        return max(1.0, forecast_queue * self.cfg['avg_service_time'] / max(nc, 1))
-    return max(1.0, (forecast_queue / max(arrival, 0.1)) + self.cfg['avg_service_time'])
-```
-
-### 9f. Long-Term Forecast (~30 min) — Growth Ratio + Mean Reversion
-
-```python
-def predict_long_term(self, base_wait: float, slope: float, nc: int) -> float:
-    counts = list(historical_counts)
-    if len(counts) < 8:
-        return base_wait
-
-    third        = max(len(counts) // 3, 1)
-    early        = np.mean(counts[:third])
-    recent       = np.mean(counts[-third:])
-    growth_ratio = recent / max(early, 1.0)
-
-    # 70% follow the trend, 30% revert to recent mean
-    long_queue = max(0.0, recent * (0.7 * growth_ratio + 0.3))
-
-    arrival = self.calculate_arrival_rate()
-    if arrival <= 0:
-        raw = long_queue * self.cfg['avg_service_time'] / max(nc, 1)
-    else:
-        raw = (long_queue / max(arrival, 0.1)) + self.cfg['avg_service_time']
-
-    return max(1.0, min(raw, 60.0))    # cap at 60 min — long forecasts are uncertain
-```
-
-### 9g. Main update — called once per video frame
-
-```python
-def update(self, count: int, current_data: dict, data_lock) -> None:
-    historical_counts.append(count)
-    historical_timestamps.append(time.time())
-
-    arrival_rate = self.calculate_arrival_rate()
-
-    with data_lock:
-        sr    = current_data['service_rate']
-        nc    = current_data['active_counters']
-        ew    = self.mmch_wait(arrival_rate, sr, nc, count)
-        util  = min(arrival_rate / (nc * sr) if sr > 0 else 0.0, 1.0)
-        slope = self._trend_slope()
-
-        current_data.update({
-            'arrival_rate':         round(arrival_rate, 2),
-            'system_utilization':   round(util, 2),
-            'estimated_wait_time':  round(ew, 1),
-            'predicted_wait_5min':  round(self.predict_short_term(ew, slope, nc), 1),
-            'predicted_wait_15min': round(self.predict_medium_term(ew, slope, nc), 1),
-            'predicted_wait_30min': round(self.predict_long_term(ew, slope, nc), 1),
-        })
-```
+- Entries still in `pending_link` (no number yet) are excluded — there is
+  nothing to no-show.
+- Automatic bumping is **disabled by default**
+  (`QUEUE_AUTO_NOSHOW_ENABLED = false`); the timer raises an alert and a
+  human decides. Removing someone from a queue is not a decision the
+  system makes unsupervised.
 
 ---
 
-## 10. Dynamic Service Time Measurement
+## 7. Wait-Time Prediction
 
-**File:** `app/database/database_handler.py` — `measure_avg_service_time()`
+**Where:** `app/services/prediction_service.py`
 
-Instead of relying on a fixed configured value, real service time is measured from the DB
-every 5 minutes using consecutive inter-departure gaps between served timestamps:
+> **Status:** the trained predictive model for this objective is being
+> developed as separate work. What ships in this system today is the
+> analytical queueing model described here. Report accuracy against
+> whichever is in place at evaluation time.
 
-```python
-def measure_avg_service_time(num_counters: int, window_minutes: int = 120,
-                              min_samples: int = 5) -> float | None:
-    cursor.execute("""
-        SELECT served_at FROM queue_records
-        WHERE status = 'served'
-          AND served_at IS NOT NULL
-          AND served_at >= DATE_SUB(NOW(), INTERVAL %s MINUTE)
-        ORDER BY served_at ASC
-    """, (window_minutes,))
+An **M/M/c queueing model** estimates waiting time from arrival rate λ,
+service rate μ, and counter count c:
 
-    timestamps = [row["served_at"].timestamp() for row in cursor.fetchall()]
-
-    gaps = []
-    for i in range(1, len(timestamps)):
-        delta_min = (timestamps[i] - timestamps[i - 1]) / 60.0
-        if 0.1 <= delta_min <= 15.0:   # filter noise and idle gaps
-            gaps.append(delta_min)
-
-    if len(gaps) < min_samples:
-        return None
-
-    # With c parallel counters: inter_departure ≈ service_time / c
-    measured = (sum(gaps) / len(gaps)) * max(1, num_counters)
-    return round(max(0.5, min(measured, 30.0)), 2)
+```
+ρ = λ / (c · μ)                    system utilisation
+W = queue_length / (c · μ)         expected wait
 ```
 
-The result is blended with the previous value in `queue_service.py` to prevent sudden jumps:
+Arrival rate is estimated from the recent count history (up to 30 samples):
 
-```python
-# In _service_time_refresh_loop() — runs every 300 s in a daemon thread
-measured = measure_avg_service_time(num_counters)
-if measured is not None:
-    old     = QUEUE_CONFIG.get("avg_service_time", 3.0)
-    blended = round(0.7 * measured + 0.3 * old, 2)
-    QUEUE_CONFIG["avg_service_time"] = blended
 ```
+λ = (count_now − count_then) / minutes_elapsed
+```
+
+Forecasts at 5, 15, and 30 minutes extend this with a linear trend
+projection over recent queue-length samples.
+
+**No accuracy measurement exists yet.** MAE and MAPE require comparing
+predictions against realised waits, which needs data from live operation.
 
 ---
 
-## 11. Counter Assignment and Display Board
+## 8. Dynamic Service-Time Measurement
 
-**File:** `QueueTracker._recalculate_positions()`
+**Where:** `app/services/queue_service.py`
 
-After every frame, the active queue is sorted by queue number and each person is assigned
-a position. The first `num_counters` positions also receive a counter number:
+Rather than trusting a configured average, a background thread re-measures
+the real average service time from completed records every 5 minutes and
+blends it into the running estimate:
 
-```python
-def _recalculate_positions(self):
-    active_line = sorted(
-        (p for p in self.active_queue.values() if p.status in ('waiting', 'missing')),
-        key=lambda x: x.queue_number
-    )
-    newly_called = []
-    for i, p in enumerate(active_line):
-        p.position_in_line = i + 1
-        if (i + 1) <= self._num_counters:
-            p.counter_number = i + 1
-            if p.queue_number not in self._announced_numbers:
-                self._announced_numbers.add(p.queue_number)
-                newly_called.append({
-                    'queue_number':   p.queue_number,
-                    'queue_label':    f"Q{p.queue_number:03d}",
-                    'counter_number': i + 1,
-                })
-        else:
-            p.counter_number = None
-    self._newly_called = newly_called
+```
+avg_service_time = 0.7 · measured + 0.3 · previous
 ```
 
-**TTS announcement (frontend — `QueueDisplayBoard.tsx`):**
-
-When the display board polls and finds a new counter assignment, it queues a speech utterance.
-A user-gesture activation overlay is shown on first load to satisfy browser security policy:
-
-```typescript
-// Activated once by user click — unlocks Web Speech API
-function activateVoice() {
-  const unlock = new SpeechSynthesisUtterance(' ');
-  unlock.volume = 0;
-  unlock.onend = () => {
-    setVoiceUnlocked(true);
-    setTimeout(speakNext, 200);
-  };
-  window.speechSynthesis.speak(unlock);
-}
-
-// Called whenever data.counter_assignments changes
-data.counter_assignments.forEach((p) => {
-  const key = `${p.queue_number}-${p.counter_number}`;
-  if (announcedRef.current.has(key)) return;
-  announcedRef.current.add(key);
-  pendingRef.current.push({ queueNumber: p.queue_number, counterNumber: p.counter_number });
-});
-
-// Speaks: "Customer number 3, please proceed to Counter 1."
-function speakNext() {
-  const next = pendingRef.current.shift();
-  const utterance = new SpeechSynthesisUtterance(
-    `Customer number ${next.queueNumber}, please proceed to Counter ${next.counterNumber}.`
-  );
-  utterance.rate = 0.85;
-  utterance.onend = () => setTimeout(speakNext, 800);
-  window.speechSynthesis.speak(utterance);
-}
-```
+The 70/30 blend is damping: a single unusually slow transaction should
+nudge the estimate, not redefine it. This keeps the wait-time model honest
+when counters are genuinely faster or slower than configured. The dashboard
+labels the figure "Measured from DB" or "Default (.env)" so staff can see
+which is in use.
 
 ---
 
-## Summary Table
+## 9. Sticky Counter Assignment
 
-| Subsystem | Algorithm | Key Parameter |
-|-----------|-----------|---------------|
-| Person detection | YOLOv8n + ByteTrack | conf ≥ 0.40 |
-| Bbox smoothing | EMA | α = 0.45 |
-| Zone membership | Centroid-in-rectangle | — |
-| Candidate confirmation | Frame counter buffer | 14 frames |
-| Appearance signature | Split-body HSV histogram | 512 values (16×16 × 2 halves) |
-| Appearance comparison | Pearson correlation | 0.60 upper + 0.40 lower |
-| Re-identification | Appearance + spatial proximity | threshold 0.20 |
-| Twin guard | Active-lookalike score | threshold 0.85 |
-| Done blacklist | Appearance blacklist | threshold 0.55 |
-| Static object filter | Motion energy + confidence bypass | 8 px motion, 0.70 bypass |
-| No-show detection | Missing-frame countdown timer | 300 s default |
-| Current wait time | M/M/c (Erlang-C) | ρ = λ/(cμ) |
-| 5-min forecast | Linear trend projection | 20-sample window |
-| 15-min forecast | Holt double-exponential smoothing | α=0.4, β=0.2, φ=0.85 |
-| 30-min forecast | Growth-ratio + mean-reversion | 70/30 blend, 60-min cap |
-| Service time | Inter-departure gaps from DB | 70/30 blend, 5-min refresh |
-| Counter assignment | Sorted position index | first N = num_counters |
-| TTS announcement | Web Speech API | client-side, per-session dedup |
+**Where:** `queue_tracker._recalculate_positions()`
+
+People within counter range (position ≤ active counter count) are assigned
+to whichever counters are currently free. Assignment is **sticky**: the
+loop skips anyone who already holds a counter, so once a person is given
+counter 2 they keep counter 2 as the queue shifts behind them.
+
+Without stickiness, a person's displayed counter could change between
+reading it and walking over — a small implementation detail with a large
+effect on whether the display can be trusted. Each newly assigned number
+is announced once, tracked in a set so it is never called twice.
+
+---
+
+## System features (not algorithms)
+
+**Ticket generation** — `app/services/ticket_printer.py`. A JWT (HS256,
+4-hour expiry) is embedded in a QR code; a PDF is rendered with the queue
+number, the recognized student's ID and name, position, and a short access
+code with ambiguous characters (0/O, 1/I) removed. Deterministic output
+formatting; no decision logic.
+
+**TTS announcements** — Web Speech API in the browser display board. Reads
+newly assigned numbers aloud. No CV, no prediction.
+
+---
+
+## Summary
+
+| # | Algorithm | Technique | Refuses when |
+|---|---|---|---|
+| 1 | Person detection & tracking | YOLOv8n + ByteTrack, 5 gates, EMA | Fails any gate |
+| 2 | Presence confirmation | Centroid-in-zone + 20-frame buffer + motion test | Too few frames, or static |
+| 3 | Track stability | IoU/centroid remap + dedup | — |
+| 4 | Face recognition | ArcFace 512-d + threshold & margin rule | Score < 0.30 or margin < 0.10 |
+| 5 | System-minted number | Reserved 5000+ range, one-per-student | Student already holds an entry |
+| 6 | No-show detection | Missing-frame countdown | Entry still pending |
+| 7 | Wait-time prediction | M/M/c + trend forecast | — |
+| 8 | Service-time measurement | Inter-departure gap blending | — |
+| 9 | Counter assignment | Sorted position, sticky | — |
+
+Five of the nine (1, 2, 4, 5, 6) have an explicit refuse-and-escalate
+branch. That is the design stance: the system is built to hand ambiguous
+cases to a human rather than resolve them by guessing.

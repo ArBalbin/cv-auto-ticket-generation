@@ -5,7 +5,7 @@ Permanent records still belong in MySQL.
 
 ## Current Progress Snapshot
 
-Last updated: May 12, 2026
+Last updated: May 19, 2026
 
 Redis cache support is implemented but optional. When `REDIS_URL` is set, live
 queue state, recent history, and the latest annotated snapshot can be mirrored to
@@ -20,6 +20,26 @@ Redis is not configured or unavailable, QueueFlow falls back to process memory.
 - `queueflow:history:recent`: recent crowd count history, longer TTL
 
 The live camera snapshot is not stored in MySQL.
+
+## Redis Persistence Requirement
+
+QueueFlow treats Redis as a volatile cache, not as permanent storage. The
+application writes live state and annotated camera snapshots using short TTL
+values, but TTL alone does not prevent Redis from writing data to disk if Redis
+RDB snapshots or AOF persistence are enabled on the Redis server.
+
+For the privacy claim that live camera snapshots are temporary, Redis should run
+in memory only:
+
+```conf
+save ""
+appendonly no
+```
+
+This repository includes `redis.conf` with those settings for self-hosted Redis.
+If you use a managed Redis provider, disable persistence/backups for the Redis
+instance used by QueueFlow, or disclose provider-side persistence in the
+manuscript and deployment notes.
 
 ## Required Cloud Environment
 

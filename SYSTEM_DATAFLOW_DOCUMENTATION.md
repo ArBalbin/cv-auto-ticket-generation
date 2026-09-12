@@ -2,7 +2,7 @@
 
 ## Current Progress Snapshot
 
-Last updated: May 12, 2026
+Last updated: May 19, 2026
 
 The implemented dataflow covers live detector metadata, annotated snapshots,
 queue records, ticket credentials, staff dashboard data, student status lookup,
@@ -179,6 +179,9 @@ Backend processing:
 ```
 
 The snapshot is temporary live data. It is not stored in MySQL.
+When Redis is configured, the snapshot is mirrored only as a short-TTL cache
+entry. Redis should be configured as in-memory only (`save ""` and
+`appendonly no`) so live snapshots are not persisted to Redis RDB or AOF files.
 
 ## 5. Backend State Dataflow
 
@@ -218,6 +221,9 @@ queue_state
 ```
 
 If Redis is configured, the same live data is mirrored to Redis.
+For privacy-sensitive live snapshots, the Redis instance must be volatile
+cache only. Self-hosted Redis can use the included `redis.conf`; managed Redis
+should have persistence/backups disabled or disclosed.
 
 Redis keys:
 

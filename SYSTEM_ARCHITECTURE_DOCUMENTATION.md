@@ -2,7 +2,7 @@
 
 ## Current Progress Snapshot
 
-Last updated: May 12, 2026
+Last updated: May 19, 2026
 
 QueueFlow is currently implemented as a FastAPI backend plus a separate local
 YOLOv8n/OpenCV detector process. The backend, queue tracker, ticket worker,
@@ -504,6 +504,7 @@ Purpose:
 - Helps cloud deployment share temporary live data.
 - Keeps latest snapshot and latest crowd state available across backend workers.
 - Falls back to memory if Redis is not configured.
+- Must be configured as volatile/in-memory only for live camera snapshots.
 
 Redis keys:
 
@@ -531,6 +532,18 @@ users
 long-term history
 PDF files
 ```
+
+Persistence rule:
+
+```text
+If Redis is self-hosted, use redis.conf with:
+save ""
+appendonly no
+```
+
+If a managed Redis provider is used, RDB/AOF persistence and provider backups
+should be disabled for the QueueFlow cache instance, or disclosed in deployment
+and manuscript notes.
 
 ## 9. Security Architecture
 

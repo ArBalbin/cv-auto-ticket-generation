@@ -22,12 +22,27 @@ data/
 # Images & videos
 *.jpg
 *.jpeg
+*.jfif
 *.png
 *.mp4
 *.avi
 
+# Face-recognition calibration data (real people's photos — never commit)
+calibration_data/
+ML/data/tickets/real/
+
+# YOLO evaluation frames — captured from the live queue-zone camera, so they
+# contain identifiable people. Same rule as calibration_data: never commit.
+ML/yolo_eval/
+
+# Evaluation figures ARE wanted in the repo (they are the panel deliverable),
+# so re-include them despite the blanket *.png rule above.
+!ML/figures/
+!ML/figures/*.png
+
 # Generated runtime files
 app/tickets/
+Tickets/
 
 # Logs
 *.err.log

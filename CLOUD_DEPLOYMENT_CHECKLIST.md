@@ -4,7 +4,7 @@ This checklist covers the app/cloud setup only. Database schema, users, and reco
 
 ## Current Progress Snapshot
 
-Last updated: May 12, 2026
+Last updated: May 19, 2026
 
 The backend is cloud-ready through `Dockerfile`, `Procfile`, `render.yaml`, and
 `.env.production.example`. The cloud deployment hosts the FastAPI backend,
@@ -95,7 +95,20 @@ Redis is optional, but recommended in cloud:
 REDIS_URL=redis://...
 ```
 
-When enabled, Redis stores recent detector state, snapshots, history, and staff sessions. If Redis is not configured, the app falls back to process memory.
+When enabled, Redis stores recent detector state, snapshots, and history. If
+Redis is not configured, the app falls back to process memory.
+
+For privacy-sensitive live snapshots, Redis must be used as a volatile cache
+only. If you self-host Redis, start it with the included `redis.conf` or set:
+
+```conf
+save ""
+appendonly no
+```
+
+If you use managed Redis, disable RDB/AOF persistence and provider backups for
+the QueueFlow cache instance, or disclose that provider-side persistence may
+exist.
 
 ## 4. Optional Ticket Object Storage
 

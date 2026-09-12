@@ -9,12 +9,15 @@ from pydantic import BaseModel
 
 from core.config import (
     CAM_TOKEN,
+    GBOX_ALLOWED_DOMAIN,
+    GOOGLE_OAUTH_CLIENT_ID,
     STAFF_REGISTRATION_CODE,
     STAFF_REGISTRATION_ENABLED,
     SESSION_COOKIE_NAME,
     SESSION_COOKIE_SAMESITE,
     SESSION_COOKIE_SECURE,
     SESSION_TTL_SECONDS,
+    STUDENT_SESSION_TTL_SECONDS,
 )
 from database.database_handler import close_db_resources, get_db_pool
 from services import cache_service
@@ -140,6 +143,126 @@ def delete_session_cookie(response: Response) -> None:
         httponly=True,
         samesite=SESSION_COOKIE_SAMESITE,
     )
+
+
+# STUDENT SESSIONS (mobile app)
+#
+# Deliberately a separate token namespace and cache-key prefix from staff
+# sessions above — a student token must never be usable against a
+# require_staff() endpoint, or vice versa. Mobile has no cookie jar, so
+# students authenticate via a bearer token only (Authorization header or
+# X-Student-Session-Token), never a cookie.
+
+_student_sessions: dict[str, tuple[int, float]] = {}
+
+
+def get_student_session_token(request: Request) -> str | None:
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip() or None
+    return request.headers.get("X-Student-Session-Token")
+
+
+def _student_session_cache_key(token: str) -> str:
+    return f"student_session:{token}"
+
+
+def _store_student_session(token: str, student_id: int) -> None:
+    expires_at = time.time() + max(60, STUDENT_SESSION_TTL_SECONDS)
+    _student_sessions[token] = (student_id, expires_at)
+    cache_service.set_json(
+        _student_session_cache_key(token),
+        {"student_id": student_id},
+        STUDENT_SESSION_TTL_SECONDS,
+    )
+
+
+def _lookup_student_session(token: str | None) -> int | None:
+    if not token:
+        return None
+
+    record = _student_sessions.get(token)
+    if record:
+        student_id, expires_at = record
+        if expires_at > time.time():
+            return student_id
+        _student_sessions.pop(token, None)
+
+    cached = cache_service.get_json(_student_session_cache_key(token))
+    if isinstance(cached, dict) and cached.get("student_id") is not None:
+        student_id = int(cached["student_id"])
+        _student_sessions[token] = (
+            student_id,
+            time.time() + max(60, STUDENT_SESSION_TTL_SECONDS),
+        )
+        return student_id
+
+    return None
+
+
+def create_student_session(student_id: int) -> str:
+    token = secrets.token_hex(32)
+    _store_student_session(token, student_id)
+    return token
+
+
+def require_student(request: Request) -> int:
+    token = get_student_session_token(request)
+    student_id = _lookup_student_session(token)
+    if student_id is None:
+        raise HTTPException(status_code=401, detail="Login required")
+    return student_id
+
+
+def clear_student_session(token: str | None) -> int | None:
+    if not token:
+        return None
+    record = _student_sessions.pop(token, None)
+    cache_service.delete(_student_session_cache_key(token))
+    if record:
+        return record[0]
+    return None
+
+
+class GoogleIdentity(BaseModel):
+    sub: str
+    email: str
+    name: str | None = None
+
+
+def verify_google_id_token(id_token_str: str) -> GoogleIdentity:
+    """Verify a Google ID token from the Flutter app's Sign-in-with-Google
+    flow: valid signature, correct audience (our OAuth client), and email
+    on the NCF Gbox domain. Raises HTTPException on any failure — this is
+    the sole credential check for student accounts, so it fails closed.
+    """
+    if not GOOGLE_OAUTH_CLIENT_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="Google sign-in is not configured on this server.",
+        )
+
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token as google_id_token
+
+        claims = google_id_token.verify_oauth2_token(
+            id_token_str, google_requests.Request(), GOOGLE_OAUTH_CLIENT_ID,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid Google sign-in token: {exc}")
+
+    if not claims.get("email_verified", False):
+        raise HTTPException(status_code=401, detail="Google account email is not verified.")
+
+    email = str(claims.get("email", "")).strip().lower()
+    if GBOX_ALLOWED_DOMAIN and not email.endswith(f"@{GBOX_ALLOWED_DOMAIN.lower()}"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Sign in with your @{GBOX_ALLOWED_DOMAIN} Gbox account.",
+        )
+
+    return GoogleIdentity(sub=str(claims["sub"]), email=email, name=claims.get("name"))
 
 
 def verify_cam_token(request: Request) -> None:

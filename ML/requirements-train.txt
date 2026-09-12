@@ -1,0 +1,12 @@
+# Training-only dependencies for ML/train_digit_classifier.py and
+# ML/generate_synthetic_tickets.py. Deliberately kept OUT of the root
+# requirements.txt — the deployed backend/detector only needs the exported
+# ONNX artifact (Model/ticket_digit_cnn.onnx) plus onnxruntime, never a full
+# training framework. Install this on Colab or a local training machine.
+
+torch
+onnx
+
+opencv-python
+numpy
+Pillow

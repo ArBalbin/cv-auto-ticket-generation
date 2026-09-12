@@ -1,0 +1,2 @@
+Method,Name,Error,Occurrences,First Seen,Last Seen
+GET,/api/queue/status,HTTPError('503 Server Error: Service Unavailable for url: /api/queue/status'),77,2026-08-26T13:21:19Z,2026-08-26T13:21:46Z

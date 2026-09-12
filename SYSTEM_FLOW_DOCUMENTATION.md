@@ -2,7 +2,7 @@
 
 ## Current Progress Snapshot
 
-Last updated: May 12, 2026
+Last updated: May 19, 2026
 
 The current flow is functional for prototype demonstration: the detector reads a
 camera feed, YOLOv8n tracks persons, detection metadata is pushed to the FastAPI
@@ -571,6 +571,17 @@ CACHE_STATE_TTL_SECONDS=30
 CACHE_SNAPSHOT_TTL_SECONDS=10
 CACHE_HISTORY_TTL_SECONDS=3600
 ```
+
+For live camera snapshots, Redis must remain a volatile cache. If Redis is
+self-hosted, use the included `redis.conf` or configure:
+
+```conf
+save ""
+appendonly no
+```
+
+If managed Redis is used, disable persistence/backups for this cache instance
+or disclose that provider-side persistence may exist.
 
 Redis is used for:
 

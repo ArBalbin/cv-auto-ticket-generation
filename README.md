@@ -1,53 +1,71 @@
-# QueueFlow
+# QueuEx
 
-QueueFlow is a computer-vision-based queue monitoring and automated queue ticket
-prototype for campus service offices. It uses a local camera and YOLOv8n person
-detection to identify people entering a queue zone, assigns queue numbers,
-generates QR-enabled queue tickets, stores queue records in MySQL, and exposes
-staff dashboard and student queue-status APIs through a FastAPI backend.
+QueuEx is a computer-vision queue management prototype for campus service
+offices. A camera watches the queue area; YOLOv8n detects and tracks people,
+ArcFace face recognition identifies enrolled students, and the system issues
+each recognised student a queue number automatically — no kiosk button, no
+staff typing, no manual input.
 
-The target deployment uses a thermal printer for physical queue tickets. The
-current prototype generates PDF tickets with the same queue number, short code,
-QR link, and JWT-backed validation flow so the ticket workflow can be demonstrated
-without printer hardware.
+Students enrol once through a mobile app (institutional Google sign-in, then a
+guided face capture). On a later visit they tap **Join the Queue**, walk into
+the queue area, and the camera does the rest.
 
-## Current Progress
+Last updated: September 12, 2026
 
-Last updated: May 12, 2026
+> **This repository is the backend.** The system is three separate repositories:
+>
+> | Part | Repo | Stack |
+> |---|---|---|
+> | **Backend + detector** (this one) | `Crowd_Monitoring` | FastAPI, YOLOv8n, InsightFace, MySQL |
+> | **Student mobile app** | `queueflow_mobile` | Flutter |
+> | **Staff dashboard** | `CV-frontend` | React + Vite + TypeScript |
+>
+> The backend serves **JSON only**. It has no HTML pages — the staff dashboard
+> is the separate React app, and the student interface is the Flutter app.
 
-Implemented:
+## How a ticket gets issued
 
-- FastAPI backend with dashboard routes, auth routes, detector upload routes,
-  queue APIs, crowd APIs, and health check.
-- Separate OpenCV + YOLOv8n detector process that reads a camera feed, performs
-  person detection/tracking, sends metadata to the backend, and uploads annotated
-  snapshots for the dashboard.
-- Queue tracker with queue-zone filtering, candidate confirmation, duplicate
-  suppression, hybrid re-entry matching, no-show handling, manual force-new
-  override, and staff done/reset actions.
-- Ticket worker that generates PDF queue tickets with QR codes, short codes, JWT
-  tokens, and MySQL persistence.
-- Wait-time prediction using an M/M/c baseline, short trend projection, Holt's
-  double exponential smoothing, and growth-ratio mean reversion for current,
-  5-minute, 15-minute, and 30-minute estimates.
-- MySQL schemas for users, queue records, queue events, counter configuration
-  history, and crowd snapshots.
-- Optional Redis cache for live state/snapshot mirroring in cloud deployments.
-- Optional S3-compatible object storage support for generated ticket PDFs.
-- Render/cloud deployment files and production environment examples.
+1. A student signs in to the mobile app with their Gbox account and captures
+   their face. Only a 512-number embedding is stored — **never a photograph**.
+2. Later, at the office, they tap **Join the Queue** in the app. This arms
+   their intent for a short window; recognition alone issues nothing, so a
+   student merely walking past the camera is never charged a ticket.
+3. The detector confirms a person is genuinely present in the queue zone
+   (rejecting static objects and momentary ghost tracks), then extracts a face
+   embedding from the person crop.
+4. The embedding is matched against enrolled students. A match is accepted only
+   if it clears **both** an absolute similarity threshold and a margin over the
+   runner-up. Anything ambiguous is refused and escalated to staff rather than
+   guessed.
+5. On an accepted match the system mints a queue number, generates a ticket
+   (PDF now, thermal printer at deployment) carrying the number, the student's
+   name, a QR code and a short access code, and pushes live status to the app.
+6. Staff mark the number done from the dashboard.
 
-In progress / demo-limited:
+Walk-ins without an enrolled face are handled by staff typing the number
+manually — the system never refuses service to someone who has not enrolled.
 
-- Thermal printer integration is planned for final deployment; PDF ticket
-  generation is the current demo fallback.
-- Detector still runs on the camera-connected local machine even when the
-  FastAPI backend is cloud-hosted.
-- Mobile app integration is documented as a consuming client for QR/status lookup;
-  this repository contains the backend, detector, dashboard, and ticket services.
-- Live testing depends on available camera position, queue-zone calibration, and
-  local service-office conditions.
+## What is measured, not claimed
 
-## Repository Structure
+Accuracy figures come from experiments that reproduce with a named script. See
+`ACCURACY.md` — it is split into **Part A (measured)** and **Part B
+(estimated)**, and the two must not be mixed.
+
+| Result | Value | Script |
+|---|---|---|
+| Face recognition ROC AUC | 0.999907 | `ML/evaluate_face_accuracy.py` |
+| Equal Error Rate | 0.42 % | same |
+| Rank-1 identification | 100 % (45/45) | same |
+| Wrong identities issued | **0** | same |
+| Unenrolled strangers refused | **45/45 (100 %)** | same |
+| API under 50 concurrent users | p50 12 ms, p99 85 ms, 0 failures | `load_testing/run_load_test.py` |
+
+Person-detection accuracy on the deployment camera is **not yet measured** —
+the harness (`ML/evaluate_yolo_accuracy.py`) is built and verified, but needs
+ground-truth labelling. `ACCURACY.md` §A4 says so plainly rather than quoting
+COCO figures as if they described this deployment.
+
+## Repository structure
 
 ```text
 Crowd_Monitoring/
@@ -57,39 +75,37 @@ Crowd_Monitoring/
 |   |-- state.py                   # Runtime state and snapshot helpers
 |   |-- core/
 |   |   |-- config.py              # Environment/config validation
-|   |   `-- security.py            # Auth, sessions, staff registration
+|   |   |-- database.py            # Engine/session helpers
+|   |   `-- security.py            # Staff auth, sessions, Google ID tokens
 |   |-- database/
 |   |   `-- database_handler.py    # MySQL pool and persistence helpers
 |   |-- routers/
-|   |   |-- auth.py                # /api/auth/*
+|   |   |-- auth.py                # /api/auth/*        staff login
 |   |   |-- crowd.py               # /api/stats, snapshot, history, video
 |   |   |-- detector_api.py        # /yolo/push-frame, /yolo/update
-|   |   |-- health.py              # /health
-|   |   |-- pages.py               # HTML dashboard/login routes
-|   |   `-- queue.py               # /api/queue/*
-|   |-- services/
-|   |   |-- cache_service.py       # Optional Redis cache
-|   |   |-- object_storage_service.py
-|   |   |-- prediction_service.py  # M/M/c + trend/Holt/mean-reversion forecasts
-|   |   |-- queue_service.py       # Queue business logic
-|   |   |-- queue_tracker.py       # Queue number tracking and re-entry matching
-|   |   |-- ticket_printer.py      # PDF ticket, QR, JWT, short code
-|   |   `-- ticket_service.py      # Background ticket worker
-|   `-- templates/                 # Dashboard/login/register pages
-|-- database_sql/                  # Local/cloud database schemas
-|-- ML/                            # Training-related files
-|-- Model/                         # Place YOLO weights here
-|-- CURRENT_PROGRESS.md            # Current implementation progress
-|-- ALGORITHMS.md                  # Algorithm reference
-|-- SYSTEM_ARCHITECTURE_DOCUMENTATION.md
-|-- SYSTEM_DATAFLOW_DOCUMENTATION.md
-|-- SYSTEM_FLOW_DOCUMENTATION.md
-|-- DATABASE_RELATIONSHIPS_DOCUMENTATION.md
-|-- CLOUD_DEPLOYMENT_CHECKLIST.md
-|-- CLOUD_CACHE_SETUP.md
-|-- Dockerfile
-|-- Procfile
-|-- render.yaml
+|   |   |-- health.py              # /health, /
+|   |   |-- queue.py               # /api/queue/*       queue operations
+|   |   `-- students.py            # /api/students/*    enrolment, join gate
+|   `-- services/
+|       |-- cache_service.py       # Optional Redis cache
+|       |-- face_service.py        # ArcFace embeddings + match decision rule
+|       |-- object_storage_service.py
+|       |-- prediction_service.py  # M/M/c + trend/Holt/mean-reversion forecasts
+|       |-- queue_service.py       # Queue business logic
+|       |-- queue_tracker.py       # Presence, tracking, re-entry, minting
+|       |-- ticket_printer.py      # PDF ticket, QR, JWT, short code
+|       `-- ticket_service.py      # Background ticket worker
+|-- ML/
+|   |-- calibrate_face_recognition.py   # Threshold calibration
+|   |-- evaluate_face_accuracy.py       # FAR/FRR/EER/ROC + open-set test
+|   |-- evaluate_yolo_accuracy.py       # Person-count accuracy harness
+|   |-- generate_accuracy_charts.py     # Figures for the evaluation chapter
+|   |-- report_recognition_metrics.py   # Live accuracy from the database
+|   `-- figures/                        # Generated evaluation figures
+|-- load_testing/                  # Locust suite + results
+|-- database_sql/                  # Schemas and migrations
+|-- Model/                         # YOLO weights (yolov8n.pt)
+|-- calibration_data/              # Face photos — gitignored, never committed
 `-- requirements.txt
 ```
 
@@ -101,98 +117,141 @@ Crowd_Monitoring/
 - YOLOv8n weights at `Model/yolov8n.pt`
 - Optional Redis instance for cloud cache
 - Optional S3-compatible object storage for ticket PDFs
-- Thermal printer for final deployment, or PDF output for prototype demo
 
-Install Python dependencies:
+InsightFace model weights (`buffalo_s`) download automatically on first run.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Environment Setup
+## Environment setup
 
-Copy `.env.example` to `.env`, then fill in values for:
+Copy `.env.example` to `.env` and fill in:
 
 - `APP_ENV`
-- `PORTAL_BASE_URL`
-- `CAM_TOKEN`
-- `JWT_SECRET_KEY`
-- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
-- `STAFF_REGISTRATION_ENABLED`
-- `STAFF_REGISTRATION_CODE`
-- camera and YOLO tuning values as needed
+- `JWT_SECRET_KEY`, `CAM_TOKEN`
+- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`
+- `GOOGLE_OAUTH_CLIENT_ID`, `GBOX_ALLOWED_DOMAIN` — required for student sign-in
+- `STAFF_REGISTRATION_ENABLED`, `STAFF_REGISTRATION_CODE`
+- Camera and YOLO tuning values as needed
 
-For production/cloud setup, use `.env.production.example` as the starting point.
+The face thresholds are **not** in `.env.example`, because their defaults are
+calibrated values rather than site settings and should not be changed casually.
+They are still overridable when a deployment genuinely needs it:
+`FACE_MATCH_THRESHOLD` (0.30), `FACE_MARGIN_THRESHOLD` (0.15),
+`FACE_MIN_DETECT_CONF` (0.60). Read `ACCURACY.md` §A1 before touching them —
+lowering the margin below 0.15 is measured to let strangers through.
 
-## Database Setup
+**`PORTAL_BASE_URL` usually needs no value.** It is baked into every printed
+ticket's QR code, and left at `localhost` the QR would resolve to the student's
+own phone instead of the server. In development the backend now detects the
+machine's LAN address automatically and prints it at startup:
 
-For a fresh cloud database, import:
+```
+[API] Ticket QR codes will point to: http://10.23.83.12:5000
+```
+
+Set it explicitly only to pin a specific address or a public domain. Production
+requires an explicit public URL and refuses to start on a loopback address.
+
+For production/cloud setup, start from `.env.production.example`.
+
+## Database setup
+
+Fresh database:
 
 ```text
 database_sql/schema_cloud_ready.sql
 ```
 
-For a clean Aiven reset that drops and recreates QueueFlow tables, use:
+Clean Aiven reset:
 
 ```text
 database_sql/aiven_clean_full_schema.sql
 ```
 
-## Running Locally
+Then apply the migrations in `database_sql/` in filename order. See
+`DATABASE_RELATIONSHIPS_DOCUMENTATION.md` for what each one adds.
 
-Start the FastAPI backend:
+## Running locally
+
+Backend:
 
 ```bash
 python app/main.py
 ```
 
-Or with Uvicorn:
-
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 5000
-```
-
-Start the detector in a separate terminal on the camera-connected machine:
+Detector, in a separate terminal on the camera machine:
 
 ```bash
 python app/detector.py
 ```
 
-Common local URLs:
+> Use `python -u` when piping either process's output to a file or another
+> tool. Python buffers stdout when it is not a terminal, which makes a running
+> process look hung — this cost two wrong diagnoses during development.
 
-- Login: `http://localhost:5000/login`
-- Queue dashboard: `http://localhost:5000/dashboard/queueflow`
-- Queue analytics: `http://localhost:5000/dashboard/queue-analytics`
-- Computer vision dashboard: `http://localhost:5000/dashboard/computer-vision`
+Useful endpoints:
+
+- Interactive API docs: `http://localhost:5000/docs`
 - Health check: `http://localhost:5000/health`
-- Queue list API: `http://localhost:5000/api/queue/list`
-- Queue prediction API: `http://localhost:5000/api/queue/prediction`
+- Queue list: `http://localhost:5000/api/queue/list`
+- Public display board data: `http://localhost:5000/api/queue/display`
+- Prediction: `http://localhost:5000/api/queue/prediction`
 
-## Cloud Deployment
+The staff dashboard and student app are separate applications; point them at
+this backend's address.
 
-Cloud deployment is supported for the FastAPI backend. The detector should still
-run on the local machine connected to the camera, with `API_BASE_URL` pointed to
-the hosted backend URL.
+## Evaluation and testing
 
-Minimum cloud start command:
+```bash
+python ML/evaluate_face_accuracy.py          # biometric accuracy + figures
+python ML/generate_accuracy_charts.py        # calibration figures
+python ML/report_recognition_metrics.py      # live accuracy from the database
+python load_testing/run_load_test.py         # API load test
+python ML/evaluate_yolo_accuracy.py capture  # person-detection ground truth
+```
+
+The load test seeds a real ticket, runs Locust headless, writes CSVs, and
+removes the seeded ticket afterwards. It targets `127.0.0.1` by default, not
+`localhost` — on Windows the latter resolves to IPv6 first and adds a spurious
+~2 s to every new connection, which earlier runs mistook for server latency.
+
+## Cloud deployment
+
+The FastAPI backend deploys to a cloud host; the detector must still run on the
+machine physically connected to the camera, with `API_BASE_URL` pointed at the
+hosted backend.
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
 ```
 
-Use these docs for deployment:
+See `CLOUD_DEPLOYMENT_CHECKLIST.md` and `CLOUD_CACHE_SETUP.md`.
 
-- `CLOUD_DEPLOYMENT_CHECKLIST.md`
-- `CLOUD_CACHE_SETUP.md`
+## Documentation
 
-## Important Documentation
+| File | Contents |
+|---|---|
+| `ALGORITHMS.md` | The nine algorithms, with the thresholds actually deployed |
+| `ACCURACY.md` | Measured results (Part A) and estimated behaviour (Part B) |
+| `FACE_RECOGNITION_CALIBRATION.md` | How the thresholds were chosen |
+| `DATABASE_RELATIONSHIPS_DOCUMENTATION.md` | All eight tables and their relationships |
+| `SYSTEM_ARCHITECTURE_DOCUMENTATION.md` | Component architecture |
+| `SYSTEM_FLOW_DOCUMENTATION.md` | End-to-end runtime flow |
+| `SYSTEM_DATAFLOW_DOCUMENTATION.md` | Data movement and storage |
+| `CURRENT_PROGRESS.md` | Implementation status |
+| `PITFALLS.md` | Real bugs and design errors hit during development |
 
-- `CURRENT_PROGRESS.md` - current progress, completed work, remaining work
-- `SYSTEM_ARCHITECTURE_DOCUMENTATION.md` - component architecture
-- `SYSTEM_FLOW_DOCUMENTATION.md` - end-to-end runtime flow
-- `SYSTEM_DATAFLOW_DOCUMENTATION.md` - data movement and storage
-- `DATABASE_RELATIONSHIPS_DOCUMENTATION.md` - database entities and relations
-- `ALGORITHMS.md` - detection, queue tracking, re-ID, no-show, prediction
+## Privacy
+
+- Face **embeddings** are stored; face **photographs** are not. Enrolment
+  images exist only in the phone's memory during capture.
+- An embedding is one-way: it supports comparison, but the original face cannot
+  be reconstructed from it.
+- `calibration_data/` holds real people's photos for threshold calibration and
+  is gitignored. It must never be committed.
+- Students choose to be recognised each visit through the Join the Queue gate.
 
 ## Team
 

@@ -35,7 +35,13 @@ import requests
 print("[Detector] Loading Ultralytics/YOLO...", flush=True)
 from ultralytics import YOLO
 from services.prediction_service import PredictionService
+from services import face_service
 print("[Detector] Detector libraries loaded.", flush=True)
+
+# Rolling live face-detection tally: [attempts, successes]. Reported on the
+# periodic status line so the detection rate is visible during a session
+# rather than only afterwards from recognition_metrics.
+_face_stats = [0, 0]
 
 # CONFIGURATION
 def _env(key: str, default: str) -> str:
@@ -206,24 +212,6 @@ def _run_nms(raw: list) -> tuple[list, list]:
 
 
 
-# APPEARANCE EXTRACTION
-def _extract_appearance(frame, bbox) -> list | None:
-    if frame is None:
-        return None
-    x1, y1, x2, y2 = bbox
-    h_f, w_f = frame.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w_f-1, x2), min(h_f-1, y2)
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0 or crop.shape[0] < 10 or crop.shape[1] < 10:
-        return None
-    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-    cv2.normalize(hist, hist)
-    return hist.flatten().tolist()
-
-
-
 # HTTP PUSH HELPER
 _session     = requests.Session()
 _push_errors = 0
@@ -294,6 +282,14 @@ def _push_to_api(payload: dict) -> None:
         _push_errors += 1
         if _push_errors <= 5 or _push_errors % 30 == 0:
                     print(f"[Detector] WARNING push-frame failed ({_push_errors}x): {e}")
+    except Exception as e:
+        # Not a transport failure — a malformed or unexpected response body
+        # (bad JSON, a shape _apply_backend_config did not expect). Without
+        # this the exception would escape into the push thread and kill it,
+        # silently stopping all queue-state updates.
+        _push_errors += 1
+        if _push_errors <= 5 or _push_errors % 30 == 0:
+            print(f"[Detector] WARNING push-frame bad response ({_push_errors}x): {e}")
 
 
 def _snapshot_upload_worker() -> None:
@@ -743,8 +739,28 @@ def run() -> None:
                       f"scale={FRAME_SCALE:.2f}")
             avg_d, max_d = predictor.calculate_density(persons, w_frame, h_frame)
 
+            # Face embedding (Algorithm 4) runs here, in the detector process,
+            # where the raw frame is available. Only the resulting vector ever
+            # crosses the wire to the backend, never a face crop.
             for tp in tracked_persons:
-                tp["appearance"] = _extract_appearance(small, tuple(tp["bbox"]))
+                tid = tp["track_id"]
+                bbox_t = tuple(tp["bbox"])
+
+                try:
+                    embedding = face_service.compute_embedding(small, bbox_t)
+                    tp["face_embedding"] = embedding.tolist() if embedding is not None else None
+                    # Live face-detection rate. A miss is a retry, not a wrong
+                    # answer — it still costs a full extraction (~260ms), so
+                    # this ratio is what drives time-to-recognition.
+                    _face_stats[0] += 1
+                    if embedding is not None:
+                        _face_stats[1] += 1
+                except Exception as e:
+                    tp["face_embedding"] = None
+                    _face_stats[0] += 1
+                    if DETECTION_DEBUG_EVERY > 0 and yolo_frame_idx[0] % DETECTION_DEBUG_EVERY == 0:
+                        print(f"[Detector] WARNING face embedding error: {e}")
+
 
             with _data_lock:
                 current_data.update({
@@ -781,10 +797,10 @@ def run() -> None:
                     "queue_length":         ql,
                     "timestamp":            time.time(),
                     "tracked_persons": [
-                        {"track_id":   p["track_id"],
-                         "bbox":       list(p["bbox"]),
-                         "conf":       p.get("conf", 0.5),
-                         "appearance": p.get("appearance")}
+                        {"track_id":      p["track_id"],
+                         "bbox":          list(p["bbox"]),
+                         "conf":          p.get("conf", 0.5),
+                         "face_embedding": p.get("face_embedding")}
                         for p in tracked_persons
                     ],
                 })
@@ -924,12 +940,35 @@ def run() -> None:
                     _shared_state["snapshot_jpg"] = buf.tobytes()
                     _shared_state["snapshot_seq"] += 1
 
-    yolo_thread = threading.Thread(target=_yolo_worker,
+    def _supervised(worker, label: str):
+        """
+        Wrap a worker thread so its death is loud instead of silent.
+
+        These threads are daemons: if one raises, Python kills just that
+        thread and the process carries on. The detector would keep reading
+        frames, keep printing an fps line, and keep looking healthy while
+        silently detecting nobody — the worst possible failure during a beta
+        session, because the logs give no reason to distrust the run.
+
+        Shutting the whole detector down instead makes the failure
+        impossible to miss and impossible to trust by accident.
+        """
+        def runner() -> None:
+            try:
+                worker()
+            except Exception as exc:
+                import traceback
+                print(f"[Detector] FATAL: {label} died: {exc}", flush=True)
+                traceback.print_exc()
+                _shutdown.set()
+        return runner
+
+    yolo_thread = threading.Thread(target=_supervised(_yolo_worker, "YOLO worker"),
                                    name="YOLOWorker", daemon=True)
     yolo_thread.start()
 
     api_push_thread = threading.Thread(
-        target=_api_push_worker,
+        target=_supervised(_api_push_worker, "API push worker"),
         name="APIPushWorker",
         daemon=True,
     )
@@ -985,8 +1024,13 @@ def run() -> None:
             if elapsed >= 5.0:
                 with _result_lock:
                     cnt = _yolo_cache["count"]
+                attempts, hits = _face_stats
+                face_note = (
+                    f" | face {hits}/{attempts} ({hits / attempts * 100:.0f}%)"
+                    if attempts else ""
+                )
                 print(f"[Detector] {_fps_frames/elapsed:.1f} fps | "
-                      f"count={cnt} | push_errors={_push_errors}")
+                      f"count={cnt} | push_errors={_push_errors}{face_note}")
                 _fps_t0     = time.time()
                 _fps_frames = 0
 

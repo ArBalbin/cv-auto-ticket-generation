@@ -13,6 +13,21 @@ from services.object_storage_service import is_configured as is_object_storage_c
 router = APIRouter()
 
 
+@router.get("/", summary="Service root", tags=["System"])
+async def root():
+    """
+    Kept deliberately: this backend is API-only (the staff dashboard is a
+    separate React app and the students use the mobile app), but Render's
+    default health check pings "/", so this must answer rather than 404.
+    """
+    return {
+        "service": "QueuEx backend",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
 @router.get("/health", summary="Health check", tags=["System"])
 async def health():
     return {
