@@ -1,7 +1,11 @@
 # Environment
 .env
 .env.*
+# The *.example files are templates: placeholders and comments, never real
+# values. They have to be committed — they are how anyone else, or you on a
+# new machine, knows which variables the system needs.
 !.env.example
+!.env.production.example
 .venv/
 __pycache__/
 *.py[cod]

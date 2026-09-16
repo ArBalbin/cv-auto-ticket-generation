@@ -3,8 +3,19 @@ fastapi
 uvicorn[standard]
 
 # Computer vision
-opencv-python
-ultralytics
+#
+# No opencv line here: insightface hard-requires opencv-python, so pinning
+# opencv-python-headless as well only installs a second package providing the
+# same cv2 module, and the two overwrite each other. The Dockerfile installs
+# libgl1 and libglib2.0-0, which are exactly what the non-headless wheel needs.
+#
+# ultralytics is NOT here on purpose. Only app/detector.py imports it, and the
+# detector runs on the machine with the camera, never on the server. Installing
+# it here made the deployment pull PyTorch and the whole CUDA stack — torch
+# 554MB, cuDNN 553MB, cuBLAS 423MB, NCCL 216MB and more, roughly 2.5GB of GPU
+# libraries onto a CPU-only host that never imports them.
+#
+# For the camera machine, install requirements-detector.txt instead.
 numpy
 
 # Face recognition (students only) + ticket-digit classifier inference

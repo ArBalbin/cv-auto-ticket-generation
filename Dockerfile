@@ -7,11 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Use headless OpenCV in Docker (no GUI needed)
+# requirements.txt is the server set: it already pins opencv-python-headless
+# and deliberately excludes ultralytics, so no grep-and-substitute is needed
+# here any more. The camera machine uses requirements-detector.txt instead.
 COPY requirements.txt .
-RUN pip install --no-cache-dir \
-        opencv-python-headless \
-        $(grep -v '^opencv-python$' requirements.txt | grep -v '^#' | grep -v '^$' | tr '\n' ' ')
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
