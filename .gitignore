@@ -35,6 +35,14 @@ ML/data/tickets/real/
 # contain identifiable people. Same rule as calibration_data: never commit.
 ML/yolo_eval/
 
+# Database dumps that carry ROWS: the users table holds a staff password hash,
+# and student_profiles holds face embeddings as soon as anyone enrols. Dumps of
+# structure only (aiven_deploy_schema.sql) stay committed — they are useful and
+# carry nothing private.
+database_sql/aiven_deploy_full.sql
+database_sql/*_data.sql
+database_sql/*_backup.sql
+
 # Evaluation figures ARE wanted in the repo (they are the panel deliverable),
 # so re-include them despite the blanket *.png rule above.
 !ML/figures/

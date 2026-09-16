@@ -205,15 +205,23 @@ If the panel asks specifically for mAP: this is stock YOLOv8n with unmodified
 COCO-pretrained weights, so its published person-class AP applies as-is, and
 this project makes no claim to have improved it.
 
-> **Finding already surfaced by building the harness.** On a saved test
-> snapshot, YOLO detected a person at **0.93 confidence** and the deployment's
-> `MAX_BBOX_FRAC = 0.70` filter discarded the box for covering **72 %** of the
-> frame. A student standing close to the camera can therefore be dropped
-> entirely — no detection, no face crop, no ticket — while looking identical
-> to a detection miss in the count. The capture stage now draws filtered boxes
-> in red and reports them separately, so the real capture run will show
-> immediately whether this affects the actual camera placement. **Verify this
-> against the deployed camera geometry before the beta test.**
+> **The size filter has less headroom than the frame suggests.** On a saved
+> test snapshot, YOLO detected a person at **0.93 confidence** whose box
+> covered **72 %** of the frame — against a `MAX_BBOX_FRAC` of **0.85**. It
+> was kept, with about 13 percentage points to spare, but a student standing
+> closer than that one would cross the limit and be discarded entirely: no
+> detection, no face crop, no ticket, and indistinguishable from a plain miss
+> in the count.
+>
+> The capture stage therefore draws filtered boxes in **red** and reports them
+> separately, so a real capture run shows immediately whether the filter is
+> removing anyone who belongs in the queue.
+>
+> *(An earlier revision of this section stated the box had been discarded at
+> `MAX_BBOX_FRAC = 0.70`. That was the fallback written in `app/detector.py`,
+> not the deployed value — `.env` sets 0.85 and overrides it. The box was
+> kept. Every threshold in this document is the `.env` value where one is
+> set, because that is what actually runs.)*
 
 ---
 

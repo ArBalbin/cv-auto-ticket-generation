@@ -51,6 +51,19 @@ import cv2
 import numpy as np
 
 ROOT = Path(__file__).parent.parent
+
+# Load .env BEFORE reading any setting below. app/detector.py calls
+# load_dotenv() at import, so every value it uses comes from .env, not from
+# the fallbacks written in its source. Without this line the harness silently
+# measured a completely different configuration than the one deployed —
+# every one of the seven settings differed (imgsz 480 vs 320, conf 0.50 vs
+# 0.55, min_area 1500 vs 800, max_frac 0.70 vs 0.85, scale 0.5 vs 0.75,
+# capture 1280x720 vs 640x480). The resulting numbers would have described a
+# detector this project does not run.
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(ROOT / ".env")
+
 OUT_DIR = Path(__file__).parent / "yolo_eval"
 FRAMES_DIR = OUT_DIR / "frames"
 CSV_PATH = OUT_DIR / "ground_truth.csv"

@@ -55,8 +55,8 @@ defaults inside `QueueTracker` are overwritten at startup by
 | `YOLO_IMGSZ` | 320 | YOLO inference resolution |
 | `YOLO_EVERY` | 3 | Run YOLO every Nth camera frame |
 | `YOLO_CONF` | 0.55 | Minimum person-detection confidence |
-| `MIN_BBOX_AREA` | 1500 px² | Reject specks |
-| `MAX_BBOX_FRAC` | 0.70 | Reject boxes covering most of the frame |
+| `MIN_BBOX_AREA` | 800 px² | Reject specks |
+| `MAX_BBOX_FRAC` | 0.85 | Reject boxes covering most of the frame |
 | `QUEUE_MIN_PORTRAIT_ASPECT` | 0.60 | Reject non-person-shaped boxes |
 | `QUEUE_MIN_CONFIRM_FRAMES` | 20 | Frames before presence is confirmed |
 | `QUEUE_MIN_MOTION_PIXELS` | 8 | Static-object rejection threshold |
