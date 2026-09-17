@@ -1,4 +1,6 @@
 import json
+import time
+
 from fastapi import HTTPException
 from threading import Lock, Thread
 
@@ -70,14 +72,35 @@ def _db_ssl_options() -> dict:
     return options
 
 
+# When pool creation fails, wait this long before trying again rather than
+# hammering an unreachable server on every request.
+_POOL_RETRY_SECONDS = 10.0
+_pool_retry_after = 0.0
+
+
 def _ensure_db_pool():
-    global db_pool, _pool_initialized
+    """
+    Return the connection pool, creating it on first use.
+
+    A failed attempt is retried later instead of being latched forever. The
+    previous version set _pool_initialized before trying and never cleared it,
+    so a single failure at startup disabled the database for the entire life of
+    the process — every later call returned None without reconnecting.
+
+    That is not hypothetical: the hosted backend started while the managed
+    database was powered off, and went on reporting "db": false long after the
+    database came back. Only a redeploy recovered it. A free-tier host that
+    sleeps and wakes, in front of a managed database that can blink, needs to
+    be able to reconnect on its own.
+    """
+    global db_pool, _pool_initialized, _pool_retry_after
 
     with _pool_lock:
         if _pool_initialized:
             return db_pool
+        if time.time() < _pool_retry_after:
+            return None
 
-        _pool_initialized = True
         try:
             _, _, pooling = _load_mysql()
             db_pool = pooling.MySQLConnectionPool(
@@ -92,9 +115,12 @@ def _ensure_db_pool():
                 **_db_ssl_options(),
             )
             print("[DB] Pool created")
+            # Only latch on success — a failure must stay retryable.
+            _pool_initialized = True
         except Exception as err:
             print(f"[DB] Pool error: {err}")
             db_pool = None
+            _pool_retry_after = time.time() + _POOL_RETRY_SECONDS
 
     return db_pool
 
