@@ -39,7 +39,31 @@ def _get_app():
         if _app is None:
             from insightface.app import FaceAnalysis
 
-            app = FaceAnalysis(name=FACE_MODEL_PACK, providers=["CPUExecutionProvider"])
+            # allowed_modules is not an optimization, it is what keeps the
+            # deployed server inside its memory limit. Without it FaceAnalysis
+            # loads every .onnx in the pack, and buffalo_s ships three this
+            # codebase never reads: 1k3d68.onnx (137MB), 2d106det.onnx and
+            # genderage.onnx. Only normed_embedding (recognition) and the
+            # bbox/det_score (detection) are ever used.
+            #
+            # Measured resident memory after prepare(), CPU provider:
+            #   all five modules       251.9 MB   load 2.01s
+            #   detection+recognition   98.9 MB   load 1.22s
+            #
+            # 153MB on a 512MB host is the difference between answering a face
+            # request and being OOM-killed mid-upload — which the proxy turns
+            # into a bodyless 502, so the phone reports a bare "Request
+            # failed." with nothing in it to diagnose.
+            #
+            # Embeddings are unaffected: recognition aligns on the detector's
+            # own keypoints, not on the landmark models. Verified on three
+            # enrolment photos, cosine 1.000000 and max |diff| 0.0 against the
+            # unrestricted pack, so existing enrolments stay valid.
+            app = FaceAnalysis(
+                name=FACE_MODEL_PACK,
+                allowed_modules=["detection", "recognition"],
+                providers=["CPUExecutionProvider"],
+            )
             app.prepare(ctx_id=-1, det_size=(320, 320))
             _app = app
     return _app
