@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, Header
 
 import state
 from core.security import verify_cam_token
@@ -36,7 +36,10 @@ def push_frame(body: dict = Body(...), _=Depends(verify_cam_token)):
 )
 def push_snapshot(
     snapshot: bytes = Body(..., media_type="image/jpeg"),
+    # The detector's frame counter. Optional: a detector that does not send it
+    # keeps the old behaviour of accepting every frame in arrival order.
+    x_snap_seq: int | None = Header(default=None, alias="X-SNAP-SEQ"),
     _=Depends(verify_cam_token),
 ):
-    state.set_snapshot(snapshot)
-    return {"ok": True}
+    accepted = state.set_snapshot(snapshot, source_seq=x_snap_seq)
+    return {"ok": True, "accepted": accepted}

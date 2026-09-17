@@ -34,6 +34,12 @@ latest_state = {
 latest_snapshot: bytes | None = None
 latest_snapshot_seq = 0
 latest_snapshot_cache_write_at = 0.0
+
+# The detector's own frame counter for the last snapshot accepted. It uploads
+# several frames at once, so they can finish out of order; one that arrives
+# behind a newer frame is a picture the dashboard has already moved past and
+# showing it would step the live view backwards.
+latest_source_seq = -1
 _snapshot_cache_lock = threading.Lock()
 _snapshot_cache_pending: tuple[bytes, int] | None = None
 _snapshot_cache_writer_running = False
@@ -134,18 +140,29 @@ def set_active_counters(counters: int) -> None:
     )
 
 
-def set_snapshot(snapshot: bytes) -> None:
-    global latest_snapshot, latest_snapshot_cache_write_at, latest_snapshot_seq
+def set_snapshot(snapshot: bytes, source_seq: int | None = None) -> bool:
+    """
+    Store a frame for the live view. Returns False when the frame was dropped
+    as stale, which only happens when the caller supplies source_seq; without
+    one every frame is accepted, as it was before concurrent uploads existed.
+    """
+    global latest_snapshot, latest_snapshot_cache_write_at
+    global latest_snapshot_seq, latest_source_seq
     with snapshot_cond:
+        if source_seq is not None:
+            if source_seq <= latest_source_seq:
+                return False
+            latest_source_seq = source_seq
         latest_snapshot = snapshot
         latest_snapshot_seq += 1
         seq = latest_snapshot_seq
         snapshot_cond.notify_all()
     now = time.time()
     if now - latest_snapshot_cache_write_at < CACHE_SNAPSHOT_MIN_INTERVAL_SECONDS:
-        return
+        return True
     latest_snapshot_cache_write_at = now
     _schedule_snapshot_cache_write(snapshot, seq)
+    return True
 
 
 def _schedule_snapshot_cache_write(snapshot: bytes, seq: int) -> None:

@@ -5,6 +5,7 @@ import time
 import signal
 import threading
 import queue as _queue
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 for _stream in (sys.stdout, sys.stderr):
@@ -101,6 +102,11 @@ PUSH_TIMEOUT   = float(os.getenv("PUSH_TIMEOUT",   "5.0"))
 SNAPSHOT_TIMEOUT = float(os.getenv("SNAPSHOT_TIMEOUT", str(min(PUSH_TIMEOUT, 1.0))))
 SNAPSHOT_FAILURE_DISABLE_AFTER = int(os.getenv("SNAPSHOT_FAILURE_DISABLE_AFTER", "3"))
 SNAPSHOT_FAILURE_BACKOFF_SECONDS = float(os.getenv("SNAPSHOT_FAILURE_BACKOFF_SECONDS", "15"))
+# How many snapshot uploads may be in flight at once. See the comment on
+# _snapshot_upload_worker for why one is not enough against a remote backend.
+# Raising this past ~4 stops helping: the frame rate is then limited by
+# SNAPSHOT_FPS and by how fast the camera produces frames, not by the network.
+SNAPSHOT_UPLOAD_WORKERS = max(1, int(os.getenv("SNAPSHOT_UPLOAD_WORKERS", "3")))
 YOLO_CONF      = float(os.getenv("YOLO_CONF",      "0.50"))
 MIN_BBOX_AREA  = int(os.getenv("MIN_BBOX_AREA",    "1500"))
 MAX_BBOX_FRAC  = float(os.getenv("MAX_BBOX_FRAC",  "0.70"))
@@ -293,20 +299,81 @@ def _push_to_api(payload: dict) -> None:
 
 
 def _snapshot_upload_worker() -> None:
-    """Upload the latest JPEG at a fixed rate, independent of YOLO cadence."""
+    """
+    Upload the latest JPEG at a fixed rate, independent of YOLO cadence.
+
+    Several uploads run at once. Against a deployed backend a single request
+    costs roughly 300ms almost regardless of what it carries: measured 304ms
+    for a 9.8KB frame and 303ms for a 1.6KB one, over a 60ms network round
+    trip. The gap is per-request overhead on a throttled shared CPU, not
+    transfer time — a 404 that runs no handler at all still took 254ms, and
+    the snapshot handler itself is a single in-memory assignment. Sending one
+    frame at a time therefore pinned the dashboard near 3fps however high
+    SNAPSHOT_FPS was set, which is what made the live view look laggy.
+
+    That time is spent waiting rather than working, so overlapping requests
+    recovers the rate: measured 3.1fps with one in flight, 6.2 with two and
+    11.5 with four. Each upload carries its frame number so the backend can
+    drop one that arrives behind a newer frame; without that, an unlucky slow
+    request would step the live view backwards.
+    """
     interval = 1.0 / max(0.1, SNAPSHOT_FPS)
     headers  = {"X-CAM-TOKEN": CAM_TOKEN, "Content-Type": "image/jpeg"}
     last_seq = -1
     errors   = 0
     backoff_until = 0.0
 
-    session = requests.Session()
+    # Uploads are paced by the semaphore, not by the pool's queue: a frame that
+    # cannot start now is dropped rather than held, because by the time a slot
+    # frees up the next frame off the camera is fresher than this one.
+    slots = threading.Semaphore(SNAPSHOT_UPLOAD_WORKERS)
+    error_lock = threading.Lock()
+    local = threading.local()
+
+    def _session() -> requests.Session:
+        # One Session per uploading thread: sharing a connection pool across
+        # threads is exactly the case requests does not promise to handle.
+        session = getattr(local, "session", None)
+        if session is None:
+            session = requests.Session()
+            local.session = session
+        return session
+
+    def _upload(payload: bytes, frame_seq: int) -> None:
+        nonlocal errors, backoff_until
+        try:
+            _session().post(
+                f"{API_BASE_URL}/yolo/update",
+                data    = payload,
+                headers = {**headers, "X-SNAP-SEQ": str(frame_seq)},
+                timeout = SNAPSHOT_TIMEOUT,
+            )
+            with error_lock:
+                errors = 0
+        except requests.RequestException as e:
+            with error_lock:
+                errors += 1
+                count = errors
+                if count >= SNAPSHOT_FAILURE_DISABLE_AFTER:
+                    backoff_until = time.time() + SNAPSHOT_FAILURE_BACKOFF_SECONDS
+                else:
+                    backoff_until = time.time() + min(3.0, max(0.5, count * 0.5))
+            if count <= 5 or count % 30 == 0:
+                print(f"[Detector] WARNING snapshot push failed ({count}x): {e}")
+        finally:
+            slots.release()
+
+    pool = ThreadPoolExecutor(
+        max_workers=SNAPSHOT_UPLOAD_WORKERS,
+        thread_name_prefix="snapshot-upload",
+    )
     try:
         while not _shutdown.is_set():
             started = time.time()
-            now = started
-            if now < backoff_until:
-                _shutdown.wait(min(interval, backoff_until - now))
+            with error_lock:
+                wait_until = backoff_until
+            if started < wait_until:
+                _shutdown.wait(min(interval, wait_until - started))
                 continue
 
             with _state_lock:
@@ -314,30 +381,15 @@ def _snapshot_upload_worker() -> None:
                 seq      = _shared_state.get("snapshot_seq", 0)
 
             if snap_jpg is not None and seq != last_seq:
-                try:
-                    session.post(
-                        f"{API_BASE_URL}/yolo/update",
-                        data    = snap_jpg,
-                        headers = headers,
-                        timeout = SNAPSHOT_TIMEOUT,
-                    )
+                if slots.acquire(blocking=False):
                     last_seq = seq
-                    errors   = 0
-                except requests.RequestException as e:
-                    last_seq = seq
-                    errors += 1
-                    if errors <= 5 or errors % 30 == 0:
-                        print(f"[Detector] WARNING snapshot push failed ({errors}x): {e}")
-                    if errors >= SNAPSHOT_FAILURE_DISABLE_AFTER:
-                        backoff_until = time.time() + SNAPSHOT_FAILURE_BACKOFF_SECONDS
-                    else:
-                        backoff_until = time.time() + min(3.0, max(0.5, errors * 0.5))
+                    pool.submit(_upload, snap_jpg, seq)
 
             delay = interval - (time.time() - started)
             if delay > 0:
                 _shutdown.wait(delay)
     finally:
-        session.close()
+        pool.shutdown(wait=False)
 
 
 
@@ -593,6 +645,7 @@ def run() -> None:
     print(f"[Detector] Push every   : {PUSH_EVERY} YOLO frames")
     print(f"[Detector] API push fps : {API_PUSH_FPS:.1f}")
     print(f"[Detector] Snapshot fps : {SNAPSHOT_FPS:.1f}")
+    print(f"[Detector] Upload slots : {SNAPSHOT_UPLOAD_WORKERS}")
     print(f"[Detector] Snapshot push: {'on' if SNAPSHOT_UPLOAD_ENABLED else 'off'}")
 
     try:
