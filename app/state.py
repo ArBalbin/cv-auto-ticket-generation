@@ -40,6 +40,15 @@ latest_snapshot_cache_write_at = 0.0
 # behind a newer frame is a picture the dashboard has already moved past and
 # showing it would step the live view backwards.
 latest_source_seq = -1
+latest_source_seq_at = 0.0
+
+# How long a gap in accepted frames before the counter above stops being
+# believed. A restarted detector begins numbering again, and trusting the old
+# high-water mark then rejects every frame it sends — which froze the live
+# view on the last picture from the previous run until the backend itself was
+# restarted. After a gap this long there is no ordering left worth protecting:
+# nothing has been shown for seconds, so the freshest frame simply wins.
+SOURCE_SEQ_RESET_SECONDS = 10.0
 _snapshot_cache_lock = threading.Lock()
 _snapshot_cache_pending: tuple[bytes, int] | None = None
 _snapshot_cache_writer_running = False
@@ -147,12 +156,15 @@ def set_snapshot(snapshot: bytes, source_seq: int | None = None) -> bool:
     one every frame is accepted, as it was before concurrent uploads existed.
     """
     global latest_snapshot, latest_snapshot_cache_write_at
-    global latest_snapshot_seq, latest_source_seq
+    global latest_snapshot_seq, latest_source_seq, latest_source_seq_at
     with snapshot_cond:
         if source_seq is not None:
-            if source_seq <= latest_source_seq:
+            stale = source_seq <= latest_source_seq
+            recent = time.monotonic() - latest_source_seq_at < SOURCE_SEQ_RESET_SECONDS
+            if stale and recent:
                 return False
             latest_source_seq = source_seq
+            latest_source_seq_at = time.monotonic()
         latest_snapshot = snapshot
         latest_snapshot_seq += 1
         seq = latest_snapshot_seq

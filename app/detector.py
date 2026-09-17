@@ -107,6 +107,15 @@ SNAPSHOT_FAILURE_BACKOFF_SECONDS = float(os.getenv("SNAPSHOT_FAILURE_BACKOFF_SEC
 # Raising this past ~4 stops helping: the frame rate is then limited by
 # SNAPSHOT_FPS and by how fast the camera produces frames, not by the network.
 SNAPSHOT_UPLOAD_WORKERS = max(1, int(os.getenv("SNAPSHOT_UPLOAD_WORKERS", "3")))
+# Frame numbers have to keep rising across detector restarts, not only within
+# one run. The backend drops any frame that is not newer than the last it
+# accepted, and the in-process frame counter starts again at zero every time
+# this script is launched — so a plain counter was rejected as stale until it
+# climbed back past the previous run's high-water mark, freezing the live view
+# on the last picture from before the restart. Offsetting by the wall clock at
+# startup keeps the numbers rising: the counter advances at most a few hundred
+# per second, the offset by a thousand.
+_SNAPSHOT_SEQ_BASE = int(time.time() * 1000)
 YOLO_CONF      = float(os.getenv("YOLO_CONF",      "0.50"))
 MIN_BBOX_AREA  = int(os.getenv("MIN_BBOX_AREA",    "1500"))
 MAX_BBOX_FRAC  = float(os.getenv("MAX_BBOX_FRAC",  "0.70"))
@@ -383,7 +392,7 @@ def _snapshot_upload_worker() -> None:
             if snap_jpg is not None and seq != last_seq:
                 if slots.acquire(blocking=False):
                     last_seq = seq
-                    pool.submit(_upload, snap_jpg, seq)
+                    pool.submit(_upload, snap_jpg, _SNAPSHOT_SEQ_BASE + seq)
 
             delay = interval - (time.time() - started)
             if delay > 0:
