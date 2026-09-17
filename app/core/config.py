@@ -215,8 +215,18 @@ CACHE_SNAPSHOT_MIN_INTERVAL_SECONDS = env_float(
     "CACHE_SNAPSHOT_MIN_INTERVAL_SECONDS",
     0.5,
 )
-REDIS_SOCKET_TIMEOUT = env_float("REDIS_SOCKET_TIMEOUT", 0.25)
-REDIS_CONNECT_TIMEOUT = env_float("REDIS_CONNECT_TIMEOUT", 0.25)
+# 250ms was fine for a Redis on the same machine and impossible for one in the
+# cloud: a plain TCP connect to a nearby region measures ~60ms from here, and a
+# TLS handshake costs two to three round trips on top, so the old connect
+# timeout expired mid-handshake every time. Connecting happens once per client,
+# so it can afford to be patient.
+REDIS_CONNECT_TIMEOUT = env_float("REDIS_CONNECT_TIMEOUT", 5.0)
+
+# Per-operation, so this one stays tight: cache_service falls back to process
+# memory on timeout and stops retrying for 5s, and no request should wait on a
+# stalled cache. 1s is far longer than a cross-region round trip yet short
+# enough that a hung Redis is invisible to users.
+REDIS_SOCKET_TIMEOUT = env_float("REDIS_SOCKET_TIMEOUT", 1.0)
 
 OBJECT_STORAGE_ENABLED = env_bool("OBJECT_STORAGE_ENABLED", False)
 OBJECT_STORAGE_ENDPOINT_URL = os.getenv("OBJECT_STORAGE_ENDPOINT_URL", "").strip()

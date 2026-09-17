@@ -373,18 +373,34 @@ def issue_ticket(
             linked_via    = linked_via,
             student_display_name = student_display_name,
         )
-        # storage = object_storage_service.upload_ticket_pdf(
-        #     pdf_path,
-        #     queue_number,
-        # ) or {}
+        # Upload the PDF so it outlives the process that made it.
+        #
+        # The backend runs on Render, whose filesystem is ephemeral: a ticket
+        # written to app/tickets/ lives inside the container and disappears on
+        # the next restart, redeploy or sleep, and no route serves it, so
+        # nobody can fetch it in the meantime. Object storage gives each ticket
+        # a URL that survives all of that.
+        #
+        # database_handler already prefers this over the local path:
+        #   ticket.get("storage_url") or ticket["pdf_path"]
+        # so queue_records ends up holding the URL whenever the upload worked.
+        #
+        # Failure is not fatal — upload_ticket_pdf returns None if storage is
+        # disabled or unreachable, and the row simply keeps the local path.
+        storage = object_storage_service.upload_ticket_pdf(
+            pdf_path,
+            queue_number,
+        ) or {}
         return {
             "queue_number" : queue_number,
             "short_code"   : short_code,
             "jwt_token"    : jwt_token,
             "expires_at"   : expires_at,
             "pdf_path"     : pdf_path,
-            "storage_key"  : None,
-            "storage_url"  : None,
+            # Empty when the upload was skipped or failed, which is exactly
+            # what database_handler's `storage_url or pdf_path` expects.
+            "storage_key"  : storage.get("storage_key"),
+            "storage_url"  : storage.get("storage_url"),
         }
     except Exception as e:
         print(f"[TicketPrinter] ❌ Failed: {e}")
