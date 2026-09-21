@@ -28,7 +28,14 @@ from database.database_handler import (
     touch_student_last_login,
 )
 from services import face_service
-from services.queue_service import queue_tracker
+# Import the module, never the tracker object. queue_service.reset_queue()
+# replaces queue_tracker with a fresh QueueTracker, and a name bound here at
+# import time would keep pointing at the discarded one for the life of the
+# process. That split the system in half after any staff reset: the app armed
+# join intent on the dead tracker while the detector asked the live one, so
+# every recognized student was written off as a bystander and no number was
+# ever issued again. Reaching through the module re-reads the current binding.
+from services import queue_service
 
 
 router = APIRouter()
@@ -163,7 +170,7 @@ async def join_queue(student_id: int = Depends(require_student)):
     asked for. The intent lapses after JOIN_INTENT_TIMEOUT_MINUTES and is
     spent as soon as it produces a number.
     """
-    armed_at = queue_tracker.arm_join_intent(student_id)
+    armed_at = queue_service.queue_tracker.arm_join_intent(student_id)
     return {
         "joined": True,
         "armed_at": armed_at.isoformat(),
@@ -178,7 +185,7 @@ async def join_queue(student_id: int = Depends(require_student)):
 )
 async def cancel_join_queue(student_id: int = Depends(require_student)):
     """Undo of join_queue(). No-op if nothing was armed."""
-    queue_tracker.clear_join_intent(student_id)
+    queue_service.queue_tracker.clear_join_intent(student_id)
     return {"joined": False}
 
 
@@ -196,9 +203,9 @@ async def get_my_queue_entry(student_id: int = Depends(require_student)):
     states: pending_link (the camera has confirmed them present but hasn't
     resolved their identity yet) or a real linked entry.
     """
-    joined = queue_tracker.has_join_intent(student_id)
+    joined = queue_service.queue_tracker.has_join_intent(student_id)
 
-    person = queue_tracker.get_person_by_student_id(student_id)
+    person = queue_service.queue_tracker.get_person_by_student_id(student_id)
     if person is None:
         return {"has_active_entry": False, "pending_link": False, "joined": joined}
     # A served/no-show person lingers in active_queue as 'done_pending' until
