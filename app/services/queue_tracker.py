@@ -154,6 +154,12 @@ class QueueTracker:
     MIN_CONFIRM_FRAMES            = 15
     DONE_COOLDOWN_FRAMES          = 150
     NOSHOW_WINDOW_SECONDS         = 60
+    # How long an "on the way" banner stays on the staff dashboard. The alert
+    # is a transient prompt — a student has said they are walking over — but
+    # nothing expired it, so the list was trimmed only once twenty newer
+    # alerts had arrived. On a quiet counter that meant a notice from much
+    # earlier sat above a queue that had long since moved on.
+    ON_WAY_NOTIFICATION_TTL_SECONDS = 90
     # NOTE: every value in this block is overwritten at startup by
     # queue_service.wire_callbacks() from core/config.py, so config is the
     # real source of truth. They are kept in sync anyway — a stale default
@@ -950,6 +956,28 @@ class QueueTracker:
             self.on_way_notifications = self.on_way_notifications[-20:]
         return notification
 
+    def live_on_way_notifications(self) -> list:
+        """The on-the-way alerts still worth showing, pruned by age.
+
+        Expiry is by time rather than only by count so that a quiet period
+        cannot leave a stale banner on screen. Entries whose timestamp cannot
+        be parsed are dropped too: a notification nobody can date is one
+        nobody can retire.
+        """
+        cutoff = datetime.now() - timedelta(
+            seconds=self.ON_WAY_NOTIFICATION_TTL_SECONDS
+        )
+        live = []
+        for item in self.on_way_notifications:
+            try:
+                created = datetime.fromisoformat(str(item.get('created_at')))
+            except (TypeError, ValueError):
+                continue
+            if created >= cutoff:
+                live.append(item)
+        self.on_way_notifications = live
+        return live
+
     def record_on_the_way_signal(self, queue_number: int) -> dict:
         notification = self._append_on_the_way_notification(queue_number, datetime.now())
         print(f"[QueueTracker] Q{queue_number:03d} on-way signal recorded")
@@ -1119,7 +1147,7 @@ class QueueTracker:
             'total_served':          self.total_served,
             'completed':             self.completed_queue[-10:],
             'noshow_alerts':         self.get_noshow_alerts(),
-            'on_way_notifications':  self.on_way_notifications[-10:],
+            'on_way_notifications':  self.live_on_way_notifications()[-10:],
             'appearance_rejections': self.appearance_rejections[-5:],
             'counter_assignments':   counter_assignments,
             'newly_called':          newly_called,

@@ -557,8 +557,24 @@ def on_way_notification_state() -> dict:
         })
         notification_ids.add(notification_id)
 
+    # Age out here as well as in the tracker. This function rebuilds entries
+    # from anyone still flagged on_the_way, so without the same cutoff a
+    # person who kept that flag would regenerate their banner indefinitely
+    # and the tracker's own pruning would never be visible to the dashboard.
+    cutoff = datetime.now() - timedelta(
+        seconds=queue_tracker.ON_WAY_NOTIFICATION_TTL_SECONDS
+    )
+    live = []
+    for item in notifications:
+        try:
+            created = datetime.fromisoformat(str(item.get("created_at")))
+        except (TypeError, ValueError):
+            continue
+        if created >= cutoff:
+            live.append(item)
+
     return {
-        "notifications": notifications[-20:],
+        "notifications": live[-20:],
         "active_queue": active_queue,
     }
 
