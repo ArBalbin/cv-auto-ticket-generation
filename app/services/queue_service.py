@@ -328,8 +328,18 @@ def _try_link_students(raw_tracked: list) -> None:
             # session), don't mint or link another. Staff must mark the
             # existing one done (served/no-show) before this student can be
             # queued again.
+            #
+            # A done_pending entry does not count. It is a finished
+            # transaction that lingers in active_queue only until the cleanup
+            # pass removes it, and that pass waits for the person to go
+            # missing for several frames. Treating it as blocking meant a
+            # student who had just been served could not be served again
+            # without physically leaving the camera's view first, because
+            # standing still kept their completed entry alive indefinitely.
+            # Immediate re-entry is already governed by the spatial
+            # done-cooldown, which is the guard actually designed for it.
             existing = queue_tracker.get_person_by_student_id(match.student_id)
-            if existing is not None:
+            if existing is not None and existing.status != 'done_pending':
                 continue
 
         except Exception as exc:

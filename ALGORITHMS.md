@@ -254,12 +254,13 @@ only risks cutting the face in half.
 
 ### Enrollment
 
-A student registers three guided poses (centre, and two opposite turns).
-Each yields an embedding; the three are averaged and L2-normalised into
-one canonical embedding:
+A student submits one to five photographs at varied angle and lighting
+(`register_my_face`). Each yields an embedding; those that produce a
+confident face are averaged and L2-normalised into one canonical
+embedding:
 
 ```
-canonical = mean(e₁, e₂, e₃) / ‖mean(e₁, e₂, e₃)‖
+canonical = mean(e₁ … eₙ) / ‖mean(e₁ … eₙ)‖
 ```
 
 Averaging across angles makes the stored signature more robust than any
@@ -281,7 +282,7 @@ similarity(a, b) = (a · b) / (‖a‖ ‖b‖)
 Acceptance requires **both** conditions:
 
 ```
-accepted = (best_score ≥ 0.30) AND (best_score − second_best ≥ 0.10)
+accepted = (best_score ≥ 0.30) AND (best_score − second_best ≥ 0.15)
 ```
 
 The second condition is the important one and is original to this system.
@@ -451,7 +452,7 @@ newly assigned numbers aloud. No CV, no prediction.
 | 1 | Person detection & tracking | YOLOv8n + ByteTrack, 5 gates, EMA | Fails any gate |
 | 2 | Presence confirmation | Centroid-in-zone + 20-frame buffer + motion test | Too few frames, or static |
 | 3 | Track stability | IoU/centroid remap + dedup | — |
-| 4 | Face recognition | ArcFace 512-d + threshold & margin rule | Score < 0.30 or margin < 0.10 |
+| 4 | Face recognition | ArcFace 512-d + threshold & margin rule | Score < 0.30 or margin < 0.15 |
 | 5 | System-minted number | Reserved 5000+ range, one-per-student | Student already holds an entry |
 | 6 | No-show detection | Missing-frame countdown | Entry still pending |
 | 7 | Wait-time prediction | M/M/c + trend forecast | — |

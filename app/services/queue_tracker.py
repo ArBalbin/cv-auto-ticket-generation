@@ -228,6 +228,32 @@ class QueueTracker:
             return None
         return self.active_queue.get(tid)
 
+    def get_bystander_by_student_id(self, student_id: int) -> QueuePerson | None:
+        """A person the camera recognized as this student but did not queue,
+        because no join intent was armed at the moment of recognition.
+
+        These never appear in _by_student_id: being marked a bystander sets
+        the attribute directly rather than going through link_queue_number(),
+        so the only way to find one is to scan. That is also why the student
+        API could not previously tell the difference between 'the camera has
+        not seen you' and 'the camera saw you and wrote you off', and showed
+        the same blank waiting screen for both.
+        """
+        for person in list(self.active_queue.values()):
+            if (person.identity_status == 'bystander'
+                    and person.student_id == student_id):
+                return person
+        return None
+
+    def has_unidentified_person(self) -> bool:
+        """True while the camera is tracking somebody whose identity has not
+        been resolved yet. Used to tell a waiting student that they have been
+        seen, which is different from not having arrived."""
+        return any(
+            person.identity_status == 'pending_link'
+            for person in list(self.active_queue.values())
+        )
+
 
     # JOIN INTENT — explicit consent to be issued a number on recognition
 

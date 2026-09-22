@@ -199,24 +199,63 @@ async def get_my_queue_entry(student_id: int = Depends(require_student)):
     Lets a logged-in student see their own live queue status without
     knowing a queue number or access token. Hands back the same
     queue_number + access_token the QR-based ticket-lookup flow uses, so
-    the app can drive the existing status screens either way. Reports two
-    states: pending_link (the camera has confirmed them present but hasn't
-    resolved their identity yet) or a real linked entry.
-    """
-    joined = queue_service.queue_tracker.has_join_intent(student_id)
+    the app can drive the existing status screens either way.
 
-    person = queue_service.queue_tracker.get_person_by_student_id(student_id)
+    The `state` field names where the student actually is in the flow. The
+    three booleans alone could not distinguish "the camera has not seen you"
+    from "the camera saw you and wrote you off as a bystander" from "the
+    camera can see somebody but has not resolved who": all three produced the
+    same empty response, so the app had nothing to show and appeared stuck on
+    the join screen while the system was in fact working as designed. Each
+    state below is a condition the student can act on.
+    """
+    tracker = queue_service.queue_tracker
+    joined = tracker.has_join_intent(student_id)
+
+    def payload(state: str, **extra) -> dict:
+        return {
+            "has_active_entry": False,
+            "pending_link": False,
+            "joined": joined,
+            "state": state,
+            **extra,
+        }
+
+    person = tracker.get_person_by_student_id(student_id)
+
     if person is None:
-        return {"has_active_entry": False, "pending_link": False, "joined": joined}
+        # Recognized earlier, but no join intent was armed at that moment, so
+        # nothing was issued. Arming the intent revives the track, but only
+        # once the camera produces another face for it — until then the
+        # student needs to know why nothing is happening.
+        if tracker.get_bystander_by_student_id(student_id) is not None:
+            return payload("recognized_not_joined" if not joined else "rejoining")
+        if not joined:
+            return payload("not_joined")
+        # Joined and waiting. Distinguish "nobody is at the camera" from "the
+        # camera is looking at someone it has not identified yet", which is
+        # usually this student mid-recognition.
+        if tracker.has_unidentified_person():
+            return payload("identifying")
+        return payload("waiting_for_camera")
+
     # A served/no-show person lingers in active_queue as 'done_pending' until
     # the done-cooldown clears them. Reporting that as still-active makes the
     # app's dashboard poll drag the student straight back into the "session
     # ended" screen they just dismissed, so treat it as finished here.
     if person.status == "done_pending":
-        return {"has_active_entry": False, "pending_link": False, "joined": joined}
+        return payload("recently_served")
+
     if person.queue_number is None:
-        return {"has_active_entry": False, "pending_link": True, "joined": joined}
+        return {
+            "has_active_entry": False,
+            "pending_link": True,
+            "joined": joined,
+            "state": "identifying",
+        }
+
     return {
+        "state": "active",
         "has_active_entry": True,
         "pending_link": False,
         "joined": joined,
