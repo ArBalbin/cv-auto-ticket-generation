@@ -555,14 +555,6 @@ def _draw_queue_overlay(
     cv2.rectangle(frame, (lx-2, ly-lh-4), (lx+lw+2, ly+4), (0, 0, 0), -1)
     cv2.putText(frame, lbl, (lx, ly), FONT, fs_large, (0, 255, 255), 1)
 
-    for i, alert in enumerate(queue_state.get("noshow_alerts", [])):
-        color    = (0, 0, 255) if alert["status"] == "critical" else (0, 165, 255)
-        warn_txt = (f"{alert['queue_number']} NO-SHOW "
-                    f"Bumping in {alert['seconds_remaining']}s")
-        (aw, ah), _ = cv2.getTextSize(warn_txt, FONT, fs_warn, 1)
-        ay = h - 10 - i * int(ah * 1.8)
-        cv2.rectangle(frame, (8, ay-ah-4), (aw+16, ay+4), (0, 0, 0), -1)
-        cv2.putText(frame, warn_txt, (12, ay), FONT, fs_warn, color, 1)
 
     for person in queue_state.get("active_queue", []):
         bbox = person.get("bbox")

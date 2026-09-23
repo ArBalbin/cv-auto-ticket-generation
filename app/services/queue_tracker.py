@@ -125,6 +125,11 @@ class QueuePerson:
             'on_the_way':        self.on_the_way,
             'on_the_way_at':     self.on_the_way_at.isoformat() if self.on_the_way_at else None,
             'on_the_way_at_display': self.on_the_way_at.strftime("%I:%M:%S %p") if self.on_the_way_at else None,
+            # How long this person has been out of the camera's view, for the
+            # staff deciding whether somebody has genuinely not turned up.
+            # Nothing acts on it: it is shown so the judgement is informed,
+            # not so the system can make it.
+            'seconds_missing':   int(self.seconds_missing) if self.went_missing_at else 0,
             'is_manual':         self.is_manual,
             'is_walkin':         self.is_walkin,
             'linked_via':        self.linked_via,
@@ -153,7 +158,6 @@ class QueueTracker:
     MAX_MISSING_FRAMES            = 300
     MIN_CONFIRM_FRAMES            = 15
     DONE_COOLDOWN_FRAMES          = 150
-    NOSHOW_WINDOW_SECONDS         = 60
     # How long an "on the way" banner stays on the staff dashboard. The alert
     # is a transient prompt — a student has said they are walking over — but
     # nothing expired it, so the list was trimmed only once twenty newer
@@ -187,7 +191,6 @@ class QueueTracker:
         self._done_cooldowns: list       = []
         self.completed_queue: list       = []
         self.total_served                = 0
-        self._noshow_timers: dict        = {}
         self.appearance_rejections: list = []
         self.on_way_notifications: list  = []
         # Fired once a printed kiosk number is linked to a present person —
@@ -196,7 +199,6 @@ class QueueTracker:
         # Fired when a person is confirmed present in the zone but not yet
         # linked to a kiosk number (Algorithm 2's new terminal state).
         self.on_presence_confirmed        = None
-        self.on_noshow                    = None
         self._claimed_this_frame: dict    = {}
         self._lock                        = threading.RLock()
         self._num_counters                = 3
@@ -434,7 +436,6 @@ class QueueTracker:
         ret_person.status              = 'waiting'
         ret_person.went_missing_at     = None
         ret_person.dedup_immune_frames = 60
-        self._noshow_timers.pop(ret_person.queue_number, None)
         if live_embedding is not None:
             ret_person.face_embedding = live_embedding
         if ret_tid != track_id:
@@ -447,73 +448,6 @@ class QueueTracker:
         self._candidates.pop(track_id, None)
         self._claimed_this_frame[ret_tid] = track_id
 
-
-    # NO-SHOW HANDLING
-
-    def _check_noshow(self):
-        now     = datetime.now()
-        to_bump = []
-        win     = self.NOSHOW_WINDOW_SECONDS
-
-        for tid, p in self.active_queue.items():
-            qn = p.queue_number
-            if p.position_in_line == 1 and p.status == 'missing':
-                if qn not in self._noshow_timers:
-                    self._noshow_timers[qn] = now
-                    print(f"⏳ Q{qn:03d} is #1 but absent — {win}s countdown")
-                elif (now - self._noshow_timers[qn]).total_seconds() >= win:
-                    to_bump.append((tid, p))
-            else:
-                self._noshow_timers.pop(qn, None)
-
-        for tid, p in to_bump:
-            qn = p.queue_number
-            print(f"🚫 Q{qn:03d} NO-SHOW bumped")
-            self._noshow_timers.pop(qn, None)
-
-            if p.pdf_path:
-                try:
-                    from services.ticket_printer import delete_ticket
-                    delete_ticket(p.pdf_path)
-                except Exception as e:
-                    print(f"[QueueTracker] ⚠️  PDF delete error (no-show) Q{qn:03d}: {e}")
-
-            completed = p.to_dict()
-            completed.update({
-                'completed_at':      now.strftime("%I:%M:%S %p"),
-                'completed_at_full': now.strftime("%b %d, %Y %I:%M:%S %p"),
-                'total_wait_time':   p.wait_time_str,
-                'bump_reason':       'no_show',
-            })
-            with self._lock:
-                self.completed_queue.append(completed)
-                self.total_served += 1
-            p.status         = 'done_pending'
-            p.missing_frames = self.MAX_MISSING_FRAMES + 1
-            self._done_cooldowns.append({'bbox': p.bbox, 'frames_left': self.DONE_COOLDOWN_FRAMES})
-
-            if self.on_noshow:
-                try:
-                    self.on_noshow(qn)
-                except Exception as e:
-                    print(f"⚠️  on_noshow callback error Q{qn:03d}: {e}")
-
-    def get_noshow_alerts(self) -> list:
-        now = datetime.now()
-        alerts = []
-        win = self.NOSHOW_WINDOW_SECONDS
-        for p in self.active_queue.values():
-            qn = p.queue_number
-            if qn in self._noshow_timers:
-                elapsed   = (now - self._noshow_timers[qn]).total_seconds()
-                remaining = max(0, win - elapsed)
-                alerts.append({
-                    'queue_number':      queue_label(qn),
-                    'queue_number_int':  qn,
-                    'seconds_remaining': int(remaining),
-                    'status': 'critical' if remaining <= 15 else 'warning',
-                })
-        return alerts
 
     def get_pending_link_alerts(self) -> list:
         """Staff alert list for people confirmed present but still
@@ -693,7 +627,6 @@ class QueueTracker:
                     if p.status in ('missing', 'waiting') and p.went_missing_at is not None:
                         p.status          = 'waiting'
                         p.went_missing_at = None
-                        self._noshow_timers.pop(p.queue_number, None)
                         label = f"Q{p.queue_number:03d}" if p.queue_number is not None else "(pending)"
                         print(f"✅ {label} back in zone (same track_id)")
                 continue
@@ -874,14 +807,21 @@ class QueueTracker:
             del self.active_queue[tid]
 
         self._dedup_active_queue()
-        self._check_noshow()
         self._recalculate_positions()
         return self.get_state()
 
 
     # MARK DONE
 
-    def mark_transaction_done(self, queue_number: int) -> bool:
+    def _retire_entry(self, queue_number: int, reason: str) -> bool:
+        """Take an active entry out of the queue at a staff member's request.
+
+        Serving somebody and writing them off as a no-show are the same
+        operation on the queue and differ only in what the record says and
+        whether it counts as served. A no-show was never served, so adding
+        them to total_served would inflate the completed-ticket figure the
+        dashboard reports and every service rate derived from it.
+        """
         p = self._person_by_queue_number(queue_number)
         if p is None or p.status not in ('waiting', 'missing'):
             return False
@@ -898,12 +838,23 @@ class QueueTracker:
         self._done_cooldowns.append(
             {'bbox': p.bbox, 'frames_left': self.DONE_COOLDOWN_FRAMES})
         with self._lock:
-            self.total_served += 1
-            self.completed_queue.append(self._make_completed_entry(p, 'served'))
-            self._noshow_timers.pop(queue_number, None)
+            if reason == 'served':
+                self.total_served += 1
+            self.completed_queue.append(self._make_completed_entry(p, reason))
         self._recalculate_positions()
-        print(f"✅ Q{queue_number:03d} DONE | Wait: {p.wait_time_str}")
+        label = 'DONE' if reason == 'served' else 'NO-SHOW'
+        print(f"✅ Q{queue_number:03d} {label} | Wait: {p.wait_time_str}")
         return True
+
+    def mark_transaction_done(self, queue_number: int) -> bool:
+        return self._retire_entry(queue_number, 'served')
+
+    def mark_no_show(self, queue_number: int) -> bool:
+        """Staff decided the person at the counter never arrived. There is no
+        timer and no automatic removal behind this: the judgement that
+        somebody has not turned up belongs to the person at the desk who can
+        see the queue area, not to a countdown."""
+        return self._retire_entry(queue_number, 'no_show')
 
     def force_new_person(self, queue_number: int, is_walkin: bool = True) -> dict | None:
         """Staff manual entry: link an already-printed kiosk number directly,
@@ -1004,15 +955,7 @@ class QueueTracker:
         expected = p.short_code if p.short_code is not None else p.access_token
         if expected != token:
             return {'error': 'invalid_token'}
-        result = p.to_dict()
-        qn = p.queue_number
-        if qn in self._noshow_timers:
-            elapsed   = (datetime.now() - self._noshow_timers[qn]).total_seconds()
-            result['noshow_countdown'] = int(max(0, self.NOSHOW_WINDOW_SECONDS - elapsed))
-            result['noshow_warning']   = True
-        else:
-            result['noshow_warning'] = False
-        return result
+        return p.to_dict()
 
 
     # HELPERS
@@ -1146,7 +1089,6 @@ class QueueTracker:
             'pending_link_alerts':   self.get_pending_link_alerts(),
             'total_served':          self.total_served,
             'completed':             self.completed_queue[-10:],
-            'noshow_alerts':         self.get_noshow_alerts(),
             'on_way_notifications':  self.live_on_way_notifications()[-10:],
             'appearance_rejections': self.appearance_rejections[-5:],
             'counter_assignments':   counter_assignments,
@@ -1168,15 +1110,6 @@ class QueueTracker:
         lx, ly = z.x1 + 6, z.y1 + lh + 8
         cv2.rectangle(frame, (lx-2, ly-lh-4), (lx+lw+2, ly+4), (0, 0, 0), -1)
         cv2.putText(frame, lbl, (lx, ly), FONT, 0.55, (0, 255, 255), 1)
-
-        for i, alert in enumerate(self.get_noshow_alerts()):
-            color    = (0, 0, 255) if alert['status'] == 'critical' else (0, 165, 255)
-            warn_txt = (f"{alert['queue_number']} NO-SHOW WARNING "
-                        f"Bumping in {alert['seconds_remaining']}s")
-            (aw, ah), _ = cv2.getTextSize(warn_txt, FONT, 0.5, 1)
-            ay = h - 20 - i * 28
-            cv2.rectangle(frame, (8, ay-ah-4), (aw+16, ay+4), (0, 0, 0), -1)
-            cv2.putText(frame, warn_txt, (12, ay), FONT, 0.5, color, 1)
 
         for person in self.active_queue.values():
             x1, y1, x2, y2 = person.bbox

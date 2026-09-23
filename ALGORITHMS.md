@@ -59,10 +59,9 @@ defaults inside `QueueTracker` are overwritten at startup by
 | `MAX_BBOX_FRAC` | 0.85 | Reject boxes covering most of the frame |
 | `QUEUE_MIN_PORTRAIT_ASPECT` | 0.60 | Reject non-person-shaped boxes |
 | `QUEUE_MIN_CONFIRM_FRAMES` | 20 | Frames before presence is confirmed |
-| `QUEUE_MIN_MOTION_PIXELS` | 8 | Static-object rejection threshold |
+| `QUEUE_MIN_MOTION_PIXELS` | 7 | Static-object rejection threshold |
 | `QUEUE_STATIC_CONF_BYPASS` | 0.70 | Confidence that skips the motion test |
 | `QUEUE_MAX_MISSING_FRAMES` | 240 | Frames absent before removal |
-| `QUEUE_NOSHOW_WINDOW_SECONDS` | 300 | No-show countdown |
 | `FACE_MODEL_PACK` | `buffalo_s` | InsightFace model pack |
 | `FACE_MATCH_THRESHOLD` | **0.30** | Minimum cosine similarity to accept |
 | `FACE_MARGIN_THRESHOLD` | **0.15** | Required lead over the runner-up |
@@ -337,7 +336,7 @@ registered students.
 **One active entry per student.** Before minting, the system checks whether
 that student already holds a pending or waiting entry. If so, nothing is
 issued. A student can only obtain a new number after staff mark the
-previous one served or no-show — preventing a recognized student from
+previous one done — preventing a recognized student from
 accumulating duplicate numbers by re-entering the camera's view.
 
 Walk-ins never reach this path: an unenrolled face produces no accepted
@@ -346,26 +345,8 @@ number printed on their kiosk ticket.
 
 ---
 
-## 6. No-Show Detection
 
-**Where:** `queue_tracker._check_noshow()`
-
-A person at the front of the queue who disappears from the camera starts a
-countdown of `QUEUE_NOSHOW_WINDOW_SECONDS` (300 s). Staff see a live
-warning and may bump them immediately or let the timer expire.
-
-Two guards prevent false no-shows:
-
-- Entries still in `pending_link` (no number yet) are excluded — there is
-  nothing to no-show.
-- Automatic bumping is **disabled by default**
-  (`QUEUE_AUTO_NOSHOW_ENABLED = false`); the timer raises an alert and a
-  human decides. Removing someone from a queue is not a decision the
-  system makes unsupervised.
-
----
-
-## 7. Wait-Time Prediction
+## 6. Wait-Time Prediction
 
 **Where:** `app/services/prediction_service.py`
 
@@ -396,7 +377,7 @@ predictions against realised waits, which needs data from live operation.
 
 ---
 
-## 8. Dynamic Service-Time Measurement
+## 7. Dynamic Service-Time Measurement
 
 **Where:** `app/services/queue_service.py`
 
@@ -416,7 +397,7 @@ which is in use.
 
 ---
 
-## 9. Sticky Counter Assignment
+## 8. Sticky Counter Assignment
 
 **Where:** `queue_tracker._recalculate_positions()`
 
@@ -443,6 +424,15 @@ formatting; no decision logic.
 **TTS announcements** — Web Speech API in the browser display board. Reads
 newly assigned numbers aloud. No CV, no prediction.
 
+**No-show** — `queue_tracker.mark_no_show()`, reached from the dashboard.
+When the student whose turn it is has not come, a staff member marks them
+a no-show and the system bumps the number and moves the queue on. There is
+no timer and no detection behind it: whether somebody has turned up is a
+judgement made by the person at the desk who can see the queue area, and
+the earlier automatic version of this was removed for that reason. A
+no-show is recorded separately from a served ticket and does not count
+towards `total_served`, since nobody was served.
+
 ---
 
 ## Summary
@@ -454,11 +444,10 @@ newly assigned numbers aloud. No CV, no prediction.
 | 3 | Track stability | IoU/centroid remap + dedup | — |
 | 4 | Face recognition | ArcFace 512-d + threshold & margin rule | Score < 0.30 or margin < 0.15 |
 | 5 | System-minted number | Reserved 5000+ range, one-per-student | Student already holds an entry |
-| 6 | No-show detection | Missing-frame countdown | Entry still pending |
-| 7 | Wait-time prediction | M/M/c + trend forecast | — |
-| 8 | Service-time measurement | Inter-departure gap blending | — |
-| 9 | Counter assignment | Sorted position, sticky | — |
+| 6 | Wait-time prediction | M/M/c + trend forecast | — |
+| 7 | Service-time measurement | Inter-departure gap blending | — |
+| 8 | Counter assignment | Sorted position, sticky | — |
 
-Five of the nine (1, 2, 4, 5, 6) have an explicit refuse-and-escalate
+Four of the eight (1, 2, 4, 5) have an explicit refuse-and-escalate
 branch. That is the design stance: the system is built to hand ambiguous
 cases to a human rather than resolve them by guessing.

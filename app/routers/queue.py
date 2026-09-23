@@ -38,10 +38,6 @@ class ZoneBody(BaseModel):
     y2: int
 
 
-class NoshowConfigBody(BaseModel):
-    seconds: int
-
-
 class CountersBody(BaseModel):
     counters: int
 
@@ -277,6 +273,25 @@ def queue_done(body: DoneBody, username: str = Depends(require_staff)):
     )
 
 
+@router.post("/api/queue/no_show", summary="Staff - mark no-show", tags=["Queue"])
+def queue_no_show(body: DoneBody, username: str = Depends(require_staff)):
+    """Staff decision, not a detection. Nothing in the system watches a
+    countdown or removes anybody on its own; this endpoint exists so the
+    person at the desk can say that the student whose turn it is has not
+    arrived, and have the queue move on."""
+    queue_state = queue_service.mark_no_show(body.queue_number, username)
+    if queue_state:
+        return {
+            "success": True,
+            "message": f"Q{body.queue_number:03d} marked as no-show",
+            "queue_state": queue_state,
+        }
+    raise HTTPException(
+        status_code=404,
+        detail=f"Q{body.queue_number:03d} not found in active queue",
+    )
+
+
 @router.post("/api/queue/reset", summary="Staff - reset entire queue", tags=["Queue"])
 def queue_reset(username: str = Depends(require_staff)):
     queue_service.reset_queue(username)
@@ -287,32 +302,6 @@ def queue_reset(username: str = Depends(require_staff)):
 def set_zone(body: ZoneBody, username: str = Depends(require_staff)):
     zone = queue_service.set_zone(body.x1, body.y1, body.x2, body.y2)
     return {"success": True, "zone": zone}
-
-
-@router.get("/api/queue/noshow_alerts", summary="Staff - no-show alerts", tags=["Queue"])
-def noshow_alerts(username: str = Depends(require_staff)):
-    return {"alerts": queue_service.queue_tracker.get_noshow_alerts()}
-
-
-@router.get("/api/queue/noshow_config", summary="Staff - get no-show window", tags=["Queue"])
-def get_noshow_config(username: str = Depends(require_staff)):
-    return {
-        "noshow_window_seconds": queue_service.queue_tracker.NOSHOW_WINDOW_SECONDS
-    }
-
-
-@router.post("/api/queue/noshow_config", summary="Staff - set no-show window", tags=["Queue"])
-def set_noshow_config(
-    body: NoshowConfigBody,
-    username: str = Depends(require_staff),
-):
-    if not (30 <= body.seconds <= 300):
-        raise HTTPException(
-            status_code=400,
-            detail="seconds must be between 30 and 300",
-        )
-    queue_service.queue_tracker.NOSHOW_WINDOW_SECONDS = body.seconds
-    return {"success": True, "noshow_window_seconds": body.seconds}
 
 
 @router.post(

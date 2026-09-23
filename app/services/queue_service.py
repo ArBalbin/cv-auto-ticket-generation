@@ -19,7 +19,6 @@ from core.config import (
     QUEUE_MIN_CONFIRM_FRAMES,
     QUEUE_MIN_MOTION_PIXELS,
     QUEUE_MIN_PORTRAIT_ASPECT,
-    QUEUE_NOSHOW_WINDOW_SECONDS,
     QUEUE_REMAP_ABSENT_FRAMES,
     QUEUE_REMAP_DIST_THRESH,
     QUEUE_REMAP_IOU_THRESH,
@@ -40,7 +39,6 @@ from services.queue_tracker import QueueTracker, QueueZone
 from services import face_service, ticket_service
 from services.ticket_printer import delete_all_tickets
 
-
 queue_zone = QueueZone(x1=10, y1=10, x2=1910, y2=1070)
 queue_tracker = QueueTracker(zone=queue_zone)
 
@@ -48,7 +46,6 @@ _REMAP_IOU_THRESH = QUEUE_REMAP_IOU_THRESH
 _REMAP_DIST_THRESH = QUEUE_REMAP_DIST_THRESH
 _MAX_REMAP_ABSENT_FRAMES = QUEUE_REMAP_ABSENT_FRAMES
 _config_lock = threading.Lock()
-
 
 def _on_number_linked(
     queue_number: int,
@@ -78,16 +75,6 @@ def _on_number_linked(
     except Exception:
         print(f"[QueueService] Ticket queue full - Q{queue_number:03d} skipped")
 
-
-def _on_noshow(queue_number: int) -> None:
-    threading.Thread(
-        target=update_queue_status,
-        args=(queue_number, "no_show"),
-        daemon=True,
-        name=f"DBUpdate-Q{queue_number:03d}-noshow",
-    ).start()
-
-
 def _service_time_refresh_loop() -> None:
     """Background thread: re-measure avg_service_time from DB every 5 minutes."""
     while True:
@@ -106,10 +93,8 @@ def _service_time_refresh_loop() -> None:
         except Exception as exc:
             print(f"[QueueService] service time refresh error: {exc}")
 
-
 def wire_callbacks() -> None:
     queue_tracker.on_number_linked = _on_number_linked
-    queue_tracker.on_noshow = _on_noshow
     queue_tracker.MAX_MISSING_FRAMES = QUEUE_MAX_MISSING_FRAMES
     queue_tracker.MIN_CONFIRM_FRAMES = QUEUE_MIN_CONFIRM_FRAMES
     queue_tracker.MIN_MOTION_PIXELS = QUEUE_MIN_MOTION_PIXELS
@@ -119,7 +104,6 @@ def wire_callbacks() -> None:
     queue_tracker.FACE_MATCH_THRESHOLD = FACE_MATCH_THRESHOLD
     queue_tracker.FACE_MARGIN_THRESHOLD = FACE_MARGIN_THRESHOLD
     queue_tracker.PENDING_LINK_TIMEOUT_SECONDS = PENDING_LINK_TIMEOUT_SECONDS
-    queue_tracker.NOSHOW_WINDOW_SECONDS = QUEUE_NOSHOW_WINDOW_SECONDS
     queue_tracker.DEDUP_IOU_THRESH = 0.40
     queue_tracker.DEDUP_CENTRE_FRAC = 0.15
 
@@ -135,7 +119,6 @@ def wire_callbacks() -> None:
         name="ServiceTimeRefresh",
     ).start()
 
-
 def _bbox_iou(a: tuple, b: tuple) -> float:
     ix1 = max(a[0], b[0])
     iy1 = max(a[1], b[1])
@@ -148,13 +131,11 @@ def _bbox_iou(a: tuple, b: tuple) -> float:
     area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
     return inter / (area_a + area_b - inter)
 
-
 def _bbox_centroid_dist(a: tuple, b: tuple) -> float:
     return (
         ((a[0] + a[2]) / 2 - (b[0] + b[2]) / 2) ** 2
         + ((a[1] + a[3]) / 2 - (b[1] + b[3]) / 2) ** 2
     ) ** 0.5
-
 
 def remap_track_ids(tracked: list, tracker) -> list:
     if not tracked:
@@ -231,7 +212,6 @@ def remap_track_ids(tracked: list, tracker) -> list:
 
     return remapped
 
-
 def inject_face_embeddings(raw_tracked: list, tracker) -> None:
     """Refresh a tracked person's stored face embedding from the latest
     detector payload. Unlike the retired HSV signature (which was EMA-
@@ -252,7 +232,6 @@ def inject_face_embeddings(raw_tracked: list, tracker) -> None:
             person.face_embedding = np.array(embedding, dtype=np.float32)
         except Exception as exc:
             print(f"[QueueService] face embedding injection error tid={tid}: {exc}")
-
 
 def _try_link_students(raw_tracked: list) -> None:
     """For each presence-confirmed-but-unlinked person whose track carries a
@@ -356,7 +335,6 @@ def _try_link_students(raw_tracked: list) -> None:
         if linked is not None:
             _record_recognition_metric(linked, match, intent_at)
 
-
 def _record_recognition_metric(person, match, intent_at=None) -> None:
     """
     Capture how long this recognition took and how many frames it cost, for
@@ -403,7 +381,6 @@ def _record_recognition_metric(person, match, intent_at=None) -> None:
         })
     except Exception as exc:
         print(f"[QueueService] recognition metric skipped: {exc}")
-
 
 def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
     queue_state: dict = {}
@@ -457,7 +434,6 @@ def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
 
     return queue_state
 
-
 def done_pending_people() -> list:
     return [
         p.to_dict()
@@ -465,13 +441,11 @@ def done_pending_people() -> list:
         if p.status == "done_pending"
     ]
 
-
 def is_queue_number_active(queue_number: int) -> bool:
     return any(
         p.queue_number == queue_number and p.status in ("waiting", "missing")
         for p in queue_tracker.active_queue.values()
     )
-
 
 def reset_queue(actor_username: str | None = None) -> None:
     global queue_tracker
@@ -486,7 +460,6 @@ def reset_queue(actor_username: str | None = None) -> None:
         name="DBAudit-queue-reset",
     ).start()
 
-
 def mark_done(queue_number: int, actor_username: str | None = None) -> dict | None:
     if not queue_tracker.mark_transaction_done(queue_number):
         return None
@@ -499,6 +472,20 @@ def mark_done(queue_number: int, actor_username: str | None = None) -> dict | No
     ).start()
     return queue_tracker.get_state()
 
+def mark_no_show(queue_number: int, actor_username: str | None = None) -> dict | None:
+    """Staff action, not a detection. A member of staff who can see the queue
+    area decides that the person whose turn it is has not come, and the
+    system then bumps the number and moves the queue on."""
+    if not queue_tracker.mark_no_show(queue_number):
+        return None
+
+    threading.Thread(
+        target=update_queue_status,
+        args=(queue_number, "no_show", actor_username),
+        daemon=True,
+        name=f"DBUpdate-Q{queue_number:03d}-noshow",
+    ).start()
+    return queue_tracker.get_state()
 
 def link_pending_person(
     track_id: int,
@@ -514,7 +501,6 @@ def link_pending_person(
     )
     return person.to_dict() if person else None
 
-
 def force_new_person(queue_number: int, is_walkin: bool = True) -> dict | None:
     """Staff manual entry — link an already-printed kiosk number directly.
     This is the walk-in path (per the panel's directive, walk-ins keep their
@@ -522,14 +508,11 @@ def force_new_person(queue_number: int, is_walkin: bool = True) -> dict | None:
     student. Returns None if that number is already linked today."""
     return queue_tracker.force_new_person(queue_number, is_walkin=is_walkin)
 
-
 def mark_on_the_way(queue_number: int) -> dict | None:
     return queue_tracker.mark_on_the_way(queue_number)
 
-
 def record_on_the_way_signal(queue_number: int) -> dict:
     return queue_tracker.record_on_the_way_signal(queue_number)
-
 
 def on_way_notification_state() -> dict:
     queue_state = queue_tracker.get_state()
@@ -578,16 +561,13 @@ def on_way_notification_state() -> dict:
         "active_queue": active_queue,
     }
 
-
 def zone_dict() -> dict:
     z = queue_zone
     return {"x1": z.x1, "y1": z.y1, "x2": z.x2, "y2": z.y2}
 
-
 def set_zone(x1: int, y1: int, x2: int, y2: int) -> dict:
     queue_zone.set_zone(x1, y1, x2, y2)
     return zone_dict()
-
 
 def as_float(value, default: float = 0.0) -> float:
     try:
@@ -595,13 +575,11 @@ def as_float(value, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
-
 def as_int(value, default: int = 0) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
-
 
 def runtime_config() -> dict:
     with _config_lock:
@@ -614,7 +592,6 @@ def runtime_config() -> dict:
         "active_counters": counters,
         "avg_service_time": avg_service_time,
     }
-
 
 def set_active_counters(
     counters: int,
@@ -642,7 +619,6 @@ def set_active_counters(
         "avg_service_time": avg_service_time,
     }
 
-
 def format_minutes(minutes: float) -> str:
     minutes = max(0.0, float(minutes))
     if minutes < 1:
@@ -656,7 +632,6 @@ def format_minutes(minutes: float) -> str:
         return f"{hours} hr" if hours == 1 else f"{hours} hrs"
     return f"{hours} hr {mins} min" if hours == 1 else f"{hours} hrs {mins} min"
 
-
 def format_seconds(seconds: int) -> str:
     seconds = max(0, as_int(seconds, 0))
     if seconds < 60:
@@ -667,10 +642,8 @@ def format_seconds(seconds: int) -> str:
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes}m" if minutes else f"{hours}h"
 
-
 def eta_iso(wait_minutes: float) -> str:
     return (datetime.now() + timedelta(minutes=max(0.0, wait_minutes))).isoformat()
-
 
 def estimate_wait_for_position(
     position: int,
@@ -683,7 +656,6 @@ def estimate_wait_for_position(
     avg_service_time = max(0.1, avg_service_time)
     batches_before = max(0, (position - 1) // counters)
     return round(batches_before * avg_service_time, 1)
-
 
 def prediction_for_position(
     position: int,
@@ -702,7 +674,6 @@ def prediction_for_position(
         "estimated_service_time_min": service_min,
     }
 
-
 def _as_datetime(value) -> datetime | None:
     if isinstance(value, datetime):
         return value
@@ -712,7 +683,6 @@ def _as_datetime(value) -> datetime | None:
         except ValueError:
             return None
     return None
-
 
 def ticket_record_status_response(record: dict) -> dict:
     queue_number = as_int(record.get("queue_number"), 0)
@@ -724,7 +694,9 @@ def ticket_record_status_response(record: dict) -> dict:
 
     messages = {
         "served": "Your queue ticket is done. Please exit the queue area.",
-        "no_show": "Your queue ticket was marked as no-show. Please contact staff if you still need service.",
+        # Kept for historical records written before no-show detection was
+        # removed; the system no longer produces this status.
+        "no_show": "Your queue ticket is no longer active. Please contact staff if you still need service.",
         "expired": "Your queue ticket has expired. Please get a new ticket if you still need service.",
     }
 
@@ -741,8 +713,7 @@ def ticket_record_status_response(record: dict) -> dict:
         "completed_at": ended_at.strftime("%I:%M:%S %p"),
         "completed_at_full": ended_at.strftime("%b %d, %Y %I:%M:%S %p"),
         "completed_at_iso": ended_at.isoformat(),
-        "noshow_warning": False,
-        "noshow_countdown": None,
+
         "message": messages.get(status, "This queue ticket is no longer active."),
         "prediction": prediction_for_position(
             0,
@@ -750,7 +721,6 @@ def ticket_record_status_response(record: dict) -> dict:
             config["active_counters"],
         ),
     }
-
 
 def ticket_record_waiting_response(record: dict) -> dict:
     queue_number = as_int(record.get("queue_number"), 0)
@@ -768,8 +738,7 @@ def ticket_record_waiting_response(record: dict) -> dict:
         "joined_at": created_at.strftime("%I:%M:%S %p"),
         "joined_at_full": created_at.strftime("%b %d, %Y %I:%M:%S %p"),
         "joined_at_iso": created_at.isoformat(),
-        "noshow_warning": False,
-        "noshow_countdown": None,
+
         "message": (
             "Your ticket is still active, but you are not currently visible "
             "in the live queue. Please return to the queue zone and ask staff "
@@ -782,14 +751,12 @@ def ticket_record_waiting_response(record: dict) -> dict:
         ),
     }
 
-
 def _active_ticket_numbers() -> set[int]:
     return {
         p.queue_number
         for p in queue_tracker.active_queue.values()
         if p.status in ("waiting", "missing")
     }
-
 
 def _fallback_person_from_ticket(record: dict, position: int) -> dict:
     queue_number = as_int(record.get("queue_number"), 0)
@@ -816,7 +783,6 @@ def _fallback_person_from_ticket(record: dict, position: int) -> dict:
         ),
     }
 
-
 # Kiosk tickets that are waiting but that the camera has not linked to a
 # tracked person yet — the fallback behind the live tracker. Reading them
 # costs a round trip to the managed database, and /api/queue/prediction is
@@ -839,7 +805,6 @@ _waiting_records_cache: list[dict] = []
 _waiting_records_read_at = 0.0
 _waiting_records_lock = threading.Lock()
 
-
 def _waiting_queue_records() -> list[dict]:
     global _waiting_records_cache, _waiting_records_read_at
 
@@ -856,7 +821,6 @@ def _waiting_queue_records() -> list[dict]:
         _waiting_records_cache = records
         _waiting_records_read_at = time.monotonic()
     return records
-
 
 def live_or_db_active_queue() -> list[dict]:
     queue_state = queue_tracker.get_state()
@@ -877,7 +841,6 @@ def live_or_db_active_queue() -> list[dict]:
         if as_int(person.get("position"), 0) <= 0:
             person["position"] = person["position_in_line"]
     return active
-
 
 def build_queue_prediction() -> dict:
     with state.state_lock:
@@ -994,17 +957,14 @@ def build_queue_prediction() -> dict:
         "active_queue": people,
     }
 
-
 def _clean_queue_record(record: dict) -> dict:
     hidden = {"access_token", "jwt_token", "short_code", "pdf_path"}
     return {key: value for key, value in record.items() if key not in hidden}
-
 
 def _average_wait(wait_values: list[int]) -> float:
     if not wait_values:
         return 0.0
     return round(sum(wait_values) / len(wait_values), 1)
-
 
 def _wait_band_counts(active_queue: list[dict]) -> list[dict]:
     bands = [
@@ -1027,18 +987,14 @@ def _wait_band_counts(active_queue: list[dict]) -> list[dict]:
         counts.append({"label": label, "count": count})
     return counts
 
-
 def _analytics_recommendation(
     data_status: str,
     utilization: float,
     queue_length: int,
     missing_count: int,
-    noshow_alert_count: int,
 ) -> str:
     if data_status == "stale":
         return "Detector updates are stale. Check the camera process before trusting the trend."
-    if noshow_alert_count:
-        return "A no-show countdown is active. Watch the first position before marking the next person."
     if missing_count:
         return "Some queued people are missing from the zone. Confirm the camera view and queue zone."
     if utilization >= 0.9 and queue_length:
@@ -1046,7 +1002,6 @@ def _analytics_recommendation(
     if queue_length == 0:
         return "Queue is clear. Keep the detector running for fresh arrivals."
     return "Queue is moving normally."
-
 
 def build_queue_analytics() -> dict:
     prediction = build_queue_prediction()
@@ -1069,13 +1024,16 @@ def build_queue_analytics() -> dict:
     ]
 
     total_completed = len(completed_all)
-    total_no_show = sum(
-        1 for record in completed_all
-        if record.get("bump_reason") == "no_show"
-    )
     total_served = sum(
         1 for record in completed_all
         if record.get("bump_reason") == "served"
+    )
+    # Counted separately from served on purpose: a no-show never reached
+    # the counter, so folding it into the served total would overstate
+    # both completed tickets and any service rate derived from them.
+    total_no_show = sum(
+        1 for record in completed_all
+        if record.get("bump_reason") == "no_show"
     )
     # No internal counter mints numbers anymore (they always come from the
     # kiosk) — "assigned today" is everyone currently active plus everyone
@@ -1084,7 +1042,6 @@ def build_queue_analytics() -> dict:
 
     data_status = prediction.get("data_status", "live")
     utilization = as_float(prediction.get("system_utilization"), 0.0)
-    noshow_alerts = queue_state.get("noshow_alerts", [])
 
     active_by_number = {
         person.get("queue_number"): _clean_queue_record(person)
@@ -1155,10 +1112,6 @@ def build_queue_analytics() -> dict:
                 (total_completed / total_assigned) * 100,
                 1,
             ) if total_assigned else 0.0,
-            "no_show_rate_percent": round(
-                (total_no_show / total_completed) * 100,
-                1,
-            ) if total_completed else 0.0,
             "data_status": data_status,
             "data_age_seconds": prediction.get("data_age_seconds", 0),
         },
@@ -1199,7 +1152,6 @@ def build_queue_analytics() -> dict:
             _clean_queue_record(record)
             for record in reversed(recent_completed)
         ],
-        "noshow_alerts": noshow_alerts,
         "on_way_notifications": queue_state.get("on_way_notifications", []),
         "appearance_rejections": queue_state.get("appearance_rejections", []),
         "zone": zone_dict(),
@@ -1208,9 +1160,7 @@ def build_queue_analytics() -> dict:
             utilization,
             queue_length,
             missing_count,
-            len(noshow_alerts),
         ),
     }
-
 
 wire_callbacks()
