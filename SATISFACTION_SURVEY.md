@@ -25,7 +25,7 @@ fit the time left before the final defense, so the protocol was shortened and
 | Separate pilot, 10–15 respondents | **Cronbach's alpha on the actual responses**, per dimension, per group |
 | Content validation by three experts | **Kept** — one review round, before the survey is used |
 | Students sized by Slovin's formula | **Convenience sample** of the students who volunteer and complete the trial |
-| Staff: total enumeration | Unchanged — every staff member who operated the dashboard in the session |
+| Staff and administrators: total enumeration | **Cashier staff only**, total enumeration; administrators and IT personnel are not surveyed, since they do not use the system themselves |
 
 Consequence stated in the manuscript: SOP #4 results describe users' *first
 experience under supervision*, not satisfaction after sustained use.
@@ -40,8 +40,8 @@ experience under supervision*, not satisfaction after sustained use.
 - **Three per dimension are role-specific** — a student cannot judge the staff
   dashboard, and staff cannot judge the mobile app.
 - Every item is worded so that agreement is favourable. **No reverse-scoring.**
-- Codes: `U` usability, `R` reliability, `C` clarity; `-s` student, `-f` staff
-  and administrators. **Keep the hyphen** — `ML/score_survey.py` only
+- Codes: `U` usability, `R` reliability, `C` clarity; `-s` student, `-f`
+  cashier staff. **Keep the hyphen** — `ML/score_survey.py` only
   recognises codes written as `U3-s`, and silently skips `U3s`.
 
 ---
@@ -79,13 +79,11 @@ If **No**, thank them and end the form. It must come *before* consent.
 ## SECTION I — Respondent profile
 
 1. Respondent code (assigned by researchers): ________
-2. **Respondent group:** ☐ Service Staff ☐ Administrator / IT Personnel ☐ Student
+2. **Respondent group:** ☐ Cashier Staff ☐ Student
 3. *(Students)* Year level: ☐ 1st ☐ 2nd ☐ 3rd ☐ 4th ☐ 5th or above
 4. *(Students)* How did you receive your queue number during the session?
    ☐ Automatically, after the camera recognised me
    ☐ From staff, because the system could not recognise me
-5. *(Staff/Admin)* Your role during the session:
-   ☐ Operated the staff dashboard ☐ Observed or supervised
 
 **Rating scale:** 5 = Strongly Agree · 4 = Agree · 3 = Neutral ·
 2 = Disagree · 1 = Strongly Disagree
@@ -115,7 +113,7 @@ If **No**, thank them and end the form. It must come *before* consent.
 | C4-s | The estimated waiting time was presented in a way I could understand. |
 | C5-s | I understood what information the system keeps about me. |
 
-## SECTION III — Staff and administrator form (15 items)
+## SECTION III — Cashier staff form (15 items)
 
 | Code | Statement |
 |---|---|
@@ -171,8 +169,8 @@ If **No**, thank them and end the form. It must come *before* consent.
 1. Put the **age screening first** and end the form on "No"; consent second.
 2. Make **Respondent group** a required question — the scorer reads any column
    whose header contains "group".
-3. Branch on the group: students see only Section II, staff and administrators
-   only Section III.
+3. Branch on the group: students see only Section II, cashier staff only
+   Section III.
 4. Make each dimension a *Multiple choice grid*, and **start every row's text
    with its code**, e.g. `U3-s. Registering my face in the mobile app was easy.`
    Keep the hyphen.
