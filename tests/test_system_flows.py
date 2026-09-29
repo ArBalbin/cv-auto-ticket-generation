@@ -255,6 +255,48 @@ def test_two_students_standing_close_each_get_a_number(system):
     assert qa is not None and qb is not None and qa != qb
 
 
+def _five_joined_students(system, base):
+    sids = [base + i for i in range(5)]
+    faces = {sid: face(sid) for sid in sids}
+    system.enrolled.update(faces)
+    for sid in sids:
+        tap_join(sid)
+    return sids, faces
+
+
+def _assert_five_tickets(system, sids):
+    numbers = [app_state(sid)["queue_number"] for sid in sids]
+    assert all(app_state(sid)["state"] == "active" for sid in sids), numbers
+    assert len(set(numbers)) == 5, f"five different numbers expected, got {numbers}"
+    assert sorted(system.tickets) == sorted(numbers), "one ticket per student"
+
+
+def test_five_students_side_by_side_get_five_tickets(system):
+    sids, faces = _five_joined_students(system, 300)
+    system.stand(*[(60 + i, 100 + 250 * i, near(faces[s], 70 + i, 0.3)) for i, s in enumerate(sids)])
+    _assert_five_tickets(system, sids)
+
+
+def test_five_students_forming_a_line_get_five_tickets(system):
+    # They arrive one at a time and stand close behind each other, so their
+    # boxes overlap heavily, as in a real queue seen from the camera.
+    sids, faces = _five_joined_students(system, 310)
+    line = []
+    for i, s in enumerate(sids):
+        line.append((80 + i, 100 + 40 * i, near(faces[s], 90 + i, 0.3)))
+        system.stand(*line)
+    _assert_five_tickets(system, sids)
+
+
+def test_five_students_taking_the_same_spot_in_turn_get_five_tickets(system):
+    # Each one steps into the spot the previous one just left.
+    sids, faces = _five_joined_students(system, 320)
+    for i, s in enumerate(sids):
+        system.stand((100 + i, 100, near(faces[s], 110 + i, 0.3)))
+        system.stand(frames=10)
+    _assert_five_tickets(system, sids)
+
+
 # ------------------------------------------------ cashier / staff dashboard
 
 def test_staff_mark_done_counts_as_served(system):
