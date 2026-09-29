@@ -45,6 +45,9 @@ queue_tracker = QueueTracker(zone=queue_zone)
 _REMAP_IOU_THRESH = QUEUE_REMAP_IOU_THRESH
 _REMAP_DIST_THRESH = QUEUE_REMAP_DIST_THRESH
 _MAX_REMAP_ABSENT_FRAMES = QUEUE_REMAP_ABSENT_FRAMES
+# Longest gap, in frames, over which a track is remapped without a face to
+# confirm it is the same person (about half a second at 15 fps).
+_REMAP_FACELESS_MAX_FRAMES = 8
 _config_lock = threading.Lock()
 
 def _on_number_linked(
@@ -148,7 +151,7 @@ def remap_track_ids(tracked: list, tracker) -> list:
     if not unknown:
         return tracked
 
-    candidates: list[tuple[int, tuple]] = []
+    candidates: list[tuple[int, tuple, object, int]] = []
     for tid, person in tracker.active_queue.items():
         if person.status == "done_pending":
             continue
@@ -161,7 +164,7 @@ def remap_track_ids(tracked: list, tracker) -> list:
 
         bbox = getattr(person, "bbox", None)
         if bbox and len(bbox) == 4:
-            candidates.append((tid, tuple(bbox)))
+            candidates.append((tid, tuple(bbox), person.face_embedding, absent_frames))
 
     if not candidates:
         return tracked
@@ -179,9 +182,22 @@ def remap_track_ids(tracked: list, tracker) -> list:
 
         best_tid = None
         best_score = -1.0
+        incoming_face = p.get("face_embedding")
 
-        for c_tid, c_bbox in candidates:
+        for c_tid, c_bbox, c_face, c_absent in candidates:
             if c_tid in used_cands:
+                continue
+            # Position alone cannot tell a lost track from a different person
+            # stepping into the spot someone just left; remapping them handed
+            # the first person's queue number to the second. When both faces
+            # are known they must match; without a face, only a near-instant
+            # track switch (the tracker losing the same person) is remapped.
+            if c_face is not None and incoming_face:
+                sim = face_service.cosine_similarity(
+                    np.asarray(incoming_face, dtype=np.float32), c_face)
+                if sim < tracker.FACE_MATCH_THRESHOLD:
+                    continue
+            elif c_absent > _REMAP_FACELESS_MAX_FRAMES:
                 continue
             iou = _bbox_iou(bbox, c_bbox)
             dist = _bbox_centroid_dist(bbox, c_bbox)

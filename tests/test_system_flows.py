@@ -208,6 +208,53 @@ def test_position_moves_up_when_the_student_ahead_is_served(system):
     assert system.tracker.get_position(qb) == 1
 
 
+def test_new_person_in_a_vacated_spot_gets_their_own_number(system):
+    # Regression: the second student used to inherit the first one's number
+    # because the track remap matched on position alone.
+    a, b = face(20), face(21)
+    system.enrolled[120], system.enrolled[121] = a, b
+    tap_join(120)
+    tap_join(121)
+    system.stand((30, 100, near(a, 22, 0.3)))
+    qa = app_state(120)["queue_number"]
+
+    system.stand(frames=10)                      # the first student steps away
+    system.stand((31, 100, near(b, 23, 0.3)))    # the next one takes the same spot
+
+    qb = app_state(121)["queue_number"]
+    assert app_state(121)["state"] == "active"
+    assert qb != qa, "the second student gets a new number"
+    assert system.tracker.get_person_by_student_id(120).queue_number == qa
+    assert system.tickets == [qa, qb]
+
+
+def test_same_person_on_a_new_track_keeps_their_number(system):
+    a = face(24)
+    system.enrolled[122] = a
+    tap_join(122)
+    system.stand((40, 100, near(a, 25, 0.3)))
+    q = app_state(122)["queue_number"]
+
+    system.stand(frames=3)                       # tracker briefly loses them
+    system.stand((41, 100, near(a, 26, 0.3)))    # and gives them a new track id
+
+    assert app_state(122)["queue_number"] == q
+    assert system.tickets == [q], "no second number for the same student"
+
+
+def test_two_students_standing_close_each_get_a_number(system):
+    a, b = face(27), face(28)
+    system.enrolled[123], system.enrolled[124] = a, b
+    tap_join(123)
+    tap_join(124)
+    system.stand((50, 100, near(a, 29, 0.3)))
+    # The second student stands right behind the first: their boxes overlap.
+    system.stand((50, 100, near(a, 30, 0.3)), (51, 130, near(b, 31, 0.3)))
+
+    qa, qb = app_state(123)["queue_number"], app_state(124)["queue_number"]
+    assert qa is not None and qb is not None and qa != qb
+
+
 # ------------------------------------------------ cashier / staff dashboard
 
 def test_staff_mark_done_counts_as_served(system):

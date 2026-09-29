@@ -519,12 +519,17 @@ class QueueTracker:
                 return tid
         return None
 
-    def _is_duplicate_of_active(self, bbox) -> bool:
+    def _is_duplicate_of_active(self, bbox, live_embedding=None) -> bool:
         for p in self.active_queue.values():
             if p.status == 'done_pending':
                 continue
             if p.missing_frames > 0:
                 continue
+            # A clearly different face is a second person standing close by,
+            # not a duplicate box, the same rule _dedup_active_queue applies.
+            if live_embedding is not None and p.face_embedding is not None:
+                if face_service.cosine_similarity(live_embedding, p.face_embedding) < self.FACE_MATCH_THRESHOLD:
+                    continue
             if self._is_duplicate_of(p.bbox, bbox):
                 return True
         return False
@@ -659,7 +664,7 @@ class QueueTracker:
                 self._candidates.pop(track_id, None)
                 continue
 
-            if self._is_duplicate_of_active(bbox):
+            if self._is_duplicate_of_active(bbox, live_embedding):
                 self._candidates.pop(track_id, None)
                 print(f"🔁 track {track_id} suppressed — duplicate of active person")
                 continue
