@@ -8,6 +8,7 @@ from core.config import (
     DB_HOST,
     DB_NAME,
     DB_PASSWORD,
+    DB_POOL_SIZE,
     DB_PORT,
     DB_SSL_CA,
     DB_SSL_MODE,
@@ -42,11 +43,12 @@ def _load_mysql():
 
 
 def _is_pool_exhausted(exc: Exception) -> bool:
-    try:
-        _, mysql_errors, _ = _load_mysql()
-        return isinstance(exc, mysql_errors.PoolExhausted)
-    except Exception:
-        return exc.__class__.__name__ == "PoolExhausted"
+    # mysql-connector raises PoolError("Failed getting connection; pool
+    # exhausted"); there is no PoolExhausted class in the versions in use, so
+    # checking only for that name let every busy moment surface as a 500.
+    if exc.__class__.__name__ in ("PoolExhausted", "PoolError"):
+        return True
+    return "pool exhausted" in str(exc).lower()
 
 
 def _is_operational_error(exc: Exception) -> bool:
@@ -105,7 +107,7 @@ def _ensure_db_pool():
             _, _, pooling = _load_mysql()
             db_pool = pooling.MySQLConnectionPool(
                 pool_name="queueflow_pool",
-                pool_size=10,
+                pool_size=DB_POOL_SIZE,
                 pool_reset_session=True,
                 host=DB_HOST,
                 port=DB_PORT,
@@ -707,6 +709,67 @@ _STUDENT_PROFILE_FIELDS = (
     "num_enrollment_samples, enrolled_at, last_login, face_enrolled_at"
 )
 
+# Columns added for the final-defense privacy requirements: consent before
+# registration, and the data-retention policy. They are read only when the
+# database already has them, so a server that starts before the migration
+# below has run keeps serving logins instead of failing on an unknown column.
+_PRIVACY_COLUMNS = {
+    "consent_version": "VARCHAR(32) DEFAULT NULL",
+    "consented_at": "DATETIME DEFAULT NULL",
+    "last_active_at": "DATETIME DEFAULT NULL",
+    "archived_at": "DATETIME DEFAULT NULL",
+}
+_PRIVACY_INDEXES = {
+    "idx_last_active_at": "last_active_at",
+    "idx_archived_at": "archived_at",
+}
+
+
+def _student_fields(cursor) -> str:
+    present = _get_table_columns(cursor, "student_profiles")
+    extra = [c for c in _PRIVACY_COLUMNS if c in present]
+    return _STUDENT_PROFILE_FIELDS + "".join(f", {c}" for c in extra)
+
+
+def _has_privacy_columns(cursor) -> bool:
+    return set(_PRIVACY_COLUMNS) <= _get_table_columns(cursor, "student_profiles")
+
+
+def ensure_privacy_columns() -> bool:
+    """Add the consent and retention columns to student_profiles if missing.
+
+    Idempotent; runs at startup. Mirrors
+    database_sql/2026_11_privacy_retention_migration.sql for databases that
+    are migrated by hand."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return False
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        _table_columns_cache.pop("student_profiles", None)
+        present = _get_table_columns(cursor, "student_profiles")
+        for column, ddl in _PRIVACY_COLUMNS.items():
+            if column not in present:
+                cursor.execute(f"ALTER TABLE student_profiles ADD COLUMN {column} {ddl}")
+                print(f"[DB] student_profiles: added column {column}")
+        cursor.execute("SHOW INDEX FROM student_profiles")
+        indexes = {row[2] for row in cursor.fetchall()}
+        for name, column in _PRIVACY_INDEXES.items():
+            if name not in indexes:
+                cursor.execute(f"CREATE INDEX {name} ON student_profiles ({column})")
+        conn.commit()
+        _table_columns_cache.pop("student_profiles", None)
+        return True
+    except Exception as exc:
+        print(f"[DB] Privacy column migration failed: {exc}")
+        return False
+    finally:
+        _table_columns_cache.pop("student_profiles", None)
+        close_db_resources(cursor, conn)
+
 
 def get_student_by_google_sub(google_sub: str) -> dict | None:
     """Login lookup — google_sub is Google's stable per-account identifier."""
@@ -719,7 +782,7 @@ def get_student_by_google_sub(google_sub: str) -> dict | None:
         conn = pool.get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"SELECT {_student_fields(cursor)} FROM student_profiles "
             f"WHERE google_sub=%s LIMIT 1",
             (google_sub,),
         )
@@ -742,7 +805,7 @@ def get_student_by_id(student_id: int) -> dict | None:
         conn = pool.get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"SELECT {_student_fields(cursor)} FROM student_profiles "
             f"WHERE id=%s LIMIT 1",
             (student_id,),
         )
@@ -765,7 +828,7 @@ def get_student_by_gbox_email(gbox_email: str) -> dict | None:
         conn = pool.get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"SELECT {_student_fields(cursor)} FROM student_profiles "
             f"WHERE gbox_email=%s LIMIT 1",
             (gbox_email,),
         )
@@ -783,9 +846,11 @@ def create_student_account(
     gbox_email: str,
     google_sub: str,
     full_name: str | None = None,
+    consent_version: str | None = None,
 ) -> int | None:
     """First-time self-registration. No embedding yet — face capture is a
-    separate later step (save_student_face_embedding)."""
+    separate later step (save_student_face_embedding). The consent the
+    student gave on the registration screen is stored with the account."""
     pool = _ensure_db_pool()
     if pool is None:
         print("[DB] No pool - student account not created")
@@ -795,14 +860,25 @@ def create_student_account(
     try:
         conn = pool.get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO student_profiles
-                (school_id, gbox_email, google_sub, full_name, enrolled_at)
-            VALUES (%s, %s, %s, %s, NOW())
-            """,
-            (school_id, gbox_email, google_sub, full_name),
-        )
+        if consent_version and _has_privacy_columns(cursor):
+            cursor.execute(
+                """
+                INSERT INTO student_profiles
+                    (school_id, gbox_email, google_sub, full_name, enrolled_at,
+                     consent_version, consented_at, last_active_at)
+                VALUES (%s, %s, %s, %s, NOW(), %s, NOW(), NOW())
+                """,
+                (school_id, gbox_email, google_sub, full_name, consent_version),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO student_profiles
+                    (school_id, gbox_email, google_sub, full_name, enrolled_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                """,
+                (school_id, gbox_email, google_sub, full_name),
+            )
         conn.commit()
         student_id = cursor.lastrowid
         print(f"[DB] Student account created: school_id={school_id}")
@@ -858,6 +934,9 @@ def save_student_face_embedding(
 
 
 def touch_student_last_login(student_id: int) -> None:
+    """Record a sign-in. Signing in is activity, so it also restarts the
+    retention clock and brings an archived account back (its face data was
+    erased on archiving, so the student enrols their face again)."""
     pool = _ensure_db_pool()
     if pool is None:
         return
@@ -866,13 +945,69 @@ def touch_student_last_login(student_id: int) -> None:
     try:
         conn = pool.get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE student_profiles SET last_login=NOW() WHERE id=%s",
-            (student_id,),
-        )
+        if _has_privacy_columns(cursor):
+            cursor.execute(
+                "UPDATE student_profiles SET last_login=NOW(), last_active_at=NOW(), "
+                "archived_at=NULL WHERE id=%s",
+                (student_id,),
+            )
+        else:
+            cursor.execute(
+                "UPDATE student_profiles SET last_login=NOW() WHERE id=%s",
+                (student_id,),
+            )
         conn.commit()
     except Exception:
         pass
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def touch_student_activity(student_id: int) -> None:
+    """Record use of the system (asking to be queued) for the retention clock."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        if _has_privacy_columns(cursor):
+            cursor.execute(
+                "UPDATE student_profiles SET last_active_at=NOW() WHERE id=%s",
+                (student_id,),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def record_student_consent(student_id: int, consent_version: str) -> bool:
+    """Store that the student agreed to the given version of the data-privacy
+    notice (personal data and face photo) shown before registration."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return False
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        if not _has_privacy_columns(cursor):
+            print("[DB] consent columns missing - run the privacy migration")
+            return False
+        cursor.execute(
+            "UPDATE student_profiles SET consent_version=%s, consented_at=NOW() WHERE id=%s",
+            (consent_version, student_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as exc:
+        print(f"[DB] Error recording consent (student_id={student_id}): {exc}")
+        return False
     finally:
         close_db_resources(cursor, conn)
 
@@ -887,7 +1022,7 @@ def get_student_by_school_id(school_id: str) -> dict | None:
         conn = pool.get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"SELECT {_student_fields(cursor)} FROM student_profiles "
             f"WHERE school_id=%s LIMIT 1",
             (school_id,),
         )
@@ -911,7 +1046,7 @@ def list_students() -> list[dict]:
         conn = pool.get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            f"SELECT {_STUDENT_PROFILE_FIELDS} FROM student_profiles "
+            f"SELECT {_student_fields(cursor)} FROM student_profiles "
             f"ORDER BY enrolled_at DESC"
         )
         return list(cursor.fetchall() or [])
@@ -941,6 +1076,136 @@ def delete_student_profile(student_id: int) -> bool:
     except Exception as exc:
         print(f"[DB] Error deleting student {student_id}: {exc}")
         return False
+    finally:
+        close_db_resources(cursor, conn)
+
+
+# ---------------------------------------------------------------- retention
+# A student's last activity is their latest sign-in or request to be queued;
+# accounts that never recorded either fall back to when they registered.
+_LAST_ACTIVITY_SQL = "COALESCE(last_active_at, last_login, enrolled_at)"
+
+
+def archive_student(student_id: int) -> bool:
+    """Archive an account: deactivate it and erase its face data.
+
+    Biometric data is the most sensitive thing the system holds, so it is the
+    first thing removed when an account goes unused. The account row (school
+    ID, Gbox email) stays for the archive period so a returning student can
+    sign in again; they then re-enrol their face."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return False
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        if not _has_privacy_columns(cursor):
+            print("[DB] retention columns missing - run the privacy migration")
+            return False
+        cursor.execute(
+            """
+            UPDATE student_profiles
+            SET is_active = FALSE,
+                embedding = NULL,
+                embedding_model_version = NULL,
+                num_enrollment_samples = 0,
+                face_enrolled_at = NULL,
+                archived_at = NOW()
+            WHERE id = %s
+            """,
+            (student_id,),
+        )
+        conn.commit()
+        archived = cursor.rowcount > 0
+        if archived:
+            print(f"[DB] Student {student_id} archived (face data erased)")
+        return archived
+    except Exception as exc:
+        print(f"[DB] Error archiving student {student_id}: {exc}")
+        return False
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def _retention_rows(where_sql: str, params: tuple, limit: int) -> list[dict]:
+    pool = _ensure_db_pool()
+    if pool is None:
+        return []
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if not _has_privacy_columns(cursor):
+            return []
+        cursor.execute(
+            f"""
+            SELECT id, school_id, full_name, archived_at,
+                   {_LAST_ACTIVITY_SQL} AS last_activity
+            FROM student_profiles
+            WHERE {where_sql}
+            ORDER BY last_activity ASC
+            LIMIT %s
+            """,
+            (*params, limit),
+        )
+        return list(cursor.fetchall() or [])
+    except Exception as exc:
+        print(f"[DB] Error reading retention candidates: {exc}")
+        return []
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def students_due_for_archive(inactive_days: int, limit: int = 1000) -> list[dict]:
+    """Accounts not archived yet whose last activity is older than the limit."""
+    return _retention_rows(
+        f"archived_at IS NULL AND {_LAST_ACTIVITY_SQL} < NOW() - INTERVAL %s DAY",
+        (inactive_days,), limit,
+    )
+
+
+def students_due_for_deletion(archived_days: int, limit: int = 1000) -> list[dict]:
+    """Archived accounts that have stayed archived past the archive period."""
+    return _retention_rows(
+        "archived_at IS NOT NULL AND archived_at < NOW() - INTERVAL %s DAY",
+        (archived_days,), limit,
+    )
+
+
+def retention_counts(inactive_days: int, archived_days: int) -> dict:
+    """Totals for the staff dashboard's data-retention page."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return {}
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if not _has_privacy_columns(cursor):
+            return {}
+        cursor.execute(
+            f"""
+            SELECT
+              COUNT(*) AS total,
+              SUM(archived_at IS NULL) AS active,
+              SUM(archived_at IS NOT NULL) AS archived,
+              SUM(embedding IS NOT NULL) AS with_face_data,
+              SUM(consent_version IS NULL) AS without_consent,
+              SUM(archived_at IS NULL AND {_LAST_ACTIVITY_SQL} < NOW() - INTERVAL %s DAY) AS due_for_archive,
+              SUM(archived_at IS NOT NULL AND archived_at < NOW() - INTERVAL %s DAY) AS due_for_deletion
+            FROM student_profiles
+            """,
+            (inactive_days, archived_days),
+        )
+        row = cursor.fetchone() or {}
+        return {k: int(v or 0) for k, v in row.items()}
+    except Exception as exc:
+        print(f"[DB] Error reading retention counts: {exc}")
+        return {}
     finally:
         close_db_resources(cursor, conn)
 

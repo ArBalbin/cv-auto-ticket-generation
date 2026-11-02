@@ -1,0 +1,4 @@
+Method,Name,Error,Occurrences,First Seen,Last Seen
+GET,/api/queue/status (real ticket),RemoteDisconnected('Remote end closed connection without response'),1,2026-11-02T08:08:25Z,2026-11-02T08:08:25Z
+GET,/api/queue/status (real ticket),"ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None)",6,2026-11-02T08:08:29Z,2026-11-02T08:09:49Z
+GET,/api/queue/status (real ticket),"ConnectionAbortedError(10053, 'An established connection was aborted by the software in your host machine', None, 10053, None)",2,2026-11-02T08:09:05Z,2026-11-02T08:09:48Z

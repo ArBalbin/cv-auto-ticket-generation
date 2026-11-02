@@ -40,11 +40,25 @@ STAFF_PASSWORD = os.getenv("LOAD_TEST_STAFF_PASSWORD", "")
 # endpoint short-circuits to 404/401, which is a cheaper code path and
 # would understate the latency a real ticket-holder experiences.
 REAL_QUEUE_NUMBER = os.getenv("LOAD_TEST_QUEUE_NUMBER", "")
+
+# "equal" (the original runs): every user class is equally common.
+# "realistic": nearly every user is a student polling their ticket, as on a
+# campus; display boards and staff dashboards are a handful of screens and do
+# not grow with enrolment. At 200 users that is about 180 students, 10 boards,
+# and 10 staff, instead of 67 of each.
+LOAD_PROFILE = os.getenv("LOAD_TEST_PROFILE", "equal")
+_WEIGHTS = (
+    {"student": 18, "display": 1, "staff": 1}
+    if LOAD_PROFILE == "realistic"
+    else {"student": 1, "display": 1, "staff": 1}
+)
 REAL_ACCESS_TOKEN = os.getenv("LOAD_TEST_ACCESS_TOKEN", "")
 
 
 class StatusPollUser(HttpUser):
     """Simulates many ticket-holders refreshing their status page. Read-only."""
+
+    weight = _WEIGHTS["student"]
 
     wait_time = between(2, 5)
 
@@ -65,6 +79,8 @@ class StatusPollUser(HttpUser):
 
 class DisplayBoardUser(HttpUser):
     """Simulates the public display board and prediction pollers. Read-only."""
+
+    weight = _WEIGHTS["display"]
 
     wait_time = between(1, 2)
 
@@ -125,6 +141,8 @@ class StaffAnalyticsUser(HttpUser):
     Requires LOAD_TEST_STAFF_PASSWORD to be set; skips login (and so gets
     401s, still a valid error-rate data point) if it isn't.
     """
+
+    weight = _WEIGHTS["staff"]
 
     wait_time = between(2, 4)
 

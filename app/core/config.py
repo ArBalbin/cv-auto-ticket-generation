@@ -189,6 +189,22 @@ PENDING_LINK_TIMEOUT_SECONDS = env_int("PENDING_LINK_TIMEOUT_SECONDS", 45)
 # cannot surprise them with a number on a later visit.
 JOIN_INTENT_TIMEOUT_MINUTES = env_int("JOIN_INTENT_TIMEOUT_MINUTES", 60)
 
+# Data-privacy consent shown in the mobile app before registration. Bump the
+# version whenever the notice text changes: every student is then asked to
+# agree again at their next sign-in, and cannot queue or enrol a face until
+# they do. The app sends the version it displayed; it must match this one.
+CONSENT_VERSION = os.getenv("CONSENT_VERSION", "2026-11-v1").strip() or "2026-11-v1"
+
+# Data-retention policy for student accounts (pre-final panel requirement).
+# An account with no sign-in or queue request for RETENTION_ARCHIVE_AFTER_DAYS
+# is archived: deactivated, with its face data erased. An account archived for
+# RETENTION_DELETE_AFTER_DAYS more is deleted. Staff can archive or delete
+# graduates at any time from the dashboard.
+RETENTION_ENABLED = env_bool("RETENTION_ENABLED", True)
+RETENTION_ARCHIVE_AFTER_DAYS = env_int("RETENTION_ARCHIVE_AFTER_DAYS", 365)
+RETENTION_DELETE_AFTER_DAYS = env_int("RETENTION_DELETE_AFTER_DAYS", 365)
+RETENTION_INTERVAL_HOURS = env_float("RETENTION_INTERVAL_HOURS", 24.0)
+
 CAM_TOKEN = os.getenv("CAM_TOKEN", "detector-secret-token")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "").strip() or secrets.token_hex(32)
 _tickets_output_raw = os.getenv("TICKETS_OUTPUT_DIR", str(APP_ROOT / "tickets")).strip()
@@ -199,6 +215,9 @@ if not TICKETS_OUTPUT_DIR.is_absolute():
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = env_int("DB_PORT", 3306)
 DB_NAME = os.getenv("DB_NAME", "Crowd_Detection")
+# Connections held open to MySQL. mysql-connector caps a pool at 32, and the
+# database server has its own connection limit, so raise it with care.
+DB_POOL_SIZE = max(1, min(32, env_int("DB_POOL_SIZE", 10)))
 DB_USERNAME = os.getenv("DB_USERNAME", "crowd_monitoring_user")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "password123")
 DB_SSL_MODE = os.getenv("DB_SSL_MODE", "DISABLED").strip().upper()

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
 
 from core.config import (
+    CONSENT_VERSION,
     FACE_MARGIN_THRESHOLD,
     FACE_MATCH_THRESHOLD,
     FACE_MODEL_PACK,
@@ -18,13 +19,14 @@ from core.security import (
 from database.database_handler import (
     create_student_account,
     delete_student_profile,
-    get_all_active_embeddings,
     get_student_by_google_sub,
     get_student_by_id,
     get_student_by_school_id,
     list_students,
     record_face_match_event,
+    record_student_consent,
     save_student_face_embedding,
+    touch_student_activity,
     touch_student_last_login,
 )
 from services import face_service
@@ -44,6 +46,20 @@ router = APIRouter()
 class GoogleAuthBody(BaseModel):
     id_token: str
     school_id: str | None = None
+    # Version of the data-privacy notice the student agreed to in the app.
+    consent_version: str | None = None
+
+
+class ConsentBody(BaseModel):
+    consent_version: str
+
+
+def _consent_required(row: dict) -> bool:
+    # Before the privacy migration has run the column is absent; nobody is
+    # blocked then, and the requirement applies as soon as it exists.
+    if "consent_version" not in row:
+        return False
+    return row.get("consent_version") != CONSENT_VERSION
 
 
 def _student_public_profile(row: dict) -> dict:
@@ -52,7 +68,24 @@ def _student_public_profile(row: dict) -> dict:
         "school_id": row["school_id"],
         "full_name": row.get("full_name"),
         "has_face_embedding": bool(row.get("face_enrolled_at")),
+        "consent_required": _consent_required(row),
+        "consent_version": CONSENT_VERSION,
     }
+
+
+def _require_consent(student_id: int) -> None:
+    """Block anything that processes the student's face until they have
+    agreed to the current data-privacy notice."""
+    student = get_student_by_id(student_id)
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if _consent_required(student):
+        raise HTTPException(status_code=403, detail="consent_required")
+
+
+def _check_consent_version(version: str | None) -> None:
+    if version != CONSENT_VERSION:
+        raise HTTPException(status_code=422, detail="consent_required")
 
 
 @router.post(
@@ -82,16 +115,23 @@ async def student_google_auth(body: GoogleAuthBody):
             raise HTTPException(
                 status_code=409, detail="This school ID is already registered."
             )
+        # No account is created until the student has agreed to the
+        # data-privacy notice (personal data and face photo).
+        _check_consent_version(body.consent_version)
 
         student_id = create_student_account(
             school_id=school_id,
             gbox_email=identity.email,
             google_sub=identity.sub,
             full_name=identity.name,
+            consent_version=body.consent_version,
         )
         if student_id is None:
             raise HTTPException(status_code=500, detail="Failed to create student account")
         existing = get_student_by_id(student_id)
+    elif body.consent_version == CONSENT_VERSION and _consent_required(existing):
+        record_student_consent(existing["id"], CONSENT_VERSION)
+        existing = get_student_by_id(existing["id"]) or existing
 
     touch_student_last_login(existing["id"])
     token = create_student_session(existing["id"])
@@ -121,12 +161,8 @@ async def student_face_auth(photo: UploadFile = File(...)):
             detail="No confident face detected - retake and retry",
         )
 
-    candidates = [
-        (student_id, face_service.embedding_from_json(emb))
-        for student_id, emb in get_all_active_embeddings()
-    ]
-    match = face_service.match_student(
-        embedding, candidates,
+    match = queue_service.embedding_index.match(
+        embedding,
         match_threshold=FACE_MATCH_THRESHOLD,
         margin_threshold=FACE_MARGIN_THRESHOLD,
     )
@@ -147,6 +183,37 @@ async def student_face_auth(photo: UploadFile = File(...)):
 async def student_logout(request: Request, student_id: int = Depends(require_student)):
     clear_student_session(get_student_session_token(request))
     return {"message": "Logged out"}
+
+
+@router.post(
+    "/api/students/me/consent",
+    summary="Student - agree to the data-privacy notice",
+    tags=["Students"],
+)
+async def give_consent(body: ConsentBody, student_id: int = Depends(require_student)):
+    """For accounts created before the notice existed, or after its text
+    changed: the app shows the notice and records the student's agreement."""
+    _check_consent_version(body.consent_version)
+    if not record_student_consent(student_id, CONSENT_VERSION):
+        raise HTTPException(status_code=500, detail="Failed to record consent")
+    student = get_student_by_id(student_id)
+    return {"student": _student_public_profile(student)}
+
+
+@router.delete(
+    "/api/students/me",
+    summary="Student - delete own account and face data",
+    tags=["Students"],
+)
+async def delete_my_account(request: Request, student_id: int = Depends(require_student)):
+    """Withdrawing consent: the student erases their own account, including
+    their face data. Queue history keeps its rows with the student unlinked."""
+    queue_service.queue_tracker.clear_join_intent(student_id)
+    if not delete_student_profile(student_id):
+        raise HTTPException(status_code=404, detail="Student not found")
+    queue_service.embedding_index.invalidate()
+    clear_student_session(get_student_session_token(request))
+    return {"message": "Account deleted"}
 
 
 @router.get("/api/students/me", summary="Student - own profile", tags=["Students"])
@@ -170,6 +237,8 @@ async def join_queue(student_id: int = Depends(require_student)):
     asked for. The intent lapses after JOIN_INTENT_TIMEOUT_MINUTES and is
     spent as soon as it produces a number.
     """
+    _require_consent(student_id)
+    touch_student_activity(student_id)
     armed_at = queue_service.queue_tracker.arm_join_intent(student_id)
     return {
         "joined": True,
@@ -279,6 +348,7 @@ async def register_my_face(
     stored, never the photos. Can be called again later to re-register (e.g.
     after a poor initial capture).
     """
+    _require_consent(student_id)
     if not photos:
         raise HTTPException(status_code=400, detail="At least one enrollment photo is required")
 
@@ -303,15 +373,11 @@ async def register_my_face(
     # own face (a fresh capture after a poor first attempt) is unaffected,
     # since the check excludes the current student_id. Same accept-only-if-
     # unambiguous logic used everywhere else face matching happens.
-    other_candidates = [
-        (sid, face_service.embedding_from_json(emb))
-        for sid, emb in get_all_active_embeddings()
-        if sid != student_id
-    ]
-    duplicate_check = face_service.match_student(
-        canonical, other_candidates,
+    duplicate_check = queue_service.embedding_index.match(
+        canonical,
         match_threshold=FACE_MATCH_THRESHOLD,
         margin_threshold=FACE_MARGIN_THRESHOLD,
+        exclude_id=student_id,
     )
     if duplicate_check.accepted:
         raise HTTPException(
@@ -327,6 +393,7 @@ async def register_my_face(
     )
     if not saved:
         raise HTTPException(status_code=500, detail="Failed to save face enrollment")
+    queue_service.embedding_index.invalidate()
 
     return {
         "student_id": student_id,
@@ -357,4 +424,5 @@ async def remove_student(student_id: int, username: str = Depends(require_staff)
     """Hard delete, supporting Data Privacy Act erasure requests."""
     if not delete_student_profile(student_id):
         raise HTTPException(status_code=404, detail="Student not found")
+    queue_service.embedding_index.invalidate()
     return {"message": "Student profile deleted"}

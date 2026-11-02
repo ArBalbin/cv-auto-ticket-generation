@@ -26,8 +26,10 @@ import pytest
 APP = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP))
 
+from core.config import CONSENT_VERSION  # noqa: E402
 from services import queue_service  # noqa: E402
 from services.queue_tracker import QueueTracker, QueueZone  # noqa: E402
+from services.embedding_index import EmbeddingIndex  # noqa: E402
 from routers import students  # noqa: E402
 
 # Settings copied from the deployed tracker so the tests exercise the real
@@ -83,6 +85,14 @@ def system(monkeypatch):
     tickets: list[int] = []
     monkeypatch.setattr(queue_service, "get_all_active_embeddings",
                         lambda: [(sid, v.tolist()) for sid, v in enrolled.items()])
+    # Every synthetic student has agreed to the data-privacy notice; joining
+    # the queue checks for it.
+    monkeypatch.setattr(students, "get_student_by_id",
+                        lambda sid: {"id": sid, "consent_version": CONSENT_VERSION})
+    monkeypatch.setattr(students, "touch_student_activity", lambda sid: None)
+    # Tests enrol students as they go, so the index must reload every time.
+    monkeypatch.setattr(queue_service, "embedding_index", EmbeddingIndex(
+        loader=lambda: [(sid, v.tolist()) for sid, v in enrolled.items()], ttl_seconds=0))
     monkeypatch.setattr(queue_service, "record_face_match_event",
                         lambda *a, **k: events.append(a))
     monkeypatch.setattr(queue_service, "record_recognition_metric", lambda *a, **k: None)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import socket
+import threading
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,14 +33,19 @@ from core.config import (
     TRUSTED_HOSTS,
     validate_cloud_config,
 )
-from database.database_handler import warm_up_db_pool
-from routers import auth, crowd, detector_api, health, queue, students
+from database.database_handler import ensure_privacy_columns, warm_up_db_pool
+from routers import auth, crowd, detector_api, health, queue, retention, students
+from services import retention_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_cloud_config()
     warm_up_db_pool()
+    # Consent and retention columns; in the background so a slow database
+    # never delays startup past the platform's health check.
+    threading.Thread(target=ensure_privacy_columns, name="privacy-migration", daemon=True).start()
+    retention_service.start_scheduler()
     yield
 
 
@@ -104,6 +110,7 @@ app.include_router(detector_api.router)
 app.include_router(crowd.router)
 app.include_router(queue.router)
 app.include_router(students.router)
+app.include_router(retention.router)
 app.include_router(health.router)
 
 

@@ -37,10 +37,16 @@ from database.database_handler import (
 )
 from services.queue_tracker import QueueTracker, QueueZone
 from services import face_service, ticket_service
-from services.ticket_printer import delete_all_tickets
+from services.embedding_index import EmbeddingIndex
+from services.ticket_printer import delete_all_tickets, invalidate_ticket_cache
 
 queue_zone = QueueZone(x1=10, y1=10, x2=1910, y2=1070)
 queue_tracker = QueueTracker(zone=queue_zone)
+
+# One shared index of enrolled faces for every 1:N match (queue camera, face
+# login, duplicate-enrolment check). The loader looks the database function up
+# at call time so tests can substitute it.
+embedding_index = EmbeddingIndex(loader=lambda: get_all_active_embeddings())
 
 _REMAP_IOU_THRESH = QUEUE_REMAP_IOU_THRESH
 _REMAP_DIST_THRESH = QUEUE_REMAP_DIST_THRESH
@@ -283,12 +289,8 @@ def _try_link_students(raw_tracked: list) -> None:
 
         try:
             live_embedding = np.array(embedding, dtype=np.float32)
-            candidates = [
-                (student_id, face_service.embedding_from_json(emb))
-                for student_id, emb in get_all_active_embeddings()
-            ]
-            match = face_service.match_student(
-                live_embedding, candidates,
+            match = embedding_index.match(
+                live_embedding,
                 match_threshold=FACE_MATCH_THRESHOLD,
                 margin_threshold=FACE_MARGIN_THRESHOLD,
             )
@@ -463,8 +465,18 @@ def is_queue_number_active(queue_number: int) -> bool:
         for p in queue_tracker.active_queue.values()
     )
 
+def _update_status_then_invalidate(queue_number: int, status: str, actor_username: str | None) -> None:
+    """Persist a status change, then drop the ticket from the validation cache
+    so the student's next status poll sees it at once."""
+    try:
+        update_queue_status(queue_number, status, actor_username)
+    finally:
+        invalidate_ticket_cache(queue_number)
+
+
 def reset_queue(actor_username: str | None = None) -> None:
     global queue_tracker
+    invalidate_ticket_cache()
     deleted = delete_all_tickets()
     print(f"[Reset] Deleted {deleted} ticket PDF(s)")
     queue_tracker = QueueTracker(zone=queue_zone)
@@ -480,8 +492,9 @@ def mark_done(queue_number: int, actor_username: str | None = None) -> dict | No
     if not queue_tracker.mark_transaction_done(queue_number):
         return None
 
+    invalidate_ticket_cache(queue_number)
     threading.Thread(
-        target=update_queue_status,
+        target=_update_status_then_invalidate,
         args=(queue_number, "served", actor_username),
         daemon=True,
         name=f"DBUpdate-Q{queue_number:03d}-served",
@@ -495,8 +508,9 @@ def mark_no_show(queue_number: int, actor_username: str | None = None) -> dict |
     if not queue_tracker.mark_no_show(queue_number):
         return None
 
+    invalidate_ticket_cache(queue_number)
     threading.Thread(
-        target=update_queue_status,
+        target=_update_status_then_invalidate,
         args=(queue_number, "no_show", actor_username),
         daemon=True,
         name=f"DBUpdate-Q{queue_number:03d}-noshow",
@@ -819,24 +833,49 @@ def _fallback_person_from_ticket(record: dict, position: int) -> dict:
 _WAITING_RECORDS_TTL_SECONDS = 10.0
 _waiting_records_cache: list[dict] = []
 _waiting_records_read_at = 0.0
+_waiting_records_refreshing = False
 _waiting_records_lock = threading.Lock()
 
+
+def _refresh_waiting_records() -> list[dict]:
+    global _waiting_records_cache, _waiting_records_read_at, _waiting_records_refreshing
+    try:
+        records = fetch_waiting_queue_records()
+        with _waiting_records_lock:
+            _waiting_records_cache = records
+            _waiting_records_read_at = time.monotonic()
+        return records
+    finally:
+        with _waiting_records_lock:
+            _waiting_records_refreshing = False
+
+
 def _waiting_queue_records() -> list[dict]:
-    global _waiting_records_cache, _waiting_records_read_at
+    """Stale-while-revalidate. Under load, every request that found the window
+    expired used to read the database at once, and each paid seconds for the
+    round trip. Now a single background read refreshes the list while callers
+    keep the last one; only the very first call, with nothing cached, waits."""
+    global _waiting_records_refreshing
 
     with _waiting_records_lock:
         age = time.monotonic() - _waiting_records_read_at
         if _waiting_records_read_at and age < _WAITING_RECORDS_TTL_SECONDS:
             return _waiting_records_cache
+        have_previous = bool(_waiting_records_read_at)
+        start_refresh = not _waiting_records_refreshing
+        if start_refresh:
+            _waiting_records_refreshing = True
+        previous = _waiting_records_cache
 
-    # Deliberately outside the lock: a slow database must not block every
-    # other request, and the worst case is two callers reading at once.
-    records = fetch_waiting_queue_records()
-
-    with _waiting_records_lock:
-        _waiting_records_cache = records
-        _waiting_records_read_at = time.monotonic()
-    return records
+    if have_previous:
+        if start_refresh:
+            threading.Thread(
+                target=_refresh_waiting_records, daemon=True, name="WaitingRecordsRefresh"
+            ).start()
+        return previous
+    if start_refresh:
+        return _refresh_waiting_records()
+    return previous
 
 def live_or_db_active_queue() -> list[dict]:
     queue_state = queue_tracker.get_state()

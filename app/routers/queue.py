@@ -5,7 +5,7 @@ import state
 from database.database_handler import get_db_pool
 from core.security import require_staff
 from services import queue_service
-from services.ticket_printer import get_ticket_record_by_short_code
+from services.ticket_printer import TicketLookupBusy, get_ticket_record_by_short_code
 
 
 router = APIRouter()
@@ -75,7 +75,10 @@ def queue_status(q: int, token: str):
             status_code=503,
             detail="Service temporarily unavailable.",
         )
-    ticket_record = get_ticket_record_by_short_code(token, q, db_pool)
+    try:
+        ticket_record = get_ticket_record_by_short_code(token, q, db_pool)
+    except TicketLookupBusy:
+        raise HTTPException(status_code=503, detail="Server is busy. Please try again shortly.")
     if not ticket_record:
         raise HTTPException(
             status_code=401,
@@ -119,11 +122,14 @@ def queue_on_way(body: OnWayBody):
         )
 
     token = body.token.strip().upper()
-    ticket_record = get_ticket_record_by_short_code(
-        token,
-        body.queue_number,
-        db_pool,
-    )
+    try:
+        ticket_record = get_ticket_record_by_short_code(
+            token,
+            body.queue_number,
+            db_pool,
+        )
+    except TicketLookupBusy:
+        raise HTTPException(status_code=503, detail="Server is busy. Please try again shortly.")
     if not ticket_record:
         raise HTTPException(
             status_code=401,

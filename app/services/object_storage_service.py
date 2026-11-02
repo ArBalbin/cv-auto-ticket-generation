@@ -36,9 +36,18 @@ def is_configured() -> bool:
 
 
 def _client_config():
+    # Since boto3 1.36 every upload carries a CRC checksum header by default.
+    # S3-compatible stores such as Supabase Storage reject it, and the upload
+    # fails with an empty "An error occurred () when calling the PutObject
+    # operation" while reads keep working. Send checksums only when the
+    # operation requires them, as boto3 did before.
+    options = {
+        "request_checksum_calculation": "when_required",
+        "response_checksum_validation": "when_required",
+    }
     if OBJECT_STORAGE_ADDRESSING_STYLE in {"path", "virtual"}:
-        return Config(s3={"addressing_style": OBJECT_STORAGE_ADDRESSING_STYLE})
-    return None
+        options["s3"] = {"addressing_style": OBJECT_STORAGE_ADDRESSING_STYLE}
+    return Config(**options)
 
 
 def client():
@@ -139,7 +148,12 @@ def upload_ticket_pdf(pdf_path: str, queue_number: int) -> dict | None:
             Key=key,
             ExtraArgs={"ContentType": "application/pdf"},
         )
-    except (BotoCoreError, ClientError) as exc:
+    except Exception as exc:
+        # upload_file wraps a failed PutObject in boto3's S3UploadFailedError,
+        # which is neither a BotoCoreError nor a ClientError. Catching only
+        # those let a storage outage escape and abort the whole ticket, so the
+        # student never received a short code and the app sat on "Join the
+        # Queue". Storage is optional: the ticket keeps its local path.
         print(f"[ObjectStorage] Ticket upload failed: {exc}")
         return None
 

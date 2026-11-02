@@ -3,6 +3,8 @@ import io
 import jwt
 import secrets
 import string
+import threading
+import time
 import qrcode
 from datetime import datetime, timezone, timedelta
 from PIL import Image
@@ -90,17 +92,77 @@ def validate_jwt_token(token: str) -> dict | None:
 
 
 def validate_short_code(short_code: str, queue_number: int, db_pool) -> dict | None:
-    record = get_ticket_record_by_short_code(short_code, queue_number, db_pool)
+    try:
+        record = get_ticket_record_by_short_code(short_code, queue_number, db_pool)
+    except TicketLookupBusy:
+        return None
     if not record or record.get("status") != "waiting":
         return None
     return record.get("jwt_payload")
 
 
-def get_ticket_record_by_short_code(
-    short_code: str,
-    queue_number: int,
-    db_pool,
-) -> dict | None:
+# Every waiting student's app polls its ticket status every few seconds, and
+# each poll used to take a database connection just to re-validate the same
+# ticket. At a few hundred simultaneous students that exhausted the connection
+# pool. A ticket that was valid and waiting a moment ago is still valid now, so
+# it is remembered briefly; anything that changes a ticket's status calls
+# invalidate_ticket_cache(), and the TTL bounds staleness for anything else.
+_TICKET_CACHE_TTL_SECONDS = 10.0
+# How long past expiry a cached ticket may still answer when the database is
+# busy or unreachable, rather than telling a valid ticket-holder "invalid".
+_TICKET_STALE_GRACE_SECONDS = 60.0
+# A short code that does not exist is remembered briefly too, so a client
+# polling a wrong code cannot make every poll a database read.
+_TICKET_MISS_TTL_SECONDS = 3.0
+# Longest a poll waits for another poll of the same ticket to finish reading.
+_TICKET_LOCK_WAIT_SECONDS = 3.0
+_ticket_cache: dict[tuple[str, int], tuple[float, dict | None]] = {}
+_ticket_cache_lock = threading.Lock()
+_ticket_key_locks: dict[tuple[str, int], threading.Lock] = {}
+_MISSING = object()
+
+
+class TicketLookupBusy(Exception):
+    """The ticket could not be checked right now (database busy). Callers
+    answer 503 "try again" rather than calling a valid ticket invalid."""
+
+
+def invalidate_ticket_cache(queue_number: int | None = None) -> None:
+    """Forget cached tickets: one queue number, or all of them."""
+    with _ticket_cache_lock:
+        if queue_number is None:
+            _ticket_cache.clear()
+            _ticket_key_locks.clear()
+        else:
+            for key in [k for k in _ticket_cache if k[1] == queue_number]:
+                _ticket_cache.pop(key, None)
+
+
+def _cached_ticket(key, now: float, allow_stale: bool = False):
+    """The cached answer: a ticket dict, None for a known-missing ticket, or
+    _MISSING when nothing usable is cached."""
+    with _ticket_cache_lock:
+        hit = _ticket_cache.get(key)
+    if not hit:
+        return _MISSING
+    expires, row = hit
+    if row is None:
+        return None if expires > now else _MISSING
+    if expires > now or (allow_stale and expires + _TICKET_STALE_GRACE_SECONDS > now):
+        return dict(row)
+    return _MISSING
+
+
+def _ticket_key_lock(key) -> threading.Lock:
+    with _ticket_cache_lock:
+        lock = _ticket_key_locks.get(key)
+        if lock is None:
+            lock = _ticket_key_locks[key] = threading.Lock()
+        return lock
+
+
+def _fetch_ticket_row(short_code: str, queue_number: int, db_pool) -> dict | None:
+    conn = cursor = None
     try:
         conn   = db_pool.get_connection()
         cursor = conn.cursor(dictionary=True)
@@ -115,20 +177,104 @@ def get_ticket_record_by_short_code(
             "LIMIT 1",
             (short_code, queue_number)
         )
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        return cursor.fetchone()
+    finally:
+        # Always hand the connection back; an exception used to leak it.
+        for resource in (cursor, conn):
+            try:
+                if resource is not None:
+                    resource.close()
+            except Exception:
+                pass
+
+
+def _refresh_ticket_in_background(key, short_code, queue_number, db_pool, lock) -> None:
+    """Re-read one cached ticket; the caller already holds its key lock."""
+    try:
+        row = _fetch_ticket_row(short_code, queue_number, db_pool)
+        now = time.monotonic()
+        payload = validate_jwt_token(row["jwt_token"]) if row else None
+        with _ticket_cache_lock:
+            if row and payload and row.get("status") == "waiting":
+                row["jwt_payload"] = payload
+                _ticket_cache[key] = (now + _TICKET_CACHE_TTL_SECONDS, dict(row))
+            else:
+                # No longer a waiting ticket: drop it so the next poll reads
+                # the database and reports the real status.
+                _ticket_cache.pop(key, None)
+    except Exception as e:
+        print(f"[JWT] background refresh failed: {e}")
+    finally:
+        lock.release()
+
+
+def get_ticket_record_by_short_code(
+    short_code: str,
+    queue_number: int,
+    db_pool,
+) -> dict | None:
+    key = (str(short_code).strip().upper(), int(queue_number))
+    now = time.monotonic()
+    cached = _cached_ticket(key, now)
+    if cached is not _MISSING:
+        return cached
+
+    # Expired but recent: answer from the cache at once and refresh it in the
+    # background, so no poll waits on the database at the moment of expiry.
+    # A status change (served, no-show, reset) removes the entry outright, so
+    # this never answers with a status that staff have already changed.
+    stale = _cached_ticket(key, now, allow_stale=True)
+    if stale is not _MISSING:
+        lock = _ticket_key_lock(key)
+        if lock.acquire(blocking=False):
+            threading.Thread(
+                target=_refresh_ticket_in_background,
+                args=(key, short_code, queue_number, db_pool, lock),
+                daemon=True,
+                name="TicketRefresh",
+            ).start()
+        return stale
+
+    # One poll per ticket refreshes it; the others arriving at the same moment
+    # wait for that answer. Without this, every poller of a ticket missed the
+    # cache together the instant it expired and each took a connection. The
+    # wait is bounded, so a slow database can never tie up every worker thread.
+    lock = _ticket_key_lock(key)
+    if not lock.acquire(timeout=_TICKET_LOCK_WAIT_SECONDS):
+        stale = _cached_ticket(key, time.monotonic(), allow_stale=True)
+        if stale is not _MISSING:
+            return stale
+        raise TicketLookupBusy()
+    try:
+        now = time.monotonic()
+        cached = _cached_ticket(key, now)
+        if cached is not _MISSING:
+            return cached
+        try:
+            row = _fetch_ticket_row(short_code, queue_number, db_pool)
+        except Exception as e:
+            print(f"[JWT] DB error during validation: {e}")
+            # The database is busy: answer with what was known moments ago.
+            stale = _cached_ticket(key, now, allow_stale=True)
+            if stale is not _MISSING:
+                return stale
+            raise TicketLookupBusy() from e
+
         if not row:
             print("[JWT] Short code not found or queue number mismatch")
+            with _ticket_cache_lock:
+                _ticket_cache[key] = (now + _TICKET_MISS_TTL_SECONDS, None)
             return None
         payload = validate_jwt_token(row["jwt_token"])
         if not payload:
             return None
         row["jwt_payload"] = payload
+        if row.get("status") == "waiting":
+            with _ticket_cache_lock:
+                _ticket_cache[key] = (now + _TICKET_CACHE_TTL_SECONDS, dict(row))
         return row
-    except Exception as e:
-        print(f"[JWT] DB error during validation: {e}")
-        return None
+    finally:
+        lock.release()
 
 # TICKET DELETION
 def delete_ticket(pdf_path: str) -> bool:

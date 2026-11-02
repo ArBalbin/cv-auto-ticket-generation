@@ -29,8 +29,11 @@ import sys
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).parent.parent
+# Staff credentials for seeding the ticket live in the gitignored .env.
+load_dotenv(ROOT / ".env")
 LOCUSTFILE = Path(__file__).parent / "locustfile.py"
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -56,8 +59,11 @@ def seed_ticket(host: str, username: str, password: str) -> tuple[str, str] | No
         headers = {"Authorization": f"Bearer {token}"}
 
         # A high number, clear of both kiosk tickets and the face-only range,
-        # so the seeded entry is obviously synthetic in any later report.
-        queue_number = 9001
+        # so the seeded entry is obviously synthetic in any later report. It
+        # varies per run: the backend accepts each number once per day, so a
+        # fixed 9001 made every run after the first fall back to not-found.
+        import random
+        queue_number = random.randint(9001, 9999)
         created = session.post(
             f"{host}/api/queue/force-new",
             json={"queue_number": queue_number, "is_walkin": True},
@@ -186,6 +192,12 @@ def main() -> None:
                         help="Leave the seeded ticket in place after the run "
                              "(default is to delete it, so the queue and the "
                              "display board are not left holding a fake entry).")
+    parser.add_argument("--prefix", default=None,
+                        help="Name for the result CSVs, e.g. scale_200_users, so a "
+                             "new run does not overwrite the files of an earlier one.")
+    parser.add_argument("--profile", choices=["equal", "realistic"], default="equal",
+                        help="equal: each user class equally common (the original runs). "
+                             "realistic: mostly students polling tickets, a few screens and staff.")
     parser.add_argument("--staff-user", default=os.getenv("LOAD_TEST_STAFF_USERNAME", "testadmin"))
     parser.add_argument("--staff-pass", default=os.getenv("LOAD_TEST_STAFF_PASSWORD", ""))
     args = parser.parse_args()
@@ -201,6 +213,7 @@ def main() -> None:
 
     env = os.environ.copy()
     env["LOAD_TEST_STAFF_USERNAME"] = args.staff_user
+    env["LOAD_TEST_PROFILE"] = args.profile
     if args.staff_pass:
         env["LOAD_TEST_STAFF_PASSWORD"] = args.staff_pass
 
@@ -221,7 +234,7 @@ def main() -> None:
         print("  Reset the queue before collecting real data.")
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    prefix = RESULTS_DIR / ("full" if args.with_camera else "readonly")
+    prefix = RESULTS_DIR / (args.prefix or ("full" if args.with_camera else "readonly"))
 
     cmd = [
         sys.executable, "-m", "locust",

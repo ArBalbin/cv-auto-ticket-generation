@@ -42,7 +42,11 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 
 
 def _is_pool_exhausted(exc: Exception) -> bool:
-    return exc.__class__.__name__ == "PoolExhausted"
+    # mysql-connector raises PoolError("... pool exhausted"), not a class named
+    # PoolExhausted; matching only that name turned a busy moment into a 500.
+    if exc.__class__.__name__ in ("PoolExhausted", "PoolError"):
+        return True
+    return "pool exhausted" in str(exc).lower()
 
 
 def _is_operational_error(exc: Exception) -> bool:

@@ -91,11 +91,18 @@ CREATE TABLE `student_profiles` (
   `last_login`              datetime     DEFAULT NULL,
   `face_enrolled_at`        datetime     DEFAULT NULL,
   `updated_at`              datetime     DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+  -- Data-privacy consent and retention (2026_11_privacy_retention_migration.sql)
+  `consent_version`         varchar(32)  DEFAULT NULL,
+  `consented_at`            datetime     DEFAULT NULL,
+  `last_active_at`          datetime     DEFAULT NULL,
+  `archived_at`             datetime     DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_school_id`  (`school_id`),
   UNIQUE KEY `uq_gbox_email` (`gbox_email`),
   UNIQUE KEY `uq_google_sub` (`google_sub`),
   KEY `idx_is_active` (`is_active`),
+  KEY `idx_last_active_at` (`last_active_at`),
+  KEY `idx_archived_at` (`archived_at`),
   KEY `fk_student_profiles_enrolled_by` (`enrolled_by_user_id`),
   CONSTRAINT `fk_student_profiles_enrolled_by`
     FOREIGN KEY (`enrolled_by_user_id`) REFERENCES `users` (`id`)
