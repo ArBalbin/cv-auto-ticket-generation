@@ -122,7 +122,10 @@ STAFF_REGISTRATION_CODE = os.getenv("STAFF_REGISTRATION_CODE", "").strip()
 # verify the "aud" claim on every Google ID token the app sends us.
 GBOX_ALLOWED_DOMAIN = os.getenv("GBOX_ALLOWED_DOMAIN", "gbox.ncf.edu.ph").strip()
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
-STUDENT_SESSION_TTL_SECONDS = env_int("STUDENT_SESSION_TTL_SECONDS", 60 * 60 * 24 * 30)
+# 12 hours, down from 30 days. The mobile app already signs a student out
+# after 30 idle minutes (unless they are in the queue); this caps how long a
+# session token stays usable at all, e.g. one left on a lost or shared phone.
+STUDENT_SESSION_TTL_SECONDS = env_int("STUDENT_SESSION_TTL_SECONDS", 60 * 60 * 12)
 
 HISTORY_LEN = 60
 
