@@ -369,12 +369,13 @@ File:
 
 ```text
 app/services/prediction_service.py
+app/services/wait_model.py
 ```
 
 Responsibilities:
 
 - Estimates arrival rate.
-- Computes current wait-time baseline.
+- Computes the current wait from the trained model.
 - Computes forecasted wait times.
 - Tracks recent count history.
 
@@ -382,7 +383,7 @@ Algorithms:
 
 ```text
 arrival rate estimation
-M/M/c queueing approximation
+median regression on people ahead (trained, see WAIT_TIME_MODEL.md)
 linear trend projection
 Holt double exponential smoothing
 mean-reversion forecast

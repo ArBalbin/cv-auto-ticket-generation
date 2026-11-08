@@ -660,6 +660,7 @@ Main file:
 
 ```text
 app/services/prediction_service.py
+app/services/wait_model.py
 ```
 
 Input:
@@ -676,7 +677,7 @@ Processing:
 
 ```text
 arrival rate estimation
-M/M/c queueing model
+trained wait-time model (median regression on people ahead)
 linear trend projection
 Holt double exponential smoothing
 longer-term mean-reversion forecast

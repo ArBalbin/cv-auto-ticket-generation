@@ -223,6 +223,26 @@ this project makes no claim to have improved it.
 > kept. Every threshold in this document is the `.env` value where one is
 > set, because that is what actually runs.)*
 
+## A5. Wait-time model
+
+**Script:** `ML/train_wait_model.py` → `Model/wait_time_model.json`
+**Details:** `WAIT_TIME_MODEL.md`
+**Dataset:** 528 observed transactions, 14 days, 2–19 October 2026
+**Validation:** leave-one-day-out, pooled over all held-out predictions
+
+| Predictor | MAE (min) | RMSE (min) | R² | MAPE (non-zero waits) |
+|---|---:|---:|---:|---:|
+| Median regression on people ahead (**deployed**) | 3.00 | 5.90 | −0.04 | 72.2% |
+| Constant 2 minutes | 2.99 | 6.13 | −0.12 | 59.7% |
+| Previous position rule | 5.33 | 10.40 | −2.22 | 232.2% |
+| Previous queueing formula | 16.58 | 46.89 | −64.48 | 772.5% |
+
+The deployed model ties the constant on MAE (difference −0.02 min, 95% CI −0.28
+to +0.17); it was chosen because it responds to the queue. These are offline
+figures. Live waits have not been compared with the running system.
+
+---
+
 ---
 
 # PART B — ESTIMATED BEHAVIOUR (May 2026, not measured)

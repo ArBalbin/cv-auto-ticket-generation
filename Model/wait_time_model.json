@@ -1,0 +1,211 @@
+{
+  "model": "Median regression of waiting time on people ahead",
+  "version": "2026-11-08",
+  "base_minutes": 1.1214,
+  "minutes_per_person": 0.1445,
+  "reference_counters": 3,
+  "usual_range": {
+    "lower_offset_min": -1.86,
+    "upper_offset_min": 6.87,
+    "nominal_coverage": 0.8,
+    "heldout_coverage": 0.799
+  },
+  "training_data": {
+    "file": "ncf_cashier_department_clean.csv",
+    "sha256": "1840f486f07dc5940c7837024d21449ecd005ceaa2a0a527bea8e3d6fc13d495",
+    "people_ahead": "reconstructed from ticket numbers",
+    "transactions": 528,
+    "transactions_fitted": 511,
+    "days": [
+      "2026-10-02",
+      "2026-10-03",
+      "2026-10-05",
+      "2026-10-06",
+      "2026-10-07",
+      "2026-10-08",
+      "2026-10-09",
+      "2026-10-10",
+      "2026-10-12",
+      "2026-10-13",
+      "2026-10-15",
+      "2026-10-16",
+      "2026-10-17",
+      "2026-10-19"
+    ]
+  },
+  "validation": {
+    "scheme": "leave-one-day-out, 14 folds, pooled over all 528 held-out predictions",
+    "predictors": {
+      "Median regression on people ahead (deployed)": {
+        "MAE": 3.004,
+        "RMSE": 5.9,
+        "R2": -0.037,
+        "MAPE_pct_nonzero_waits": 72.2,
+        "WAPE_pct": 75.2,
+        "within_2_min_pct": 66.3,
+        "within_5_min_pct": 85.4
+      },
+      "Same, with a cap chosen on the training days": {
+        "MAE": 2.91,
+        "RMSE": 5.983,
+        "R2": -0.066,
+        "MAPE_pct_nonzero_waits": 61.9,
+        "WAPE_pct": 72.8,
+        "within_2_min_pct": 71.0,
+        "within_5_min_pct": 86.6
+      },
+      "Constant median (aiprediction production model)": {
+        "MAE": 2.985,
+        "RMSE": 6.129,
+        "R2": -0.119,
+        "MAPE_pct_nonzero_waits": 59.7,
+        "WAPE_pct": 74.7,
+        "within_2_min_pct": 75.0,
+        "within_5_min_pct": 86.7
+      },
+      "Previous position rule": {
+        "MAE": 5.333,
+        "RMSE": 10.395,
+        "R2": -2.218,
+        "MAPE_pct_nonzero_waits": 232.2,
+        "WAPE_pct": 133.5,
+        "within_2_min_pct": 56.1,
+        "within_5_min_pct": 75.6
+      },
+      "Previous queueing formula": {
+        "MAE": 16.575,
+        "RMSE": 46.893,
+        "R2": -64.484,
+        "MAPE_pct_nonzero_waits": 772.5,
+        "WAPE_pct": 414.8,
+        "within_2_min_pct": 31.4,
+        "within_5_min_pct": 54.0
+      }
+    },
+    "mae_reduction_against_constant": {
+      "minutes": -0.02,
+      "ci95": [
+        -0.28,
+        0.172
+      ]
+    },
+    "per_day": {
+      "2026-10-02": {
+        "tickets": 21,
+        "deployed_MAE": 1.504,
+        "constant_MAE": 1.571
+      },
+      "2026-10-03": {
+        "tickets": 11,
+        "deployed_MAE": 0.989,
+        "constant_MAE": 1.091
+      },
+      "2026-10-05": {
+        "tickets": 78,
+        "deployed_MAE": 1.744,
+        "constant_MAE": 1.885
+      },
+      "2026-10-06": {
+        "tickets": 83,
+        "deployed_MAE": 2.292,
+        "constant_MAE": 2.012
+      },
+      "2026-10-07": {
+        "tickets": 38,
+        "deployed_MAE": 1.716,
+        "constant_MAE": 1.658
+      },
+      "2026-10-08": {
+        "tickets": 32,
+        "deployed_MAE": 1.444,
+        "constant_MAE": 1.312
+      },
+      "2026-10-09": {
+        "tickets": 25,
+        "deployed_MAE": 1.462,
+        "constant_MAE": 1.16
+      },
+      "2026-10-10": {
+        "tickets": 3,
+        "deployed_MAE": 2.489,
+        "constant_MAE": 0.667
+      },
+      "2026-10-12": {
+        "tickets": 23,
+        "deployed_MAE": 2.664,
+        "constant_MAE": 1.174
+      },
+      "2026-10-13": {
+        "tickets": 30,
+        "deployed_MAE": 2.047,
+        "constant_MAE": 2.067
+      },
+      "2026-10-15": {
+        "tickets": 30,
+        "deployed_MAE": 2.291,
+        "constant_MAE": 2.8
+      },
+      "2026-10-16": {
+        "tickets": 35,
+        "deployed_MAE": 2.163,
+        "constant_MAE": 2.143
+      },
+      "2026-10-17": {
+        "tickets": 10,
+        "deployed_MAE": 0.97,
+        "constant_MAE": 1.1
+      },
+      "2026-10-19": {
+        "tickets": 109,
+        "deployed_MAE": 7.204,
+        "constant_MAE": 7.541
+      }
+    },
+    "estimates_shown_live": null,
+    "chronological_test": {
+      "train_days": [
+        "2026-10-02",
+        "2026-10-03",
+        "2026-10-05",
+        "2026-10-06",
+        "2026-10-07",
+        "2026-10-08",
+        "2026-10-09",
+        "2026-10-10",
+        "2026-10-12",
+        "2026-10-13",
+        "2026-10-15",
+        "2026-10-16"
+      ],
+      "test_days": [
+        "2026-10-17",
+        "2026-10-19"
+      ],
+      "test_transactions": 119,
+      "fit_on_training_days": {
+        "base_minutes": 1.8,
+        "minutes_per_person": 0.0333
+      },
+      "predictors": {
+        "Median regression on people ahead (deployed)": {
+          "MAE": 6.689,
+          "RMSE": 11.069,
+          "R2": -0.227,
+          "MAPE_pct_nonzero_waits": 72.0,
+          "WAPE_pct": 83.5,
+          "within_2_min_pct": 48.7,
+          "within_5_min_pct": 65.5
+        },
+        "Constant median (aiprediction production model)": {
+          "MAE": 7.0,
+          "RMSE": 11.659,
+          "R2": -0.362,
+          "MAPE_pct_nonzero_waits": 70.5,
+          "WAPE_pct": 87.4,
+          "within_2_min_pct": 55.5,
+          "within_5_min_pct": 65.5
+        }
+      }
+    }
+  }
+}

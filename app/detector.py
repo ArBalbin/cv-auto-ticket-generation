@@ -92,7 +92,7 @@ CAM_RETRY_SLEEP = float(os.getenv("CAM_RETRY_SLEEP", "2.0"))
 CAM_MAX_RETRIES = int(os.getenv("CAM_MAX_RETRIES",   "30"))
 
 QUEUE_CONFIG = {
-    "avg_service_time": float(os.getenv("AVG_SERVICE_TIME", "3.0")),
+    "avg_service_time": float(os.getenv("AVG_SERVICE_TIME", "2.0")),
     "num_counters":     int(os.getenv("NUM_COUNTERS",       "3")),
 }
 

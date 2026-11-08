@@ -376,6 +376,75 @@ def _insert_queue_event(
     )
 
 
+# What the system estimated when a number was issued, and when that person was
+# actually called to a counter. Together they let the wait-time model be
+# checked against real waits, and re-fitted on exact queue counts instead of
+# the reconstruction it was trained on (WAIT_TIME_MODEL.md).
+_WAIT_LOG_ISSUE_COLUMNS = {
+    "people_ahead_at_issue": "INT DEFAULT NULL",
+    "active_counters_at_issue": "TINYINT DEFAULT NULL",
+    "predicted_wait_min": "DECIMAL(6,1) DEFAULT NULL",
+    "wait_model_version": "VARCHAR(32) DEFAULT NULL",
+}
+_WAIT_LOG_COLUMNS = {**_WAIT_LOG_ISSUE_COLUMNS, "called_at": "DATETIME DEFAULT NULL"}
+
+
+def ensure_wait_log_columns() -> bool:
+    """Add the wait-log columns to queue_records if missing.
+
+    Idempotent; runs at startup. Mirrors
+    database_sql/2026_11_wait_log_migration.sql for databases that are
+    migrated by hand."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return False
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor()
+        _add_missing_columns(cursor, "queue_records", _WAIT_LOG_COLUMNS)
+        conn.commit()
+        return True
+    except Exception as exc:
+        print(f"[DB] Wait-log column migration failed: {exc}")
+        return False
+    finally:
+        _table_columns_cache.pop("queue_records", None)
+        close_db_resources(cursor, conn)
+
+
+def fetch_wait_observations() -> list[dict]:
+    """Served tickets that carry both the logged estimate and the call time.
+    Read-only; used by ML/export_wait_log.py."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return []
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if not set(_WAIT_LOG_COLUMNS) <= _get_table_columns(cursor, "queue_records"):
+            print("[DB] queue_records has no wait-log columns yet")
+            return []
+        cursor.execute(
+            """
+            SELECT service_date, queue_number, created_at, called_at, served_at,
+                   people_ahead_at_issue, active_counters_at_issue,
+                   predicted_wait_min, wait_model_version
+            FROM queue_records
+            WHERE status = 'served'
+              AND called_at IS NOT NULL
+              AND people_ahead_at_issue IS NOT NULL
+            ORDER BY created_at
+            """
+        )
+        return cursor.fetchall() or []
+    finally:
+        close_db_resources(cursor, conn)
+
+
 def save_ticket_record(ticket: dict) -> bool:
     pool = _ensure_db_pool()
     if pool is None:
@@ -406,6 +475,12 @@ def save_ticket_record(ticket: dict) -> bool:
             "linked_via = VALUES(linked_via), linked_at = VALUES(linked_at)"
             if has_identity_cols else ""
         )
+        # The wait estimate logged at issue, on schemas that have the columns.
+        wait_cols = [c for c in _WAIT_LOG_ISSUE_COLUMNS if c in columns and c in ticket]
+        identity_fields += "".join(f", {c}" for c in wait_cols)
+        identity_placeholders += ", %s" * len(wait_cols)
+        identity_values += tuple(ticket[c] for c in wait_cols)
+        identity_update += "".join(f", {c} = VALUES({c})" for c in wait_cols)
 
         if "service_date" in columns:
             cursor.execute(
@@ -479,6 +554,7 @@ def update_queue_status(
     queue_number: int,
     status: str,
     actor_username: str | None = None,
+    called_seconds_ago: int | None = None,
 ) -> None:
     if status not in {"served", "no_show", "expired"}:
         print(f"[DB] Ignored unsupported status '{status}' for Q{queue_number:03d}")
@@ -520,6 +596,9 @@ def update_queue_status(
         if status == "served" and "served_by_user_id" in columns:
             set_parts.append("served_by_user_id=%s")
             params.append(actor_user_id)
+        if called_seconds_ago is not None and "called_at" in columns:
+            set_parts.append("called_at=COALESCE(called_at, NOW() - INTERVAL %s SECOND)")
+            params.append(int(called_seconds_ago))
         params.append(record_id)
 
         cursor.execute(
@@ -735,6 +814,16 @@ def _has_privacy_columns(cursor) -> bool:
     return set(_PRIVACY_COLUMNS) <= _get_table_columns(cursor, "student_profiles")
 
 
+def _add_missing_columns(cursor, table: str, columns: dict) -> None:
+    _table_columns_cache.pop(table, None)
+    present = _get_table_columns(cursor, table)
+    for column, ddl in columns.items():
+        if column not in present:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            print(f"[DB] {table}: added column {column}")
+    _table_columns_cache.pop(table, None)
+
+
 def ensure_privacy_columns() -> bool:
     """Add the consent and retention columns to student_profiles if missing.
 
@@ -749,12 +838,7 @@ def ensure_privacy_columns() -> bool:
     try:
         conn = pool.get_connection()
         cursor = conn.cursor()
-        _table_columns_cache.pop("student_profiles", None)
-        present = _get_table_columns(cursor, "student_profiles")
-        for column, ddl in _PRIVACY_COLUMNS.items():
-            if column not in present:
-                cursor.execute(f"ALTER TABLE student_profiles ADD COLUMN {column} {ddl}")
-                print(f"[DB] student_profiles: added column {column}")
+        _add_missing_columns(cursor, "student_profiles", _PRIVACY_COLUMNS)
         cursor.execute("SHOW INDEX FROM student_profiles")
         indexes = {row[2] for row in cursor.fetchall()}
         for name, column in _PRIVACY_INDEXES.items():

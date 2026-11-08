@@ -29,6 +29,9 @@ class QueuePerson:
         'on_the_way', 'on_the_way_at', 'is_manual', 'counter_number',
         'dedup_immune_frames',
         'student_id', 'is_walkin', 'linked_via', 'identity_status', 'linked_at',
+        # When a counter was first assigned: the moment the person is called.
+        # Logged at done/no-show so the real wait can be measured.
+        'called_at',
         # Evaluation instrumentation (recognition_metrics) — first_seen_at is
         # the very first frame this person appeared in, which is earlier than
         # entered_at (the moment presence was *confirmed*).
@@ -59,6 +62,7 @@ class QueuePerson:
         self.linked_via           = None
         self.identity_status      = 'linked' if queue_number is not None else 'pending_link'
         self.linked_at            = datetime.now() if queue_number is not None else None
+        self.called_at            = None
         self.first_seen_at        = None
         self.embed_attempts       = 0
         self.embed_successes      = 0
@@ -202,6 +206,9 @@ class QueueTracker:
         self._claimed_this_frame: dict    = {}
         self._lock                        = threading.RLock()
         self._num_counters                = 3
+        # Set by staff for a closure such as lunch: nobody is called to a
+        # counter before this time. Whoever is already at one keeps it.
+        self.counters_closed_until: datetime | None = None
         self._announced_numbers: set      = set()
         self._newly_called: list          = []
         self._by_queue_number: dict       = {}   # queue_number -> track_id
@@ -328,6 +335,23 @@ class QueueTracker:
     def get_position(self, queue_number: int) -> int:
         p = self._person_by_queue_number(queue_number)
         return p.position_in_line if p else 0
+
+    def get_called_at(self, queue_number: int) -> datetime | None:
+        p = self._person_by_queue_number(queue_number)
+        return p.called_at if p else None
+
+    def line_snapshot(self) -> list[dict]:
+        """The live line in order: each person's position, their counter (None
+        while still waiting) and when they were called to it."""
+        people = [
+            p for p in list(self.active_queue.values())
+            if p.queue_number is not None and p.status in ('waiting', 'missing') and p.position_in_line > 0
+        ]
+        return [
+            {"position": p.position_in_line, "queue_number": p.queue_number,
+             "counter_number": p.counter_number, "called_at": p.called_at}
+            for p in sorted(people, key=lambda p: p.position_in_line)
+        ]
 
 
     # QUEUE-NUMBER LINKING (Algorithm 2's terminal step)
@@ -1046,6 +1070,10 @@ class QueueTracker:
         for i, p in enumerate(active_line):
             p.position_in_line = i + 1
 
+        if self.counters_closed_until is not None and datetime.now() < self.counters_closed_until:
+            self._newly_called = []
+            return
+
         # Keep existing counter assignments sticky — find which counters are free
         occupied = {p.counter_number for p in active_line if p.counter_number is not None}
         free_counters = sorted(
@@ -1060,6 +1088,7 @@ class QueueTracker:
                 continue
             if p.position_in_line <= self._num_counters and free_idx < len(free_counters):
                 p.counter_number = free_counters[free_idx]
+                p.called_at = p.called_at or datetime.now()
                 free_idx += 1
                 if p.queue_number not in self._announced_numbers:
                     self._announced_numbers.add(p.queue_number)

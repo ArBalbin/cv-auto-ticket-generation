@@ -90,7 +90,8 @@ Crowd_Monitoring/
 |       |-- cache_service.py       # Optional Redis cache
 |       |-- face_service.py        # ArcFace embeddings + match decision rule
 |       |-- object_storage_service.py
-|       |-- prediction_service.py  # M/M/c + trend/Holt/mean-reversion forecasts
+|       |-- prediction_service.py  # Trend/Holt/mean-reversion forecasts
+|       |-- wait_model.py          # Trained wait-time model (WAIT_TIME_MODEL.md)
 |       |-- queue_service.py       # Queue business logic
 |       |-- queue_tracker.py       # Presence, tracking, re-entry, minting
 |       |-- ticket_printer.py      # PDF ticket, QR, JWT, short code

@@ -1,6 +1,6 @@
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -24,6 +24,8 @@ from core.config import (
     QUEUE_REMAP_IOU_THRESH,
     QUEUE_STATIC_CONF_BYPASS,
     QUEUE_STATIC_STDEV_THRESHOLD,
+    SCHOOL_UTC_OFFSET_HOURS,
+    WAIT_ESTIMATOR,
 )
 from database.database_handler import (
     fetch_waiting_queue_records,
@@ -36,7 +38,7 @@ from database.database_handler import (
     update_queue_status,
 )
 from services.queue_tracker import QueueTracker, QueueZone
-from services import face_service, ticket_service
+from services import face_service, queue_engine, ticket_service, wait_model
 from services.embedding_index import EmbeddingIndex
 from services.ticket_printer import delete_all_tickets, invalidate_ticket_cache
 
@@ -56,6 +58,12 @@ _MAX_REMAP_ABSENT_FRAMES = QUEUE_REMAP_ABSENT_FRAMES
 _REMAP_FACELESS_MAX_FRAMES = 8
 _config_lock = threading.Lock()
 
+USE_QUEUE_ENGINE = WAIT_ESTIMATOR != "regression"
+SCHOOL_TZ = timezone(timedelta(hours=SCHOOL_UTC_OFFSET_HOURS))
+# Kept here as well as on the tracker so a queue reset does not reopen
+# counters that staff closed.
+_counters_closed_until: datetime | None = None
+
 def _on_number_linked(
     queue_number: int,
     wait_time_str: str,
@@ -71,14 +79,20 @@ def _on_number_linked(
     unchanged; only the trigger event moved from "CV auto-detected someone"
     to "a real kiosk number was linked.\""""
     position = queue_tracker.get_position(queue_number)
+    counters = runtime_config()["active_counters"]
     try:
         ticket_service.enqueue_ticket(
             queue_number=queue_number,
             position=position,
-            est_wait_min=0,
+            est_wait_min=estimate_wait_for_position(position, counters),
             student_id=student_id,
             linked_via=linked_via,
             is_walkin=is_walkin,
+            # Logged with the ticket, so the estimate the student saw can
+            # later be checked against the wait they actually had.
+            people_ahead=max(0, position - 1),
+            active_counters=counters,
+            estimator_version=estimator_version(),
         )
         print(f"[QueueService] Q{queue_number:03d} ({linked_via}) queued for ticket generation")
     except Exception:
@@ -117,6 +131,7 @@ def wire_callbacks() -> None:
     queue_tracker.DEDUP_CENTRE_FRAC = 0.15
 
     queue_tracker._num_counters = max(1, int(QUEUE_CONFIG.get('num_counters', 3)))
+    queue_tracker.counters_closed_until = _counters_closed_until
 
     # Store the .env default so build_queue_prediction can label the source.
     QUEUE_CONFIG.setdefault("_default_avg_service_time",
@@ -465,13 +480,27 @@ def is_queue_number_active(queue_number: int) -> bool:
         for p in queue_tracker.active_queue.values()
     )
 
-def _update_status_then_invalidate(queue_number: int, status: str, actor_username: str | None) -> None:
+def _update_status_then_invalidate(
+    queue_number: int,
+    status: str,
+    actor_username: str | None,
+    called_seconds_ago: int | None = None,
+) -> None:
     """Persist a status change, then drop the ticket from the validation cache
     so the student's next status poll sees it at once."""
     try:
-        update_queue_status(queue_number, status, actor_username)
+        update_queue_status(queue_number, status, actor_username, called_seconds_ago=called_seconds_ago)
     finally:
         invalidate_ticket_cache(queue_number)
+
+def _seconds_since_called(queue_number: int) -> int | None:
+    """How long ago this person was called to a counter. Sent as an age, not a
+    time: created_at and served_at come from the database's clock, which need
+    not match this process's (the server is UTC, a laptop is not)."""
+    called_at = queue_tracker.get_called_at(queue_number)
+    if called_at is None:
+        return None
+    return max(0, int((datetime.now() - called_at).total_seconds()))
 
 
 def reset_queue(actor_username: str | None = None) -> None:
@@ -489,13 +518,14 @@ def reset_queue(actor_username: str | None = None) -> None:
     ).start()
 
 def mark_done(queue_number: int, actor_username: str | None = None) -> dict | None:
+    called_seconds_ago = _seconds_since_called(queue_number)
     if not queue_tracker.mark_transaction_done(queue_number):
         return None
 
     invalidate_ticket_cache(queue_number)
     threading.Thread(
         target=_update_status_then_invalidate,
-        args=(queue_number, "served", actor_username),
+        args=(queue_number, "served", actor_username, called_seconds_ago),
         daemon=True,
         name=f"DBUpdate-Q{queue_number:03d}-served",
     ).start()
@@ -505,13 +535,14 @@ def mark_no_show(queue_number: int, actor_username: str | None = None) -> dict |
     """Staff action, not a detection. A member of staff who can see the queue
     area decides that the person whose turn it is has not come, and the
     system then bumps the number and moves the queue on."""
+    called_seconds_ago = _seconds_since_called(queue_number)
     if not queue_tracker.mark_no_show(queue_number):
         return None
 
     invalidate_ticket_cache(queue_number)
     threading.Thread(
         target=_update_status_then_invalidate,
-        args=(queue_number, "no_show", actor_username),
+        args=(queue_number, "no_show", actor_username, called_seconds_ago),
         daemon=True,
         name=f"DBUpdate-Q{queue_number:03d}-noshow",
     ).start()
@@ -675,30 +706,93 @@ def format_seconds(seconds: int) -> str:
 def eta_iso(wait_minutes: float) -> str:
     return (datetime.now() + timedelta(minutes=max(0.0, wait_minutes))).isoformat()
 
-def estimate_wait_for_position(
-    position: int,
-    avg_service_time: float,
-    counters: int,
-) -> float:
+def estimator_version() -> str:
+    """Logged with each ticket, so its estimate can be traced to its method."""
+    return "queue-engine" if USE_QUEUE_ENGINE else wait_model.MODEL_VERSION
+
+def counters_closed_until() -> datetime | None:
+    until = queue_tracker.counters_closed_until
+    return until if until is not None and until > datetime.now() else None
+
+def school_time_today(clock) -> datetime:
+    """A time of day on the school's clock, today, as the server's own naive
+    local time (the form every datetime.now() in this code uses)."""
+    school_now = datetime.now(SCHOOL_TZ)
+    return datetime.combine(school_now.date(), clock, tzinfo=SCHOOL_TZ).astimezone().replace(tzinfo=None)
+
+def school_iso(moment: datetime | None) -> str | None:
+    """A server-local time as ISO 8601 with the school's offset, for clients."""
+    return moment.astimezone().astimezone(SCHOOL_TZ).isoformat() if moment else None
+
+def set_counters_closed_until(until: datetime | None) -> datetime | None:
+    """Close every counter until `until` (lunch), or reopen with None."""
+    global _counters_closed_until
+    _counters_closed_until = until
+    queue_tracker.counters_closed_until = until
+    # Reopening calls the people at the front at once, not on the next frame.
+    queue_tracker._recalculate_positions()
+    return counters_closed_until()
+
+def _waiting_ahead(line: list[dict], position: int) -> int | None:
+    """People still waiting in front of `position`, not counting those already
+    at a counter. None when the person at `position` is at a counter."""
+    if any(q["position"] == position and q["counter_number"] is not None for q in line):
+        return None
+    known = [q for q in line if q["position"] < position]
+    # Positions past the live line (the next arrival, or rows from the database
+    # while the tracker is empty) count everyone before them as waiting.
+    return sum(1 for q in known if q["counter_number"] is None) + max(0, position - 1 - len(known))
+
+def _queue_engine_wait(position: int, counters: int, service_min: float) -> float:
+    now = datetime.now()
+    line = queue_tracker.line_snapshot()
+    ahead = _waiting_ahead(line, position)
+    if ahead is None:
+        return 0.0
+    called = {q["counter_number"]: q["called_at"] for q in line if q["counter_number"] is not None}
+    closed = counters_closed_until()
+    states = [
+        queue_engine.CounterState(busy_since=called.get(n), closed_until=closed)
+        for n in range(1, max(1, counters) + 1)
+    ]
+    return queue_engine.wait_minutes(now, states, ahead, service_min)
+
+def estimate_wait_for_position(position: int, counters: int) -> float:
+    # Position 0 means not in the live line, e.g. a ticket already served.
     if position <= 0:
         return 0.0
-    counters = max(1, counters)
-    avg_service_time = max(0.1, avg_service_time)
-    batches_before = max(0, (position - 1) // counters)
-    return round(batches_before * avg_service_time, 1)
+    if USE_QUEUE_ENGINE:
+        service_min = runtime_config()["avg_service_time"]
+        return round(_queue_engine_wait(position, counters, service_min), 1)
+    return round(wait_model.predict_minutes(position - 1, counters), 1)
+
+def wait_range_fields(wait_min: float, in_line: bool = True) -> dict:
+    """The usual range around an estimate, for the app to show beside it.
+
+    The range is the spread of the regression's errors on unseen days. The
+    queue engine has no measured errors yet, so it shows no range rather than
+    borrow one that was never measured for it."""
+    if not in_line or USE_QUEUE_ENGINE:
+        return {"estimated_wait_range_minutes": [0, 0], "estimated_wait_range_label": ""}
+    low, high = wait_model.usual_range(wait_min)
+    return {
+        "estimated_wait_range_minutes": [low, high],
+        "estimated_wait_range_label": f"usually {low}–{high} mins",
+    }
 
 def prediction_for_position(
     position: int,
     avg_service_time: float,
     counters: int,
 ) -> dict:
-    wait_min = estimate_wait_for_position(position, avg_service_time, counters)
+    wait_min = estimate_wait_for_position(position, counters)
     service_min = round(max(0.1, avg_service_time), 1)
     return {
         "position": position,
         "estimated_wait_time": wait_min,
         "estimated_wait_time_minutes": wait_min,
         "estimated_wait_time_label": format_minutes(wait_min),
+        **wait_range_fields(wait_min, in_line=position > 0),
         "estimated_service_start_at": eta_iso(wait_min),
         "estimated_service_finish_at": eta_iso(wait_min + service_min),
         "estimated_service_time_min": service_min,
@@ -916,16 +1010,26 @@ def build_queue_prediction() -> dict:
     counters = config["active_counters"]
     avg_service_time = config["avg_service_time"]
     data_age_seconds = max(0.0, time.time() - as_float(metrics["timestamp"], time.time()))
-    current_wait = as_float(metrics["estimated_wait_time"], 0.0)
-    fallback_new_wait = estimate_wait_for_position(
-        queue_count + 1,
-        avg_service_time,
-        counters,
-    )
-    new_arrival_wait = round(
-        current_wait if current_wait > 0 else fallback_new_wait,
-        1,
-    )
+    if USE_QUEUE_ENGINE:
+        new_arrival_wait = estimate_wait_for_position(queue_count + 1, counters)
+        # The line ahead of a later arrival, projected with the camera's rate
+        # of growth in people per minute (never negative). Not validated.
+        growth = max(0.0, as_float(metrics["arrival_rate"], 0.0))
+        horizon_waits = {
+            h: min(120.0, estimate_wait_for_position(queue_count + 1 + round(growth * h), counters))
+            for h in (5, 15, 30)
+        }
+    else:
+        current_wait = as_float(metrics["estimated_wait_time"], 0.0)
+        fallback_new_wait = estimate_wait_for_position(queue_count + 1, counters)
+        new_arrival_wait = round(
+            current_wait if current_wait > 0 else fallback_new_wait,
+            1,
+        )
+        horizon_waits = {
+            h: as_float(metrics[f"predicted_wait_{h}min"], new_arrival_wait) for h in (5, 15, 30)
+        }
+    closed_until = counters_closed_until()
 
     people = []
     for person in active_queue:
@@ -952,12 +1056,15 @@ def build_queue_prediction() -> dict:
         "system_utilization": as_float(metrics["system_utilization"], 0.0),
         "data_age_seconds": round(data_age_seconds, 1),
         "data_status": "stale" if data_age_seconds > 15 else "live",
+        "wait_estimator": estimator_version(),
+        "counters_closed_until": school_iso(closed_until),
         "new_arrival": {
             "position": queue_count + 1,
             "estimated_wait_time": new_arrival_wait,
             "estimated_wait_time_minutes": new_arrival_wait,
             "estimated_wait_time_label": format_minutes(new_arrival_wait),
             "estimated_service_start_at": eta_iso(new_arrival_wait),
+            **wait_range_fields(new_arrival_wait),
         },
         "forecast": {
             "now": {
@@ -966,47 +1073,14 @@ def build_queue_prediction() -> dict:
                 "estimated_wait_time_minutes": round(new_arrival_wait, 1),
                 "estimated_wait_time_label": format_minutes(new_arrival_wait),
             },
-            "in_5min": {
-                "horizon_minutes": 5,
-                "estimated_wait_time": as_float(
-                    metrics["predicted_wait_5min"],
-                    new_arrival_wait,
-                ),
-                "estimated_wait_time_minutes": as_float(
-                    metrics["predicted_wait_5min"],
-                    new_arrival_wait,
-                ),
-                "estimated_wait_time_label": format_minutes(
-                    as_float(metrics["predicted_wait_5min"], new_arrival_wait)
-                ),
-            },
-            "in_15min": {
-                "horizon_minutes": 15,
-                "estimated_wait_time": as_float(
-                    metrics["predicted_wait_15min"],
-                    new_arrival_wait,
-                ),
-                "estimated_wait_time_minutes": as_float(
-                    metrics["predicted_wait_15min"],
-                    new_arrival_wait,
-                ),
-                "estimated_wait_time_label": format_minutes(
-                    as_float(metrics["predicted_wait_15min"], new_arrival_wait)
-                ),
-            },
-            "in_30min": {
-                "horizon_minutes": 30,
-                "estimated_wait_time": as_float(
-                    metrics["predicted_wait_30min"],
-                    new_arrival_wait,
-                ),
-                "estimated_wait_time_minutes": as_float(
-                    metrics["predicted_wait_30min"],
-                    new_arrival_wait,
-                ),
-                "estimated_wait_time_label": format_minutes(
-                    as_float(metrics["predicted_wait_30min"], new_arrival_wait)
-                ),
+            **{
+                f"in_{h}min": {
+                    "horizon_minutes": h,
+                    "estimated_wait_time": round(minutes, 1),
+                    "estimated_wait_time_minutes": round(minutes, 1),
+                    "estimated_wait_time_label": format_minutes(minutes),
+                }
+                for h, minutes in horizon_waits.items()
             },
         },
         "active_queue": people,

@@ -17,6 +17,8 @@ Run:  .venv/Scripts/python.exe -m pytest tests -v
 """
 import asyncio
 import sys
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -354,3 +356,116 @@ def test_counters_go_to_the_front_of_the_queue_and_stay_assigned(system):
     counters = {p["queue_number"]: p["counter_number"] for p in system.tracker.get_state()["active_queue"]}
     assert counters[numbers[0]] == 1 and counters[numbers[2]] == 3, "assignments are sticky"
     assert counters[numbers[3]] == 2, "the next student takes the freed counter"
+
+
+# ------------------------------------------------- queue engine (services/queue_engine.py)
+
+def service_minutes() -> float:
+    return queue_service.runtime_config()["avg_service_time"]
+
+
+def test_people_at_a_counter_wait_nothing_and_the_rest_wait_their_turn(system, monkeypatch):
+    monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", True)
+    for n in (5801, 5802, 5803, 5804, 5805, 5806, 5807):
+        system.tracker.force_new_person(n)
+    service = service_minutes()
+    waits = [queue_service.estimate_wait_for_position(p, 3) for p in range(1, 9)]
+
+    assert waits[:3] == [0.0, 0.0, 0.0], "three counters, three people at them"
+    assert waits[3] == waits[4] == waits[5] == pytest.approx(service, abs=0.1), "next three take the counters as they free"
+    assert waits[6] == pytest.approx(2 * service, abs=0.1)
+    assert waits[7] == pytest.approx(2 * service, abs=0.1), "the next arrival is fifth in the waiting line"
+
+
+def test_a_long_line_is_not_under_estimated(system, monkeypatch):
+    monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", True)
+    for n in range(5900, 5933):                     # 33 in line: 3 at counters, 30 waiting
+        system.tracker.force_new_person(n)
+    service = service_minutes()
+    # The 31st waiting person goes after ten full rounds of three counters.
+    assert queue_service.estimate_wait_for_position(34, 3) == pytest.approx(11 * service, abs=0.1)
+
+
+def test_fewer_counters_mean_a_longer_wait(system, monkeypatch):
+    monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", True)
+    for n in range(6000, 6010):
+        system.tracker.force_new_person(n)
+    assert queue_service.estimate_wait_for_position(11, 1) > queue_service.estimate_wait_for_position(11, 3)
+
+
+def test_nobody_is_called_while_counters_are_closed_for_lunch(system, monkeypatch):
+    monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", True)
+    monkeypatch.setattr(queue_service, "_counters_closed_until", None)
+    reopen = datetime.now() + timedelta(minutes=30)
+    queue_service.set_counters_closed_until(reopen)
+
+    for n in (6101, 6102):
+        system.tracker.force_new_person(n)
+    line = system.tracker.line_snapshot()
+    assert all(q["counter_number"] is None for q in line), "no one is called during the closure"
+    assert queue_service.estimate_wait_for_position(1, 3) == pytest.approx(30, abs=0.2)
+
+    queue_service.set_counters_closed_until(None)
+    line = system.tracker.line_snapshot()
+    assert all(q["counter_number"] is not None for q in line), "reopening calls them at once"
+    assert queue_service.estimate_wait_for_position(1, 3) == 0.0
+
+
+def test_a_queue_reset_keeps_the_counters_closed(system, monkeypatch):
+    monkeypatch.setattr(queue_service, "_counters_closed_until", None)
+    monkeypatch.setattr(queue_service, "delete_all_tickets", lambda: 0)
+    monkeypatch.setattr(queue_service, "record_queue_reset", lambda *a: None)
+    reopen = datetime.now() + timedelta(minutes=30)
+    queue_service.set_counters_closed_until(reopen)
+    queue_service.reset_queue()
+    try:
+        assert queue_service.counters_closed_until() == reopen
+    finally:
+        queue_service.set_counters_closed_until(None)
+
+
+def test_the_dashboard_forecast_comes_from_the_engine(system, monkeypatch):
+    monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", True)
+    for n in range(6200, 6206):
+        system.tracker.force_new_person(n)
+    monkeypatch.setitem(queue_service.state.latest_state, "arrival_rate", 1.0)   # one more person a minute
+
+    forecast = queue_service.build_queue_prediction()
+    assert forecast["wait_estimator"] == "queue-engine"
+    now = forecast["forecast"]["now"]["estimated_wait_time_minutes"]
+    later = [forecast["forecast"][f"in_{h}min"]["estimated_wait_time_minutes"] for h in (5, 15, 30)]
+    assert now == forecast["new_arrival"]["estimated_wait_time_minutes"]
+    assert now <= later[0] <= later[1] <= later[2], "a growing line means longer waits later"
+
+
+# ------------------------------------------------- wait log (WAIT_TIME_MODEL.md)
+
+def test_each_ticket_logs_the_line_it_joined_and_its_estimate(system, monkeypatch):
+    jobs = []
+    monkeypatch.setattr(queue_service.ticket_service, "enqueue_ticket", lambda **k: jobs.append(k))
+    for n in (5601, 5602, 5603, 5604):
+        system.tracker.force_new_person(n)
+
+    assert [j["people_ahead"] for j in jobs] == [0, 1, 2, 3]
+    assert [j["active_counters"] for j in jobs] == [3, 3, 3, 3]
+    assert jobs[3]["est_wait_min"] == queue_service.estimate_wait_for_position(4, 3)
+
+
+def test_staff_actions_log_when_the_person_was_called(system, monkeypatch):
+    saved = {}
+    finished = threading.Event()
+
+    def record(queue_number, status, actor, called_seconds_ago=None):
+        saved[queue_number] = called_seconds_ago
+        if len(saved) == 2:
+            finished.set()
+
+    monkeypatch.setattr(queue_service, "_update_status_then_invalidate", record)
+    numbers = [system.tracker.force_new_person(n)["queue_number"] for n in (5701, 5702, 5703, 5704)]
+    assert system.tracker.get_called_at(numbers[3]) is None, "fourth in line, no counter yet"
+
+    queue_service.mark_no_show(numbers[3])      # never called
+    queue_service.mark_done(numbers[0])         # called the moment a counter was free
+    assert finished.wait(2)
+    assert saved[numbers[3]] is None
+    assert saved[numbers[0]] is not None

@@ -142,6 +142,13 @@ CREATE TABLE `queue_records` (
   `expires_at`         datetime     DEFAULT NULL,
   `created_at`         datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `served_at`          datetime     DEFAULT NULL,
+  -- Wait-time log (2026_11_wait_log_migration.sql): the estimate at issue and
+  -- the time the person was called to a counter.
+  `people_ahead_at_issue`    int          DEFAULT NULL,
+  `active_counters_at_issue` tinyint      DEFAULT NULL,
+  `predicted_wait_min`       decimal(6,1) DEFAULT NULL,
+  `wait_model_version`       varchar(32)  DEFAULT NULL,
+  `called_at`                datetime     DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_queue_number`          (`queue_number`),
   KEY `idx_service_date_queue`    (`service_date`,`queue_number`),

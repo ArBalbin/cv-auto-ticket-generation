@@ -10,3 +10,6 @@ onnx
 opencv-python
 numpy
 Pillow
+
+# ML/train_wait_model.py needs only numpy and scipy.
+scipy

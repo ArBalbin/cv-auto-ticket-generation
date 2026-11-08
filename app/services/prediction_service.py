@@ -4,8 +4,15 @@ import time
 import numpy as np
 from collections import deque
 
+from services import wait_model
+
 
 # ── Shared history (written by update_queue_metrics, read by predictors) ──────
+# One sample every 10 seconds, so the 60 samples cover the last 10 minutes.
+# Sampling every frame kept only about 12 seconds of history: one person walking
+# in looked like a queue growing by the second, and the trend projected from it
+# showed "in 5 min: 34 mins" for a few seconds on a line of four.
+SAMPLE_INTERVAL_SECONDS = 10
 historical_counts:     deque = deque(maxlen=60)
 historical_timestamps: deque = deque(maxlen=60)
 
@@ -15,7 +22,7 @@ class PredictionService:
     def __init__(self, queue_config: dict):
         self.cfg = queue_config
 
-    
+
     # DENSITY
 
     def calculate_density(self, persons: list, width: int, height: int,
@@ -35,9 +42,9 @@ class PredictionService:
             counts[r, c] += 1
         return float(np.mean(counts)), float(np.max(counts))
 
-    
+
     # ARRIVAL RATE
-    
+
 
     def calculate_arrival_rate(self) -> float:
         """
@@ -51,32 +58,13 @@ class PredictionService:
         dt = (historical_timestamps[-1] - historical_timestamps[-n]) / 60.0
         return max(0.0, (counts[-1] - counts[-n]) / dt) if dt > 0 else 0.0
 
-    
-    # M/M/c BASELINE
 
-    def mmch_wait(self, arrival_rate: float, service_rate: float,
-                  num_counters: int, queue: int) -> float:
-        """
-        M/M/c queuing formula — current-snapshot wait time in minutes.
-        This is the ground-truth baseline; the three horizon models
-        adjust it based on projected future queue depth.
-        """
-        avg_svc = self.cfg['avg_service_time']
-        nc      = max(num_counters, 1)
-        if arrival_rate <= 0:
-            return queue * avg_svc / nc
-        rho = arrival_rate / max(nc * service_rate, 1e-9)
-        if rho >= 1.0:
-            return queue * avg_svc / nc
-        return max(0.0, (queue / max(arrival_rate, 0.1)) + avg_svc)
-
-    
     # TREND SLOPE (shared utility)
-    
+
 
     def _trend_slope(self) -> float:
         """
-        Linear regression slope over recent queue counts (people/frame).
+        Linear regression slope over recent queue counts (people/sample).
         Positive → queue growing. Negative → queue shrinking.
         Returns 0.0 when insufficient history.
         """
@@ -91,43 +79,38 @@ class PredictionService:
         denom = np.dot(x, x)
         return float(np.dot(x, y) / denom) if denom > 1e-9 else 0.0
 
-    def _estimated_fps(self) -> float:
-        """Estimate camera fps from recent frame timestamps."""
+    def _samples_per_second(self) -> float:
+        """Actual sampling rate from recent history timestamps."""
         times = list(historical_timestamps)
         if len(times) < 2:
-            return 15.0
+            return 1.0 / SAMPLE_INTERVAL_SECONDS
         n       = min(30, len(times) - 1)
         elapsed = times[-1] - times[-n - 1]
-        return n / elapsed if elapsed > 0 else 15.0
+        return n / elapsed if elapsed > 0 else 1.0 / SAMPLE_INTERVAL_SECONDS
 
-    
+
     # SHORT-TERM  (5–15 min)
-    
+
 
     def predict_short_term(self, base_wait: float, slope: float,
                            nc: int) -> float:
         """
         Projects queue size 10 minutes into the future using the current
-        linear trend, then recalculates M/M/c wait for that projected size.
+        linear trend, then asks the wait model what that queue means.
 
-        slope (people/frame) × fps × 600s = people expected to join in 10 min.
+        slope (people/sample) × samples/s × 600s = people expected to join
+        in 10 min.
         """
         counts = list(historical_counts)
         if not counts:
             return base_wait
 
-        fps             = self._estimated_fps()
-        projected_queue = max(0.0, counts[-1] + slope * fps * 600)
-        avg_svc         = self.cfg['avg_service_time']
-        arrival         = self.calculate_arrival_rate()
+        projected_queue = max(0.0, counts[-1] + slope * self._samples_per_second() * 600)
+        return wait_model.predict_minutes(projected_queue, nc)
 
-        if arrival <= 0:
-            return max(1.0, projected_queue * avg_svc / max(nc, 1))
-        return max(1.0, (projected_queue / max(arrival, 0.1)) + avg_svc)
 
-    
     # MEDIUM-TERM  (15–30 min)
-    
+
 
     def predict_medium_term(self, base_wait: float, slope: float,
                             nc: int) -> float:
@@ -156,14 +139,9 @@ class PredictionService:
         damping        = 0.85
         damp_sum       = sum(damping ** i for i in range(1, horizon + 1))
         forecast_queue = max(0.0, level + trend * damp_sum)
+        return wait_model.predict_minutes(forecast_queue, nc)
 
-        avg_svc = self.cfg['avg_service_time']
-        arrival = self.calculate_arrival_rate()
-        if arrival <= 0:
-            return max(1.0, forecast_queue * avg_svc / max(nc, 1))
-        return max(1.0, (forecast_queue / max(arrival, 0.1)) + avg_svc)
 
-    
     # LONG-TERM  (1–4 hours
 
     def predict_long_term(self, base_wait: float, slope: float,
@@ -186,35 +164,29 @@ class PredictionService:
 
         # 70 % follow the trend, 30 % revert to recent mean (ratio = 1.0)
         long_queue = max(0.0, recent * (0.7 * growth_ratio + 0.3))
+        return min(wait_model.predict_minutes(long_queue, nc), 60.0)
 
-        avg_svc = self.cfg['avg_service_time']
-        arrival = self.calculate_arrival_rate()
-        if arrival <= 0:
-            raw = long_queue * avg_svc / max(nc, 1)
-        else:
-            raw = (long_queue / max(arrival, 0.1)) + avg_svc
-
-        return max(1.0, min(raw, 60.0))
-    
     # MAIN UPDATE — called once per video frame
 
 
     def update(self, count: int, current_data: dict, data_lock) -> None:
         """
-        Append the latest frame count, recalculate all metrics, and
+        Sample the latest frame count, recalculate all metrics, and
         write results back into current_data (thread-safe via data_lock).
 
         Call this from gen_frames() after detection is complete.
         """
-        historical_counts.append(count)
-        historical_timestamps.append(time.time())
+        now = time.time()
+        if not historical_timestamps or now - historical_timestamps[-1] >= SAMPLE_INTERVAL_SECONDS:
+            historical_counts.append(count)
+            historical_timestamps.append(now)
 
         arrival_rate = self.calculate_arrival_rate()
 
         with data_lock:
             sr    = current_data['service_rate']
             nc    = current_data['active_counters']
-            ew    = self.mmch_wait(arrival_rate, sr, nc, count)
+            ew    = wait_model.predict_minutes(count, nc)
             util  = min(arrival_rate / (nc * sr) if sr > 0 else 0.0, 1.0)
             slope = self._trend_slope()
 

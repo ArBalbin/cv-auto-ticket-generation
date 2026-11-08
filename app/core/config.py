@@ -149,9 +149,23 @@ QUEUE_REMAP_DIST_THRESH = env_float("QUEUE_REMAP_DIST_THRESH", 180)
 QUEUE_REMAP_ABSENT_FRAMES = env_int("QUEUE_REMAP_ABSENT_FRAMES", 45)
 
 QUEUE_CONFIG = {
-    "avg_service_time": env_float("AVG_SERVICE_TIME", 3.0),
+    # Seed for the service time until Algorithm 7 has measured one. 2.0 is the
+    # median transaction in both the September and October cashier logs; the
+    # earlier 3.0 was a guess.
+    "avg_service_time": env_float("AVG_SERVICE_TIME", 2.0),
     "num_counters": env_int("NUM_COUNTERS", 3),
 }
+
+# How a wait is estimated. "queue" simulates the live line counter by counter
+# (services/queue_engine.py); "regression" uses the line fitted on October's
+# people-ahead counts (services/wait_model.py). Set WAIT_ESTIMATOR=regression
+# on the server to switch back without a code change.
+WAIT_ESTIMATOR = os.getenv("WAIT_ESTIMATOR", "queue").strip().lower()
+
+# The school's clock, for times staff type in (e.g. "close counters until
+# 13:00"). The deployed server runs on UTC, so a bare 13:00 there would be
+# 9 PM in the Philippines. The Philippines keeps UTC+8 all year.
+SCHOOL_UTC_OFFSET_HOURS = env_float("SCHOOL_UTC_OFFSET_HOURS", 8.0)
 
 # Face-recognition identity validation (students only) — see app/services/face_service.py
 # Thresholds calibrated 2026-08 via ML/calibrate_face_recognition.py against 16

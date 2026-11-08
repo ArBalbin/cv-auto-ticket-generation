@@ -348,32 +348,54 @@ number printed on their kiosk ticket.
 
 ## 6. Wait-Time Prediction
 
-**Where:** `app/services/prediction_service.py`
+**Where:** `app/services/queue_engine.py` (default), `app/services/wait_model.py`
+(fallback), `queue_service.estimate_wait_for_position`
 
-> **Status:** the trained predictive model for this objective is being
-> developed as separate work. What ships in this system today is the
-> analytical queueing model described here. Report accuracy against
-> whichever is in place at evaluation time.
+**By default a queue engine simulates the live line.** Each counter is free, busy
+until its current transaction is expected to end, or closed until a set time
+(staff close all counters for lunch from the dashboard). People waiting are
+taken in queue order by whichever counter frees up first, one service time each;
+when a person is taken is when their turn starts. See `WAIT_TIME_MODEL.md`,
+section 0. `WAIT_ESTIMATOR=regression` switches back to the regression below.
 
-An **M/M/c queueing model** estimates waiting time from arrival rate λ,
-service rate μ, and counter count c:
-
-```
-ρ = λ / (c · μ)                    system utilisation
-W = queue_length / (c · μ)         expected wait
-```
-
-Arrival rate is estimated from the recent count history (up to 30 samples):
+As the benchmark and fallback, a **median regression trained on observed
+cashier transactions** gives the wait for someone with a given number of people
+ahead:
 
 ```
-λ = (count_now − count_then) / minutes_elapsed
+wait = 1.1214 + 0.1445 × people_ahead × (3 / active_counters)     minutes
 ```
 
-Forecasts at 5, 15, and 30 minutes extend this with a linear trend
-projection over recent queue-length samples.
+Trained by `ML/train_wait_model.py` on 528 transactions over 14 days, and stored
+as plain coefficients in `Model/wait_time_model.json`, so neither the server nor
+the detector needs scikit-learn. On unseen days its MAE is **3.00 minutes**
+(RMSE 5.90, R² −0.04, MAPE 72.2%), the same as a constant 2-minute prediction
+but responsive to the queue. See `WAIT_TIME_MODEL.md` for the validation and
+limitations, especially that long lines are under-estimated.
 
-**No accuracy measurement exists yet.** MAE and MAPE require comparing
-predictions against realised waits, which needs data from live operation.
+**Each student** gets the model's estimate for their own position, with
+`people_ahead = position − 1`.
+
+**Forecasts at 5, 15, and 30 minutes** project the camera's queue count forward,
+then apply the model to the projected count:
+
+| Horizon | Projection of the count |
+|---|---|
+| 5 min | Linear trend over the last 20 samples |
+| 15 min | Holt's double exponential smoothing, damped |
+| 30 min | Growth ratio with mean reversion, capped at 60 min |
+
+The count history holds one sample every 10 seconds, covering 10 minutes. Only
+the mapping from count to wait is trained; the projections are not validated.
+
+The arrival rate λ and utilisation ρ = λ / (c · μ) are still computed from the
+same history for the dashboard, but no longer drive the wait.
+
+**Every ticket logs its own check.** When a number is issued, the ticket row
+stores the people ahead, the counters open and the estimate shown; when staff
+mark it done, it stores when the person was called to a counter. Comparing the
+two gives the live accuracy, and the same log re-fits the model on exact counts
+(`WAIT_TIME_MODEL.md`, section 6).
 
 ---
 
@@ -390,10 +412,11 @@ avg_service_time = 0.7 · measured + 0.3 · previous
 ```
 
 The 70/30 blend is damping: a single unusually slow transaction should
-nudge the estimate, not redefine it. This keeps the wait-time model honest
-when counters are genuinely faster or slower than configured. The dashboard
-labels the figure "Measured from DB" or "Default (.env)" so staff can see
-which is in use.
+nudge the estimate, not redefine it. The result sets a student's estimated
+service finish time and the utilisation figure. It does not scale the wait:
+that was tested and made the wait model worse on unseen days (MAE 3.08 against
+3.00). The dashboard labels the figure "Measured from DB" or "Default (.env)"
+so staff can see which is in use.
 
 ---
 
@@ -444,7 +467,7 @@ towards `total_served`, since nobody was served.
 | 3 | Track stability | IoU/centroid remap + dedup | — |
 | 4 | Face recognition | ArcFace 512-d + threshold & margin rule | Score < 0.30 or margin < 0.15 |
 | 5 | System-minted number | Reserved 5000+ range, one-per-student | Student already holds an entry |
-| 6 | Wait-time prediction | M/M/c + trend forecast | — |
+| 6 | Wait-time prediction | Median regression on people ahead + count projection | — |
 | 7 | Service-time measurement | Inter-departure gap blending | — |
 | 8 | Counter assignment | Sorted position, sticky | — |
 

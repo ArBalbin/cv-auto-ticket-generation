@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -40,6 +42,10 @@ class ZoneBody(BaseModel):
 
 class CountersBody(BaseModel):
     counters: int
+
+
+class CloseCountersBody(BaseModel):
+    until: str  # 24-hour clock today, e.g. "13:00"
 
 
 @router.get("/api/queue/list", summary="Live queue state - PUBLIC", tags=["Queue"])
@@ -326,6 +332,39 @@ def adjust_counters(
         )
     config = queue_service.set_active_counters(body.counters, username)
     return {"success": True, "counters": config["active_counters"]}
+
+
+@router.post(
+    "/api/queue/close_counters",
+    summary="Staff - close every counter until a time today (e.g. lunch)",
+    tags=["Queue"],
+)
+def close_counters(
+    body: CloseCountersBody,
+    username: str = Depends(require_staff),
+):
+    try:
+        clock = datetime.strptime(body.until.strip(), "%H:%M").time()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="until must be a time like 13:00")
+    # The time is on the school's clock; the server may be on UTC.
+    until = queue_service.school_time_today(clock)
+    if not datetime.now() < until <= datetime.now() + timedelta(hours=12):
+        raise HTTPException(status_code=400, detail="until must be later today")
+    closed = queue_service.set_counters_closed_until(until)
+    print(f"[Queue] Counters closed until {body.until} (school time) by {username}")
+    return {"success": True, "closed_until": queue_service.school_iso(closed)}
+
+
+@router.post(
+    "/api/queue/open_counters",
+    summary="Staff - reopen the counters before the closure ends",
+    tags=["Queue"],
+)
+def open_counters(username: str = Depends(require_staff)):
+    queue_service.set_counters_closed_until(None)
+    print(f"[Queue] Counters reopened by {username}")
+    return {"success": True, "closed_until": None}
 
 
 @router.get(

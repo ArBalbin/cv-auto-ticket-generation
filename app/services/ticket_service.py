@@ -3,6 +3,7 @@ from queue import Queue as ThreadQueue
 
 from core.config import QUEUE_CONFIG
 from database.database_handler import get_student_by_id, save_ticket_record
+from services import wait_model
 from services.ticket_printer import delete_ticket, issue_ticket
 
 
@@ -17,6 +18,9 @@ def enqueue_ticket(
     student_id: int | None = None,
     linked_via: str = "manual",
     is_walkin: bool = True,
+    people_ahead: int | None = None,
+    active_counters: int | None = None,
+    estimator_version: str | None = None,
 ) -> None:
     ticket_queue.put_nowait({
         "queue_number": queue_number,
@@ -25,6 +29,9 @@ def enqueue_ticket(
         "student_id": student_id,
         "linked_via": linked_via,
         "is_walkin": is_walkin,
+        "people_ahead": people_ahead,
+        "active_counters": active_counters,
+        "estimator_version": estimator_version,
     })
 
 
@@ -84,6 +91,11 @@ def _ticket_worker() -> None:
             ticket["student_id"] = job.get("student_id")
             ticket["linked_via"] = job.get("linked_via", "manual")
             ticket["is_walkin"] = job.get("is_walkin", True)
+            if job.get("people_ahead") is not None:
+                ticket["people_ahead_at_issue"] = job["people_ahead"]
+                ticket["active_counters_at_issue"] = job.get("active_counters")
+                ticket["predicted_wait_min"] = job["est_wait_min"]
+                ticket["wait_model_version"] = job.get("estimator_version") or wait_model.MODEL_VERSION
 
             short_code_set = queue_service.queue_tracker.set_short_code(
                 qn,
