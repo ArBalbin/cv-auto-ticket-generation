@@ -109,6 +109,20 @@ def require_staff(request: Request) -> str:
     return username
 
 
+def require_staff_for_media(request: Request) -> str:
+    """Staff check for the camera stream and snapshot.
+
+    The dashboard shows the stream in an <img> tag, which cannot send the
+    X-Session-Token header. So the session token may also come as a `token`
+    query parameter, but only on these routes; every other route still
+    requires the header or cookie."""
+    token = get_session_token(request) or request.query_params.get("token")
+    username = _lookup_session(token)
+    if not username:
+        raise HTTPException(status_code=401, detail="Login required")
+    return username
+
+
 def get_session_username(request: Request, default: str = "") -> str:
     return _lookup_session(get_session_token(request)) or default
 

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
 import state
-from core.security import require_staff
+from core.security import require_staff, require_staff_for_media
 
 
 router = APIRouter()
@@ -20,8 +20,9 @@ async def get_crowd_data():
     return state.crowd_stats()
 
 
-@router.get("/api/crowd/video", summary="MJPEG annotated camera stream", tags=["Crowd"])
-async def get_video_stream():
+# The camera shows students' faces, so only signed-in staff may watch it.
+@router.get("/api/crowd/video", summary="MJPEG annotated camera stream - staff only", tags=["Crowd"])
+async def get_video_stream(username: str = Depends(require_staff_for_media)):
     async def _generate():
         last_seq = 0
         while True:
@@ -44,8 +45,8 @@ async def get_video_stream():
     )
 
 
-@router.get("/api/snapshot", summary="Latest annotated JPEG frame", tags=["Crowd"])
-async def get_snapshot():
+@router.get("/api/snapshot", summary="Latest annotated JPEG frame - staff only", tags=["Crowd"])
+async def get_snapshot(username: str = Depends(require_staff_for_media)):
     snapshot = state.get_snapshot()
     if snapshot is None:
         raise HTTPException(status_code=503, detail="No snapshot available yet")

@@ -48,8 +48,21 @@ class CloseCountersBody(BaseModel):
     until: str  # 24-hour clock today, e.g. "13:00"
 
 
-@router.get("/api/queue/list", summary="Live queue state - PUBLIC", tags=["Queue"])
-def queue_list():
+# What the public display board may show about each person in line. Ticket
+# codes, camera track ids and boxes, and identity details stay staff-only: a
+# queue number plus its ticket code is all /api/queue/status asks for.
+_PUBLIC_QUEUE_FIELDS = (
+    "queue_number", "queue_label", "status", "position_in_line",
+    "counter_number", "wait_time", "wait_time_seconds",
+)
+
+
+def _public_entry(entry: dict) -> dict:
+    return {key: entry.get(key) for key in _PUBLIC_QUEUE_FIELDS}
+
+
+@router.get("/api/queue/list", summary="Live queue state - staff only", tags=["Queue"])
+def queue_list(username: str = Depends(require_staff)):
     state_dict = dict(queue_service.queue_tracker.get_state())
     # Pending (not-yet-linked) people are a staff-only concern — see
     # /api/queue/pending and /api/queue/data for that detail.
@@ -63,8 +76,8 @@ def queue_display():
     state = queue_service.queue_tracker.get_state()
     config = queue_service.runtime_config()
     return {
-        "counter_assignments": state["counter_assignments"],
-        "active_queue":        state["active_queue"],
+        "counter_assignments": [_public_entry(p) for p in state["counter_assignments"]],
+        "active_queue":        [_public_entry(p) for p in state["active_queue"]],
         "newly_called":        state["newly_called"],
         "num_counters":        state["num_counters"],
         "queue_count":         state["queue_count"],
