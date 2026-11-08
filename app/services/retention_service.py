@@ -46,7 +46,8 @@ def policy() -> dict:
 
 def _public(row: dict) -> dict:
     def iso(v):
-        return v.isoformat() if isinstance(v, datetime) else v
+        # Database times carry no zone; they are on the server's clock (UTC).
+        return v.astimezone().isoformat() if isinstance(v, datetime) else v
     return {
         "student_id": row.get("id"),
         "school_id": row.get("school_id"),
@@ -92,7 +93,7 @@ def run(dry_run: bool = False, actor: str = "scheduler") -> dict:
             archived = archive([r["id"] for r in to_archive])
             deleted = delete([r["id"] for r in to_delete])
         report = {
-            "ran_at": datetime.now().isoformat(timespec="seconds"),
+            "ran_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "actor": actor,
             "dry_run": dry_run,
             "due_for_archive": len(to_archive),
