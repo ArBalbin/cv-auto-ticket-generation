@@ -414,9 +414,10 @@ def ensure_wait_log_columns() -> bool:
         close_db_resources(cursor, conn)
 
 
-def fetch_wait_observations() -> list[dict]:
-    """Served tickets that carry both the logged estimate and the call time.
-    Read-only; used by ML/export_wait_log.py."""
+def fetch_wait_observations(days: int | None = None) -> list[dict]:
+    """Served tickets that carry both the logged estimate and the call time,
+    all of them or only those issued in the last `days` days. Read-only; used
+    by ML/export_wait_log.py and the dashboard's accuracy panel."""
     pool = _ensure_db_pool()
     if pool is None:
         return []
@@ -428,8 +429,9 @@ def fetch_wait_observations() -> list[dict]:
         if not set(_WAIT_LOG_COLUMNS) <= _get_table_columns(cursor, "queue_records"):
             print("[DB] queue_records has no wait-log columns yet")
             return []
+        recent = "AND created_at >= NOW() - INTERVAL %s DAY" if days else ""
         cursor.execute(
-            """
+            f"""
             SELECT service_date, queue_number, created_at, called_at, served_at,
                    people_ahead_at_issue, active_counters_at_issue,
                    predicted_wait_min, wait_model_version
@@ -437,8 +439,10 @@ def fetch_wait_observations() -> list[dict]:
             WHERE status = 'served'
               AND called_at IS NOT NULL
               AND people_ahead_at_issue IS NOT NULL
+              {recent}
             ORDER BY created_at
-            """
+            """,
+            (int(days),) if days else (),
         )
         return cursor.fetchall() or []
     finally:

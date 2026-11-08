@@ -6,7 +6,7 @@ from pydantic import BaseModel
 import state
 from database.database_handler import get_db_pool
 from core.security import require_staff
-from services import queue_service
+from services import queue_service, wait_accuracy
 from services.ticket_printer import TicketLookupBusy, get_ticket_record_by_short_code
 
 
@@ -195,6 +195,15 @@ def queue_prediction():
 )
 def queue_analytics(username: str = Depends(require_staff)):
     return queue_service.build_queue_analytics()
+
+
+@router.get(
+    "/api/queue/prediction_accuracy",
+    summary="How close the wait estimates were to real waits - staff only",
+    tags=["Queue"],
+)
+def queue_prediction_accuracy(username: str = Depends(require_staff)):
+    return wait_accuracy.current_summary()
 
 
 @router.get(

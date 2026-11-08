@@ -44,12 +44,31 @@ with no one ahead is told about 30 minutes.
 **Why it replaced the regression as the default.** The regression learned its
 slope from an overcounted reconstruction of the people ahead, so it says 6
 minutes for 30 people; it cannot know about a lunch closure at all. The engine
-uses what the system knows exactly at the moment. **It is not yet validated:**
-the October log observed too few tickets to rebuild the full line, so it cannot
-be replayed there. The system's own log (section 6) records every ticket in its
-line, and replaying that log against the real call times is how it will be
-measured. Until then it shows no "usually" range, since that range was measured
-for the regression only.
+uses what the system knows exactly at the moment. **It is not yet validated.**
+It was replayed on the 119 held-out tickets of 17 and 19 October in the
+aiprediction repository (commit `31dacf9`). That replay used the repository's
+people-ahead column, its active-window count, and counters marked busy from the
+logged service times:
+
+| Predictor on the same 119 tickets | MAE (min) |
+|---|---:|
+| Constant 2 minutes (aiprediction production model) | **7.00** |
+| This engine | 7.89 |
+| The repository's own FIFO simulator | 7.89 |
+
+The engine loses here, and so does every queue-based method, for the same
+reason: the October log does not hold the real line. 74 of the 119 tickets show
+nobody ahead, and 16 of those still waited more than 10 minutes, which cannot
+happen with nobody ahead and three counters open. The people-ahead column never
+goes above 6 and appears to count only the tickets that were observed (6 to
+31 % of each day's ticket numbers), so it undercounts. The
+reconstruction in section 2 overcounts instead. Neither is a head count, so the
+October log cannot settle whether the engine is right.
+
+The system's own log (section 6) records the real line for every ticket, and the
+dashboard scores the engine on it as tickets are served. Until it has, the
+engine shows no "usually" range, since that range was measured for the
+regression only.
 
 The dashboard's 5-, 15- and 30-minute forecasts use the same engine with the
 line grown at the camera's current rate of growth; they are not validated.
@@ -221,6 +240,15 @@ This writes `ML/data/wait_time/system_wait_log.csv` (read-only query). Training
 on it also reports how far the estimates the system showed were from the waits
 that followed: the live accuracy SOP 3 asks for.
 
+**On the dashboard.** The Analytics tab's "Are the Wait Estimates Right?"
+panel (`GET /api/queue/prediction_accuracy`, staff only) does the same scoring
+live over the last 30 days. For served tickets it shows how many were checked,
+the average miss, and the share within 2 minutes. It scores a fixed 2-minute
+guess on the same tickets, so the panel says plainly whether the engine is
+beating the constant. It also shows whether estimates tend to run short or long,
+and the latest tickets as "app said X, called after Y". It reads
+`fetch_wait_observations` and caches the result for 30 seconds.
+
 **Observation at the cashier.** `ML/wait_data_collection/` holds a recording
 sheet and instructions: one row per ticket, with a head count of the line at the
 moment the ticket is taken. A few days of this re-fits the slope on real counts
@@ -294,6 +322,13 @@ real count and the real wait for every ticket, so the slope can be re-fitted on
 exact data.
 
 **How accurate is it in the running system?**
-State what was measured. If the live log or the cashier observation has been
-collected and scored, give those figures. If not, say that only the offline
-figures exist and that the system records what is needed to measure it.
+Open the dashboard's "Are the Wait Estimates Right?" panel and read it out:
+tickets checked, average miss, the share within 2 minutes, and the fixed
+2-minute guess on the same tickets. If it has too few tickets, say so, and say
+that the system scores every served ticket on its own.
+
+**Why not train it on the October data?**
+That data has no real count of the people ahead (section 0). Every method scored
+on it ties or loses to a constant: machine learning, the regression, and this
+engine alike. A better model cannot recover a count that was never recorded, so
+the system records it now.
