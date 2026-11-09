@@ -1063,9 +1063,25 @@ def build_queue_prediction() -> dict:
         "measured" if abs(avg_service_time - _default_svc_time) > 0.05 else "default"
     )
 
+    # Who is at each window, for the app's "Now serving" card. The same
+    # numbers the public display board shows; no ticket codes.
+    now_serving = sorted(
+        (
+            {
+                "counter_number": as_int(person.get("counter_number"), 0),
+                "queue_number": person.get("queue_number"),
+                "queue_label": person.get("queue_label"),
+            }
+            for person in active_queue
+            if person.get("counter_number") is not None and person.get("queue_number") is not None
+        ),
+        key=lambda entry: entry["counter_number"],
+    )
+
     return {
         "queue_length": queue_count,
         "active_counters": counters,
+        "now_serving": now_serving,
         "avg_service_time_min": round(avg_service_time, 2),
         "service_time_source": service_time_source,
         "arrival_rate_per_min": as_float(metrics["arrival_rate"], 0.0),

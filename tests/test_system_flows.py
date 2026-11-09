@@ -583,6 +583,21 @@ def test_the_dashboard_forecast_comes_from_the_engine(system, monkeypatch):
     assert now <= later[0] <= later[1] <= later[2], "a growing line means longer waits later"
 
 
+def test_the_app_is_told_who_is_at_each_window(system):
+    for n in range(6300, 6305):
+        system.tracker.force_new_person(n)
+
+    serving = queue_service.build_queue_prediction()["now_serving"]
+    assert [(s["counter_number"], s["queue_number"]) for s in serving] == [
+        (1, 6300), (2, 6301), (3, 6302)], "three windows, the first three in line"
+    assert all(set(s) == {"counter_number", "queue_number", "queue_label"} for s in serving)
+
+    queue_service.mark_done(6301)
+    serving = queue_service.build_queue_prediction()["now_serving"]
+    assert (2, 6303) in [(s["counter_number"], s["queue_number"]) for s in serving], \
+        "the next in line takes the freed window"
+
+
 # ------------------------------------------------- wait log (WAIT_TIME_MODEL.md)
 
 def test_each_ticket_logs_the_line_it_joined_and_its_estimate(system, monkeypatch):
