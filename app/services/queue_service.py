@@ -819,6 +819,12 @@ def _as_datetime(value) -> datetime | None:
             return None
     return None
 
+NO_SHOW_MESSAGE = (
+    "Staff marked you as not present when your number was called, so your "
+    "number was skipped. Tap Join the Queue again if you still need the cashier."
+)
+
+
 def ticket_record_status_response(record: dict) -> dict:
     queue_number = as_int(record.get("queue_number"), 0)
     status = str(record.get("status") or "expired")
@@ -829,9 +835,8 @@ def ticket_record_status_response(record: dict) -> dict:
 
     messages = {
         "served": "Your queue ticket is done. Please exit the queue area.",
-        # Kept for historical records written before no-show detection was
-        # removed; the system no longer produces this status.
-        "no_show": "Your queue ticket is no longer active. Please contact staff if you still need service.",
+        # Staff mark a no-show from the dashboard; nothing is decided automatically.
+        "no_show": NO_SHOW_MESSAGE,
         "expired": "Your queue ticket has expired. Please get a new ticket if you still need service.",
     }
 

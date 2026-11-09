@@ -32,6 +32,10 @@ class QueuePerson:
         # When a counter was first assigned: the moment the person is called.
         # Logged at done/no-show so the real wait can be measured.
         'called_at',
+        # 'served' or 'no_show' once staff retire the entry. Both leave the
+        # person as 'done_pending' while they walk away; the app needs to
+        # know which, to tell a skipped student why their number ended.
+        'retired_as',
         # Evaluation instrumentation (recognition_metrics) — first_seen_at is
         # the very first frame this person appeared in, which is earlier than
         # entered_at (the moment presence was *confirmed*).
@@ -63,6 +67,7 @@ class QueuePerson:
         self.identity_status      = 'linked' if queue_number is not None else 'pending_link'
         self.linked_at            = datetime.now() if queue_number is not None else None
         self.called_at            = None
+        self.retired_as           = None
         self.first_seen_at        = None
         self.embed_attempts       = 0
         self.embed_successes      = 0
@@ -139,6 +144,7 @@ class QueuePerson:
             'linked_via':        self.linked_via,
             'has_face_embedding': self.face_embedding is not None,
             'counter_number':    self.counter_number,
+            'retired_as':        self.retired_as,
         }
 
 
@@ -900,6 +906,7 @@ class QueueTracker:
                 print(f"[QueueTracker] ⚠️  PDF delete error for Q{queue_number:03d}: {e}")
 
         p.status           = 'done_pending'
+        p.retired_as       = reason
         p.position_in_line = 0
         self._done_cooldowns.append({
             'bbox': p.bbox,

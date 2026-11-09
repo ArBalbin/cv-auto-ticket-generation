@@ -117,6 +117,13 @@ def queue_status(q: int, token: str):
             detail="Invalid token. Please check your ticket.",
         )
 
+    # A skipped person stays 'done_pending' in the tracker while they walk
+    # away, as a served one does; until the database row says 'no_show' too,
+    # tell the app here, or it shows "transaction complete" or nothing at all.
+    if result.get("status") == "done_pending" and result.get("retired_as") == "no_show":
+        result["status"] = "no_show"
+        result["message"] = queue_service.NO_SHOW_MESSAGE
+
     position = queue_service.as_int(result.get("position_in_line"), 0)
     config = queue_service.runtime_config()
     result["prediction"] = queue_service.prediction_for_position(

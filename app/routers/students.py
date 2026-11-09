@@ -313,7 +313,7 @@ async def get_my_queue_entry(student_id: int = Depends(require_student)):
     # app's dashboard poll drag the student straight back into the "session
     # ended" screen they just dismissed, so treat it as finished here.
     if person.status == "done_pending":
-        return payload("recently_served")
+        return payload("recently_skipped" if person.retired_as == "no_show" else "recently_served")
 
     if person.queue_number is None:
         return {

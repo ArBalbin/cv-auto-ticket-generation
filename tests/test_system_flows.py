@@ -228,6 +228,48 @@ def test_served_student_who_steps_away_and_rejoins_gets_a_new_number(system):
     assert system.tickets == [first, second]
 
 
+def test_a_skipped_student_is_told_so_by_the_app(system, monkeypatch):
+    from routers import queue as queue_router
+
+    ana = face(151)
+    system.enrolled[151] = ana
+    tap_join(151)
+    system.stand((90, 100, near(ana, 4000, 0.3)))
+    number = app_state(151)["queue_number"]
+    person = system.tracker.get_person_by_student_id(151)
+    token = person.short_code or person.access_token
+
+    queue_service.mark_no_show(number)
+
+    # The database row is written in the background; until it says no_show,
+    # the tracker's answer must already say so.
+    monkeypatch.setattr(queue_router, "get_db_pool", lambda: object())
+    monkeypatch.setattr(queue_router, "get_ticket_record_by_short_code",
+                        lambda t, q, pool: {"queue_number": q, "status": "waiting"})
+    status = queue_router.queue_status(number, token)
+    assert status["status"] == "no_show"
+    assert "skipped" in status["message"]
+
+    # Once the row says no_show, the record's own answer says the same.
+    monkeypatch.setattr(queue_router, "get_ticket_record_by_short_code",
+                        lambda t, q, pool: {"queue_number": q, "status": "no_show"})
+    status = queue_router.queue_status(number, token)
+    assert status["status"] == "no_show" and "skipped" in status["message"]
+
+    # The dashboard screen of the app shows the skipped card, not "just served".
+    assert app_state(151)["state"] == "recently_skipped"
+
+
+def test_a_served_student_is_still_reported_as_served(system):
+    ana = face(152)
+    system.enrolled[152] = ana
+    tap_join(152)
+    system.stand((91, 100, near(ana, 4100, 0.3)))
+    queue_service.mark_done(app_state(152)["queue_number"])
+    assert app_state(152)["state"] == "recently_served"
+    assert system.tracker.get_person_by_student_id(152).to_dict()["status"] == "done_pending"
+
+
 def test_without_a_face_the_full_count_still_applies(system):
     for i in range(3):
         queue_service.process_tracked_persons(frame((8, 400, None)), i)
