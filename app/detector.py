@@ -6,7 +6,9 @@ import signal
 import threading
 import queue as _queue
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -107,6 +109,23 @@ SNAPSHOT_FAILURE_BACKOFF_SECONDS = float(os.getenv("SNAPSHOT_FAILURE_BACKOFF_SEC
 # Raising this past ~4 stops helping: the frame rate is then limited by
 # SNAPSHOT_FPS and by how fast the camera produces frames, not by the network.
 SNAPSHOT_UPLOAD_WORKERS = max(1, int(os.getenv("SNAPSHOT_UPLOAD_WORKERS", "3")))
+# Local live view. The dashboard on this same computer can take the camera
+# straight from here instead of through the cloud backend. Through the backend,
+# every frame goes to the server and back: about 1-2 s behind and at most
+# SNAPSHOT_FPS. Locally it is a fraction of a second behind.
+# Bound to 127.0.0.1, so only programs on this computer can connect.
+LOCAL_VIEW_ENABLED = os.getenv("LOCAL_VIEW_ENABLED", "1").strip() != "0"
+LOCAL_VIEW_PORT = int(os.getenv("LOCAL_VIEW_PORT", "8765"))
+LOCAL_VIEW_FPS = float(os.getenv("LOCAL_VIEW_FPS", "15"))
+# Pages allowed to use it: the deployed dashboard and the local dev server.
+LOCAL_VIEW_ORIGINS = frozenset(
+    o.strip().rstrip("/")
+    for o in os.getenv(
+        "LOCAL_VIEW_ORIGINS",
+        "https://cv-frontend-amber.vercel.app,http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if o.strip()
+)
 # Frame numbers have to keep rising across detector restarts, not only within
 # one run. The backend drops any frame that is not newer than the last it
 # accepted, and the in-process frame counter starts again at zero every time
@@ -631,6 +650,141 @@ def _draw_queue_overlay(
 
 
 
+# LOCAL LIVE VIEW
+_local_viewers = 0
+_local_viewers_lock = threading.Lock()
+
+
+def _local_viewer_count() -> int:
+    with _local_viewers_lock:
+        return _local_viewers
+
+
+def _origin_of(url: str | None) -> str | None:
+    if not url:
+        return None
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else None
+
+
+class _LocalViewHandler(BaseHTTPRequestHandler):
+    """
+    /ping  - lets the dashboard check that the detector is on this computer.
+    /video - the annotated camera as an MJPEG stream: the same picture the
+             backend receives, but at LOCAL_VIEW_FPS and without the trip to
+             the server.
+
+    Chrome asks before a website may reach this computer (Private Network
+    Access / Local Network Access): it sends an OPTIONS preflight, answered
+    below, and may show the staff member an "allow" prompt once.
+    """
+
+    server_version = "QueuExLocalView/1.0"
+
+    def log_message(self, *args) -> None:  # keep the detector console readable
+        pass
+
+    def _allowed_origin(self) -> str | None:
+        origin = (self.headers.get("Origin") or "").rstrip("/")
+        return origin if origin in LOCAL_VIEW_ORIGINS else None
+
+    def _cors_headers(self, origin: str) -> None:
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Vary", "Origin")
+
+    def do_OPTIONS(self) -> None:
+        origin = self._allowed_origin()
+        if origin is None:
+            self.send_error(403)
+            return
+        self.send_response(204)
+        self._cors_headers(origin)
+        self.send_header("Access-Control-Allow-Methods", "GET")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/ping":
+            self._ping()
+        elif path == "/video":
+            self._video()
+        else:
+            self.send_error(404)
+
+    def _ping(self) -> None:
+        origin = self._allowed_origin()
+        if self.headers.get("Origin") and origin is None:
+            self.send_error(403)
+            return
+        body = b'{"ok": true}'
+        self.send_response(200)
+        if origin:
+            self._cors_headers(origin)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _video(self) -> None:
+        # An <img> sends no Origin header, only a Referer. A page that is not
+        # the dashboard is refused; a request with no Referer (opening the URL
+        # directly in a browser on this computer) is allowed.
+        referer = _origin_of(self.headers.get("Referer"))
+        if referer is not None and referer not in LOCAL_VIEW_ORIGINS:
+            self.send_error(403)
+            return
+
+        global _local_viewers
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        with _local_viewers_lock:
+            _local_viewers += 1
+        last_seq = -1
+        poll = max(0.01, 0.5 / max(1.0, LOCAL_VIEW_FPS))
+        try:
+            while not _shutdown.is_set():
+                with _state_lock:
+                    jpg = _shared_state.get("snapshot_jpg")
+                    seq = _shared_state.get("snapshot_seq", 0)
+                if jpg is not None and seq != last_seq:
+                    last_seq = seq
+                    self.wfile.write(
+                        b"--frame\r\nContent-Type: image/jpeg\r\n"
+                        + f"Content-Length: {len(jpg)}\r\n\r\n".encode()
+                        + jpg
+                        + b"\r\n"
+                    )
+                    self.wfile.flush()
+                _shutdown.wait(poll)
+        except OSError:
+            pass  # the dashboard closed the stream
+        finally:
+            with _local_viewers_lock:
+                _local_viewers -= 1
+
+
+def _start_local_view() -> ThreadingHTTPServer | None:
+    if not LOCAL_VIEW_ENABLED:
+        return None
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", LOCAL_VIEW_PORT), _LocalViewHandler)
+    except OSError as e:
+        print(f"[Detector] WARNING local live view off - port {LOCAL_VIEW_PORT} unavailable ({e})")
+        return None
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, name="LocalView", daemon=True).start()
+    print(f"[Detector] Local view   : http://127.0.0.1:{LOCAL_VIEW_PORT}/video")
+    return server
+
+
 # MAIN DETECTOR LOOP
 def run() -> None:
     print("[Detector] Starting...")
@@ -1030,22 +1184,29 @@ def run() -> None:
 
     snapshot_thread: threading.Thread | None = None
     snapshot_encode_thread: threading.Thread | None = None
-    if SNAPSHOT_UPLOAD_ENABLED:
+    if SNAPSHOT_UPLOAD_ENABLED or LOCAL_VIEW_ENABLED:
         snapshot_encode_thread = threading.Thread(
             target=_snapshot_encode_worker,
             name="SnapshotEncoder",
             daemon=True,
         )
         snapshot_encode_thread.start()
+    if SNAPSHOT_UPLOAD_ENABLED:
         snapshot_thread = threading.Thread(target=_snapshot_upload_worker,
                                            name="SnapshotUploader", daemon=True)
         snapshot_thread.start()
+    local_view = _start_local_view()
 
     # Capture loop - never blocks on YOLO.
     frame_idx   = 0
     _fps_t0     = time.time()
     _fps_frames = 0
+    # Frames are drawn and encoded at SNAPSHOT_FPS, or at LOCAL_VIEW_FPS while
+    # a dashboard on this computer is watching. The uploader keeps its own
+    # SNAPSHOT_FPS pace either way, taking the newest frame each time.
     snapshot_interval = 1.0 / max(0.1, SNAPSHOT_FPS)
+    local_interval    = 1.0 / max(0.1, LOCAL_VIEW_FPS)
+    encode_frames     = SNAPSHOT_UPLOAD_ENABLED or local_view is not None
     next_snapshot_at  = 0.0
     read_failures = 0
 
@@ -1120,14 +1281,20 @@ def run() -> None:
             # Queue only the newest frame for dashboard video. Drawing and
             # JPEG encoding happen outside the camera read loop.
             now = time.time()
-            if SNAPSHOT_UPLOAD_ENABLED and now >= next_snapshot_at:
-                next_snapshot_at = now + snapshot_interval
+            if encode_frames and now >= next_snapshot_at:
+                watched_here = local_view is not None and _local_viewer_count() > 0
+                next_snapshot_at = now + (
+                    min(snapshot_interval, local_interval) if watched_here else snapshot_interval
+                )
                 _queue_latest(_snapshot_encode_queue, frame.copy())
 
     finally:
         _shutdown.set()
         print("[Detector] Releasing camera...")
         cap.release()
+        if local_view is not None:
+            local_view.shutdown()
+            local_view.server_close()
         _session.close()
         if snapshot_thread is not None:
             snapshot_thread.join(timeout=2.0)
