@@ -455,8 +455,8 @@ def test_staff_actions_log_when_the_person_was_called(system, monkeypatch):
     saved = {}
     finished = threading.Event()
 
-    def record(queue_number, status, actor, called_seconds_ago=None):
-        saved[queue_number] = called_seconds_ago
+    def record(queue_number, status, actor, called_seconds_ago=None, cashier_window=None):
+        saved[queue_number] = (called_seconds_ago, cashier_window)
         if len(saved) == 2:
             finished.set()
 
@@ -467,5 +467,6 @@ def test_staff_actions_log_when_the_person_was_called(system, monkeypatch):
     queue_service.mark_no_show(numbers[3])      # never called
     queue_service.mark_done(numbers[0])         # called the moment a counter was free
     assert finished.wait(2)
-    assert saved[numbers[3]] is None
-    assert saved[numbers[0]] is not None
+    assert saved[numbers[3]] == (None, None)
+    called_seconds_ago, window = saved[numbers[0]]
+    assert called_seconds_ago is not None and window == 1

@@ -112,6 +112,20 @@ def test_done_without_a_call_time_leaves_the_column_alone(database):
     assert "called_at" not in pool.log[-1][0]
 
 
+def test_done_records_the_serving_window(database):
+    pool = database({"called_at", "cashier_window"}, row=(11, None))
+    database_handler.update_queue_status(5001, "served", None, called_seconds_ago=60, cashier_window=2)
+    sql, params = pool.log[-1]
+    assert "cashier_window=%s" in sql
+    assert params == ("served", 60, 2, 11)
+
+
+def test_window_is_skipped_on_a_table_without_the_column(database):
+    pool = database({"called_at"}, row=(11, None))
+    database_handler.update_queue_status(5001, "served", None, cashier_window=2)
+    assert "cashier_window" not in pool.log[-1][0]
+
+
 # ---------------------------------------------------------------- export
 
 def test_export_writes_the_measured_format():

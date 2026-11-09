@@ -149,6 +149,8 @@ CREATE TABLE `queue_records` (
   `predicted_wait_min`       decimal(6,1) DEFAULT NULL,
   `wait_model_version`       varchar(32)  DEFAULT NULL,
   `called_at`                datetime     DEFAULT NULL,
+  -- Window that served the ticket (2026_11_service_window_migration.sql).
+  `cashier_window`           tinyint      DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_queue_number`          (`queue_number`),
   KEY `idx_service_date_queue`    (`service_date`,`queue_number`),

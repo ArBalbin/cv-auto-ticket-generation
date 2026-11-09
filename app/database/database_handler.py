@@ -387,6 +387,9 @@ _WAIT_LOG_ISSUE_COLUMNS = {
     "wait_model_version": "VARCHAR(32) DEFAULT NULL",
 }
 _WAIT_LOG_COLUMNS = {**_WAIT_LOG_ISSUE_COLUMNS, "called_at": "DATETIME DEFAULT NULL"}
+# Which window served the ticket, written with called_at. Kept out of
+# _WAIT_LOG_COLUMNS so the wait log keeps working on a table without it.
+_SERVICE_LOG_COLUMNS = {"cashier_window": "TINYINT DEFAULT NULL"}
 
 
 def ensure_wait_log_columns() -> bool:
@@ -403,7 +406,7 @@ def ensure_wait_log_columns() -> bool:
     try:
         conn = pool.get_connection()
         cursor = conn.cursor()
-        _add_missing_columns(cursor, "queue_records", _WAIT_LOG_COLUMNS)
+        _add_missing_columns(cursor, "queue_records", {**_WAIT_LOG_COLUMNS, **_SERVICE_LOG_COLUMNS})
         conn.commit()
         return True
     except Exception as exc:
@@ -445,6 +448,48 @@ def fetch_wait_observations(days: int | None = None) -> list[dict]:
             (int(days),) if days else (),
         )
         return cursor.fetchall() or []
+    finally:
+        close_db_resources(cursor, conn)
+
+
+def fetch_completed_transactions() -> list[dict]:
+    """Served tickets with their real wait and service time, for retraining.
+    Read-only. No student identifiers are selected: no names, school IDs or
+    student links, only times, counts and the estimate that was shown."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return []
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        columns = _get_table_columns(cursor, "queue_records")
+        if not {"created_at", "called_at", "served_at", "status"} <= columns:
+            return []
+        fields = [
+            "created_at AS ticket_created_at",
+            "called_at AS service_started_at",
+            "served_at AS service_completed_at",
+            "TIMESTAMPDIFF(SECOND, created_at, called_at) AS actual_wait_seconds",
+            "TIMESTAMPDIFF(SECOND, called_at, served_at) AS actual_service_seconds",
+        ]
+        for name in ("people_ahead_at_issue", "active_counters_at_issue", "cashier_window",
+                     "predicted_wait_min", "wait_model_version"):
+            if name in columns:
+                fields.append(name)
+        cursor.execute(
+            f"""
+            SELECT {', '.join(fields)}
+            FROM queue_records
+            WHERE status = 'served'
+              AND called_at IS NOT NULL
+              AND called_at >= created_at
+              AND served_at >= called_at
+            ORDER BY served_at
+            """
+        )
+        return list(cursor.fetchall() or [])
     finally:
         close_db_resources(cursor, conn)
 
@@ -559,6 +604,7 @@ def update_queue_status(
     status: str,
     actor_username: str | None = None,
     called_seconds_ago: int | None = None,
+    cashier_window: int | None = None,
 ) -> None:
     if status not in {"served", "no_show", "expired"}:
         print(f"[DB] Ignored unsupported status '{status}' for Q{queue_number:03d}")
@@ -603,6 +649,9 @@ def update_queue_status(
         if called_seconds_ago is not None and "called_at" in columns:
             set_parts.append("called_at=COALESCE(called_at, NOW() - INTERVAL %s SECOND)")
             params.append(int(called_seconds_ago))
+        if cashier_window is not None and "cashier_window" in columns:
+            set_parts.append("cashier_window=%s")
+            params.append(int(cashier_window))
         params.append(record_id)
 
         cursor.execute(

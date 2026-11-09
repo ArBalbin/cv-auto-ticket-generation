@@ -226,6 +226,7 @@ people ahead. Two sources now provide it, in the same CSV format, and
 | `predicted_wait_min` | The number is issued | The estimate the student was shown |
 | `wait_model_version` | The number is issued | Which model made it |
 | `called_at` | Staff mark the ticket done or no-show | When a counter was first assigned to the person |
+| `cashier_window` | Staff mark the ticket done or no-show | The window that served the person |
 
 The real wait is `called_at − created_at`. A person counts as called when the
 system assigns them a counter, which happens when the person before them at that
@@ -239,6 +240,14 @@ migrated by hand the same change is `database_sql/2026_11_wait_log_migration.sql
 This writes `ML/data/wait_time/system_wait_log.csv` (read-only query). Training
 on it also reports how far the estimates the system showed were from the waits
 that followed: the live accuracy SOP 3 asks for.
+
+**Download without database access.** The same panel has a "Download service
+records (CSV)" button (`GET /api/queue/service_records.csv`, staff only). It
+gives every served ticket's real wait and service time in seconds, the people
+ahead, the counters open, the serving window, and the estimate shown. It has no
+names, school IDs or student links, so it can go to whoever retrains the model.
+`cashier_window` comes from `database_sql/2026_11_service_window_migration.sql`,
+which the backend also applies at startup.
 
 **On the dashboard.** The Analytics tab's "Are the Wait Estimates Right?"
 panel (`GET /api/queue/prediction_accuracy`, staff only) does the same scoring

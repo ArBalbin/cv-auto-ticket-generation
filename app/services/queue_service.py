@@ -485,11 +485,15 @@ def _update_status_then_invalidate(
     status: str,
     actor_username: str | None,
     called_seconds_ago: int | None = None,
+    cashier_window: int | None = None,
 ) -> None:
     """Persist a status change, then drop the ticket from the validation cache
     so the student's next status poll sees it at once."""
     try:
-        update_queue_status(queue_number, status, actor_username, called_seconds_ago=called_seconds_ago)
+        update_queue_status(
+            queue_number, status, actor_username,
+            called_seconds_ago=called_seconds_ago, cashier_window=cashier_window,
+        )
     finally:
         invalidate_ticket_cache(queue_number)
 
@@ -518,14 +522,16 @@ def reset_queue(actor_username: str | None = None) -> None:
     ).start()
 
 def mark_done(queue_number: int, actor_username: str | None = None) -> dict | None:
+    # Read before the entry is retired; afterwards the tracker no longer has it.
     called_seconds_ago = _seconds_since_called(queue_number)
+    cashier_window = queue_tracker.get_counter_number(queue_number)
     if not queue_tracker.mark_transaction_done(queue_number):
         return None
 
     invalidate_ticket_cache(queue_number)
     threading.Thread(
         target=_update_status_then_invalidate,
-        args=(queue_number, "served", actor_username, called_seconds_ago),
+        args=(queue_number, "served", actor_username, called_seconds_ago, cashier_window),
         daemon=True,
         name=f"DBUpdate-Q{queue_number:03d}-served",
     ).start()
@@ -536,13 +542,14 @@ def mark_no_show(queue_number: int, actor_username: str | None = None) -> dict |
     area decides that the person whose turn it is has not come, and the
     system then bumps the number and moves the queue on."""
     called_seconds_ago = _seconds_since_called(queue_number)
+    cashier_window = queue_tracker.get_counter_number(queue_number)
     if not queue_tracker.mark_no_show(queue_number):
         return None
 
     invalidate_ticket_cache(queue_number)
     threading.Thread(
         target=_update_status_then_invalidate,
-        args=(queue_number, "no_show", actor_username, called_seconds_ago),
+        args=(queue_number, "no_show", actor_username, called_seconds_ago, cashier_window),
         daemon=True,
         name=f"DBUpdate-Q{queue_number:03d}-noshow",
     ).start()

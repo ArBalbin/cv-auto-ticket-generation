@@ -340,6 +340,10 @@ class QueueTracker:
         p = self._person_by_queue_number(queue_number)
         return p.called_at if p else None
 
+    def get_counter_number(self, queue_number: int) -> int | None:
+        p = self._person_by_queue_number(queue_number)
+        return p.counter_number if p else None
+
     def line_snapshot(self) -> list[dict]:
         """The live line in order: each person's position, their counter (None
         while still waiting) and when they were called to it."""

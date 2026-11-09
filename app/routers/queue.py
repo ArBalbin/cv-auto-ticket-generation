@@ -1,10 +1,12 @@
+import csv
 from datetime import datetime, timedelta
+from io import StringIO
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 import state
-from database.database_handler import get_db_pool
+from database.database_handler import fetch_completed_transactions, get_db_pool
 from core.security import require_staff
 from services import queue_service, wait_accuracy
 from services.ticket_printer import TicketLookupBusy, get_ticket_record_by_short_code
@@ -217,6 +219,36 @@ def queue_analytics(username: str = Depends(require_staff)):
 )
 def queue_prediction_accuracy(username: str = Depends(require_staff)):
     return wait_accuracy.current_summary()
+
+
+# Columns of the service-records download, in order. Times and counts only:
+# no names, school IDs or student links.
+SERVICE_RECORD_FIELDS = (
+    "ticket_created_at", "service_started_at", "service_completed_at",
+    "actual_wait_seconds", "actual_service_seconds", "people_ahead_at_issue",
+    "active_counters_at_issue", "cashier_window", "predicted_wait_min",
+    "wait_model_version",
+)
+
+
+@router.get(
+    "/api/queue/service_records.csv",
+    summary="Staff - download served tickets' real waits and service times (CSV)",
+    tags=["Queue"],
+)
+def queue_service_records(username: str = Depends(require_staff)):
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=SERVICE_RECORD_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(fetch_completed_transactions())
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="queuex_service_records.csv"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get(
