@@ -168,7 +168,19 @@ class QueueTracker:
     # MIN_CONFIRM_SECONDS over at least MIN_CONFIRM_FACE_FRAMES updates.
     MIN_CONFIRM_SECONDS           = 1.0
     MIN_CONFIRM_FACE_FRAMES       = 3
-    DONE_COOLDOWN_FRAMES          = 150
+    # After someone is served, by time rather than by update count, for the
+    # same reason as MIN_CONFIRM_SECONDS: the counts were set at about 14
+    # updates a second, and the cloud backend gets 2-3. 150 updates had meant
+    # ~10 s and became 50-75 s; 10 updates had meant ~0.7 s and became 4-5 s.
+    #   DONE_COOLDOWN_SECONDS - no new person is confirmed where the served
+    #                           person stood, so their own box flickering as
+    #                           they walk away is not taken for someone new.
+    #   DONE_LEAVE_SECONDS    - out of view this long (over at least
+    #                           DONE_LEAVE_MIN_FRAMES updates) counts as gone.
+    DONE_COOLDOWN_SECONDS         = 10.0
+    DUPLICATE_COOLDOWN_SECONDS    = 3.0
+    DONE_LEAVE_SECONDS            = 1.0
+    DONE_LEAVE_MIN_FRAMES         = 3
     # How long an "on the way" banner stays on the staff dashboard. The alert
     # is a transient prompt — a student has said they are walking over — but
     # nothing expired it, so the list was trimmed only once twenty newer
@@ -518,10 +530,8 @@ class QueueTracker:
         return any(self._iou(e['bbox'], bbox) > threshold for e in self._done_cooldowns)
 
     def _tick_done_cooldowns(self):
-        self._done_cooldowns = [
-            {**e, 'frames_left': e['frames_left'] - 1}
-            for e in self._done_cooldowns if e['frames_left'] > 1
-        ]
+        now = datetime.now()
+        self._done_cooldowns = [e for e in self._done_cooldowns if e['until'] > now]
         for p in self.active_queue.values():
             if p.dedup_immune_frames > 0:
                 p.dedup_immune_frames -= 1
@@ -837,7 +847,8 @@ class QueueTracker:
             p.missing_frames += 1
 
             if p.status == 'done_pending':
-                if p.missing_frames > 10:
+                unseen = (datetime.now() - p.last_seen).total_seconds()
+                if p.missing_frames >= self.DONE_LEAVE_MIN_FRAMES and unseen >= self.DONE_LEAVE_SECONDS:
                     if p.queue_number is not None:
                         self._by_queue_number.pop(p.queue_number, None)
                     if p.student_id is not None:
@@ -890,8 +901,10 @@ class QueueTracker:
 
         p.status           = 'done_pending'
         p.position_in_line = 0
-        self._done_cooldowns.append(
-            {'bbox': p.bbox, 'frames_left': self.DONE_COOLDOWN_FRAMES})
+        self._done_cooldowns.append({
+            'bbox': p.bbox,
+            'until': datetime.now() + timedelta(seconds=self.DONE_COOLDOWN_SECONDS),
+        })
         with self._lock:
             if reason == 'served':
                 self.total_served += 1
@@ -1078,7 +1091,8 @@ class QueueTracker:
                         self._by_student_id.pop(drop.student_id, None)
                     self._done_cooldowns.append({
                         'bbox': drop.bbox,
-                        'frames_left': min(self.DONE_COOLDOWN_FRAMES, 45),
+                        'until': datetime.now() + timedelta(seconds=min(
+                            self.DONE_COOLDOWN_SECONDS, self.DUPLICATE_COOLDOWN_SECONDS)),
                     })
                     to_drop.add(drop_tid)
 

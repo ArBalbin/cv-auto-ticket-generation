@@ -197,6 +197,37 @@ def test_a_face_and_a_faceless_detection_together(system):
     assert 71 in system.tracker.active_queue, "confirmed by count; staff link a walk-in by hand"
 
 
+def test_served_student_who_steps_away_and_rejoins_gets_a_new_number(system):
+    ana = face(150)
+    system.enrolled[150] = ana
+    tap_join(150)
+    system.stand((80, 100, near(ana, 3000, 0.3)))
+    first = app_state(150)["queue_number"]
+    queue_service.mark_done(first)
+
+    # Still standing there: still the served person, no new number.
+    system.stand((80, 100, near(ana, 3001, 0.3)), frames=5)
+    assert system.tracker.get_person_by_student_id(150).status == "done_pending"
+
+    # Out of view for a second (two or three updates on the cloud backend).
+    system.tracker.get_person_by_student_id(150).last_seen -= timedelta(seconds=1.5)
+    system.stand(frames=3)
+    assert system.tracker.get_person_by_student_id(150) is None, "gone after a second"
+
+    # Back in the same spot before the cooldown ends: not taken for someone new.
+    tap_join(150)
+    system.stand((81, 100, near(ana, 3002, 0.3)), frames=5)
+    assert system.tickets == [first]
+
+    # Ten seconds after being served, the spot is free again.
+    for entry in system.tracker._done_cooldowns:
+        entry["until"] -= timedelta(seconds=11)
+    system.stand((81, 100, near(ana, 3003, 0.3)))
+    second = app_state(150)["queue_number"]
+    assert second is not None and second != first
+    assert system.tickets == [first, second]
+
+
 def test_without_a_face_the_full_count_still_applies(system):
     for i in range(3):
         queue_service.process_tracked_persons(frame((8, 400, None)), i)

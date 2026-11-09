@@ -140,6 +140,11 @@ also confirmed after `QUEUE_MIN_CONFIRM_SECONDS` (1 s) over at least
 second. A candidate without a face still needs the full count, so the
 static-object check below keeps enough positions to judge it.
 
+**After someone is served** the same correction applies:
+
+- They count as gone once out of view for 1 second over at least 3 updates. This was 10 updates, which became 4–5 seconds.
+- For 10 seconds after being served, nobody new is confirmed where they stood. This stops their own box from being taken for someone new as they walk away. It was 150 updates, which became 50–75 seconds and kept a student who stepped away and rejoined from getting a new number for about a minute.
+
 **Static-object rejection:** a candidate whose bounding-box centre moves
 less than `QUEUE_MIN_MOTION_PIXELS` (8 px) across the accumulation window
 is rejected as a poster, reflection, or photograph rather than a live
