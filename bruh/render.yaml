@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: queueflow-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: PORTAL_BASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: SECRET_KEY
+        generateValue: true
+      - key: CAM_TOKEN
+        sync: false
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_USERNAME
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_SSL_MODE
+        value: REQUIRED
+      - key: OBJECT_STORAGE_ENABLED
+        value: "1"
+      - key: OBJECT_STORAGE_ENDPOINT_URL
+        sync: false
+      - key: OBJECT_STORAGE_BUCKET
+        sync: false
+      - key: OBJECT_STORAGE_REGION
+        sync: false
+      - key: OBJECT_STORAGE_ACCESS_KEY_ID
+        sync: false
+      - key: OBJECT_STORAGE_SECRET_ACCESS_KEY
+        sync: false
+      - key: OBJECT_STORAGE_PREFIX
+        value: tickets
+      - key: OBJECT_STORAGE_ADDRESSING_STYLE
+        value: path
+      - key: SESSION_COOKIE_SECURE
+        value: "1"

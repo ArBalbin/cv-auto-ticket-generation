@@ -1,0 +1,19 @@
+# Dependencies for the machine that runs app/detector.py — the one physically
+# connected to the queue-zone camera.
+#
+# The detector cannot be deployed: it needs the camera. It runs locally and
+# pushes detections to the backend over HTTP, so it needs everything the
+# server needs, plus YOLO.
+#
+#   pip install -r requirements-detector.txt
+#
+# The server installs requirements.txt only. Keeping ultralytics out of that
+# file is what stops the deployment from downloading ~2.5GB of PyTorch and
+# CUDA wheels it never imports.
+
+-r requirements.txt
+
+# YOLOv8n person detection and ByteTrack tracking. Pulls torch, which on Linux
+# pulls the CUDA runtime as well — several GB, and worth it only on the machine
+# that actually runs detection.
+ultralytics
