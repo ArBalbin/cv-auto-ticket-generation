@@ -144,6 +144,13 @@ class QueuePerson:
             'linked_via':        self.linked_via,
             'has_face_embedding': self.face_embedding is not None,
             'counter_number':    self.counter_number,
+            # How long they have been at their window, for the staff "Now
+            # serving" cards. An age, not a time: this process's clock is UTC
+            # on the server, and the browser would read a bare time as local.
+            'seconds_at_counter': (
+                max(0, int((datetime.now() - self.called_at).total_seconds()))
+                if self.counter_number is not None and self.called_at is not None else None
+            ),
             'retired_as':        self.retired_as,
         }
 
@@ -236,6 +243,9 @@ class QueueTracker:
         self.counters_closed_until: datetime | None = None
         self._announced_numbers: set      = set()
         self._newly_called: list          = []
+        # True: a free window takes the next number by itself. False: staff
+        # call each number with call_next(). Set from QUEUE_CALL_MODE.
+        self.auto_call: bool              = True
         self._by_queue_number: dict       = {}   # queue_number -> track_id
         self._by_student_id: dict         = {}   # student_id -> track_id
         # Next number to hand out via mint_face_only_number() — a dedicated
@@ -1117,6 +1127,9 @@ class QueueTracker:
         for i, p in enumerate(active_line):
             p.position_in_line = i + 1
 
+        if not self.auto_call:
+            return  # staff call each number with call_next()
+
         if self.counters_closed_until is not None and datetime.now() < self.counters_closed_until:
             self._newly_called = []
             return
@@ -1146,6 +1159,45 @@ class QueueTracker:
                     })
 
         self._newly_called = newly_called
+
+    def call_next(self, counter_number: int) -> tuple[str, dict | None]:
+        """Staff at window `counter_number` call the next number in line.
+
+        Returns (outcome, person):
+          'called'  - the first person not yet at a window now has this one;
+          'busy'    - someone is still at this window: finish them first;
+          'empty'   - nobody is waiting;
+          'closed'  - every window is closed (lunch) until a set time;
+          'invalid' - there is no such window.
+        """
+        if not 1 <= counter_number <= self._num_counters:
+            return 'invalid', None
+        if self.counters_closed_until is not None and datetime.now() < self.counters_closed_until:
+            return 'closed', None
+
+        line = sorted(
+            (p for p in self.active_queue.values()
+             if p.queue_number is not None and p.status in ('waiting', 'missing')),
+            key=lambda x: x.queue_number,
+        )
+        at_window = next((p for p in line if p.counter_number == counter_number), None)
+        if at_window is not None:
+            return 'busy', at_window.to_dict()
+        person = next((p for p in line if p.counter_number is None), None)
+        if person is None:
+            return 'empty', None
+
+        person.counter_number = counter_number
+        person.called_at = person.called_at or datetime.now()
+        if person.queue_number not in self._announced_numbers:
+            self._announced_numbers.add(person.queue_number)
+            self._newly_called.append({
+                'queue_number':   person.queue_number,
+                'queue_label':    queue_label(person.queue_number),
+                'counter_number': counter_number,
+            })
+        print(f"📣 {queue_label(person.queue_number)} called to window {counter_number}")
+        return 'called', person.to_dict()
 
     def get_state(self) -> dict:
         active = sorted(

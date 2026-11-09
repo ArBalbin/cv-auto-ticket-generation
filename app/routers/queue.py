@@ -46,6 +46,14 @@ class CountersBody(BaseModel):
     counters: int
 
 
+class WindowBody(BaseModel):
+    counter_number: int
+
+
+class CallModeBody(BaseModel):
+    mode: str  # "staff" (Call next) or "auto"
+
+
 class CloseCountersBody(BaseModel):
     until: str  # 24-hour clock today, e.g. "13:00"
 
@@ -329,6 +337,63 @@ def link_pending(body: LinkPendingBody, username: str = Depends(require_staff)):
         "message": f"Q{body.queue_number:03d} linked",
         "person": person,
     }
+
+
+@router.get("/api/queue/windows", summary="Staff - the windows and who holds each", tags=["Queue"])
+def queue_windows(username: str = Depends(require_staff)):
+    return queue_service.window_overview(username)
+
+
+@router.post("/api/queue/window/claim", summary="Staff - take a window for this account", tags=["Queue"])
+def queue_claim_window(body: WindowBody, username: str = Depends(require_staff)):
+    try:
+        queue_service.claim_window(username, body.counter_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except queue_service.WindowTaken as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return queue_service.window_overview(username)
+
+
+@router.post("/api/queue/window/release", summary="Staff - give up this account's window", tags=["Queue"])
+def queue_release_window(username: str = Depends(require_staff)):
+    queue_service.release_window(username)
+    return queue_service.window_overview(username)
+
+
+@router.post("/api/queue/call_mode", summary="Staff - switch between Call next and automatic calling", tags=["Queue"])
+def queue_call_mode(body: CallModeBody, username: str = Depends(require_staff)):
+    try:
+        queue_service.set_call_mode(body.mode.strip().lower(), username)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return queue_service.window_overview(username)
+
+
+@router.post("/api/queue/call_next", summary="Staff - call the next number to my window", tags=["Queue"])
+def queue_call_next(body: WindowBody, username: str = Depends(require_staff)):
+    try:
+        outcome, person = queue_service.call_next(body.counter_number, username)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except queue_service.WindowTaken as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    if outcome == "called":
+        return {"called": person, "message": f"{person['queue_label']} called to window {body.counter_number}."}
+    if outcome == "empty":
+        return {"called": None, "message": "No one is waiting."}
+    if outcome == "busy":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Window {body.counter_number} is still serving {person['queue_label']}. "
+                   "Mark it Done or No-show first.",
+        )
+    if outcome == "closed":
+        until = queue_service.counters_closed_until()
+        when = queue_service.school_time_label(until) if until else "later"
+        raise HTTPException(status_code=409, detail=f"All windows are closed until {when}.")
+    raise HTTPException(status_code=400, detail=f"There is no window {body.counter_number}.")
 
 
 @router.post("/api/queue/done", summary="Staff - mark done", tags=["Queue"])

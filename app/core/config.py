@@ -165,6 +165,12 @@ QUEUE_CONFIG = {
 # people-ahead counts (services/wait_model.py). Set WAIT_ESTIMATOR=regression
 # on the server to switch back without a code change.
 WAIT_ESTIMATOR = os.getenv("WAIT_ESTIMATOR", "queue").strip().lower()
+# Who calls the next number to a window:
+#   "staff" - the staff member at that window presses Call next (default);
+#   "auto"  - the system calls the next number as soon as a window is free.
+QUEUE_CALL_MODE = os.getenv("QUEUE_CALL_MODE", "staff").strip().lower()
+if QUEUE_CALL_MODE not in {"staff", "auto"}:
+    QUEUE_CALL_MODE = "staff"
 
 # The school's clock, for times staff type in (e.g. "close counters until
 # 13:00"). The deployed server runs on UTC, so a bare 13:00 there would be

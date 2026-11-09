@@ -598,6 +598,29 @@ def test_the_app_is_told_who_is_at_each_window(system):
         "the next in line takes the freed window"
 
 
+def test_staff_and_app_see_who_is_at_each_window_and_for_how_long(system, monkeypatch):
+    from routers import queue as queue_router
+
+    for n in range(6400, 6405):
+        system.tracker.force_new_person(n)
+    at_window = system.tracker._person_by_queue_number(6401)
+    at_window.called_at -= timedelta(seconds=90)
+
+    entries = {p["queue_number"]: p for p in system.tracker.get_state()["active_queue"]}
+    assert entries[6401]["counter_number"] == 2
+    assert 89 <= entries[6401]["seconds_at_counter"] <= 95, "the staff card shows how long"
+    assert entries[6404]["counter_number"] is None and entries[6404]["seconds_at_counter"] is None
+
+    # The app's status for someone at a window carries the window, so it can
+    # show "It's your turn: Window 2" instead of "Waiting in line".
+    token = at_window.short_code or at_window.access_token
+    monkeypatch.setattr(queue_router, "get_db_pool", lambda: object())
+    monkeypatch.setattr(queue_router, "get_ticket_record_by_short_code",
+                        lambda t, q, pool: {"queue_number": q, "status": "waiting"})
+    status = queue_router.queue_status(6401, token)
+    assert status["counter_number"] == 2 and status["status"] == "waiting"
+
+
 # ------------------------------------------------- wait log (WAIT_TIME_MODEL.md)
 
 def test_each_ticket_logs_the_line_it_joined_and_its_estimate(system, monkeypatch):

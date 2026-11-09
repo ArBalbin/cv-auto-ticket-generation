@@ -12,6 +12,7 @@ from core.config import (
     FACE_MATCH_THRESHOLD,
     LOW_CONF_BOOST,
     PENDING_LINK_TIMEOUT_SECONDS,
+    QUEUE_CALL_MODE,
     QUEUE_CONFIG,
     QUEUE_DEDUP_CENTRE_FRAC,
     QUEUE_DEDUP_IOU_THRESH,
@@ -65,6 +66,9 @@ SCHOOL_TZ = timezone(timedelta(hours=SCHOOL_UTC_OFFSET_HOURS))
 # Kept here as well as on the tracker so a queue reset does not reopen
 # counters that staff closed.
 _counters_closed_until: datetime | None = None
+# "staff" or "auto". Starts from QUEUE_CALL_MODE; staff switch it from the
+# dashboard. Kept here, like the lunch closure, so a queue reset keeps it.
+_call_mode: str = QUEUE_CALL_MODE
 
 def _on_number_linked(
     queue_number: int,
@@ -120,6 +124,7 @@ def _service_time_refresh_loop() -> None:
 
 def wire_callbacks() -> None:
     queue_tracker.on_number_linked = _on_number_linked
+    queue_tracker.auto_call = _call_mode == "auto"
     queue_tracker.MAX_MISSING_FRAMES = QUEUE_MAX_MISSING_FRAMES
     queue_tracker.MIN_CONFIRM_FRAMES = QUEUE_MIN_CONFIRM_FRAMES
     queue_tracker.MIN_CONFIRM_SECONDS = QUEUE_MIN_CONFIRM_SECONDS
@@ -525,6 +530,96 @@ def reset_queue(actor_username: str | None = None) -> None:
         name="DBAudit-queue-reset",
     ).start()
 
+# WINDOWS HELD BY STAFF ACCOUNTS
+#
+# Each signed-in staff member works one window, and one window belongs to one
+# account at a time, so two people never call numbers to the same window. The
+# dashboard renews its claim while it is open; a claim it stops renewing (the
+# browser was closed without logging out) lapses after WINDOW_CLAIM_TTL_SECONDS.
+WINDOW_CLAIM_TTL_SECONDS = 120
+_window_claims: dict[int, tuple[str, float]] = {}
+_window_claims_lock = threading.Lock()
+
+
+class WindowTaken(Exception):
+    def __init__(self, counter_number: int, holder: str):
+        super().__init__(f"Window {counter_number} is being used by {holder}.")
+        self.counter_number = counter_number
+        self.holder = holder
+
+
+def _purge_expired_claims(now: float) -> None:
+    for counter, (_, renewed) in list(_window_claims.items()):
+        if now - renewed > WINDOW_CLAIM_TTL_SECONDS:
+            del _window_claims[counter]
+
+
+def claim_window(username: str, counter_number: int) -> None:
+    """Hold `counter_number` for `username`, or renew their hold on it.
+    A staff member holds one window: claiming another releases the first."""
+    if not 1 <= counter_number <= queue_tracker._num_counters:
+        raise ValueError(f"There is no window {counter_number}.")
+    now = time.monotonic()
+    with _window_claims_lock:
+        _purge_expired_claims(now)
+        holder = _window_claims.get(counter_number)
+        if holder is not None and holder[0] != username:
+            raise WindowTaken(counter_number, holder[0])
+        for counter, (user, _) in list(_window_claims.items()):
+            if user == username and counter != counter_number:
+                del _window_claims[counter]
+        _window_claims[counter_number] = (username, now)
+
+
+def release_window(username: str) -> None:
+    with _window_claims_lock:
+        for counter, (user, _) in list(_window_claims.items()):
+            if user == username:
+                del _window_claims[counter]
+
+
+def window_overview(username: str) -> dict:
+    now = time.monotonic()
+    with _window_claims_lock:
+        _purge_expired_claims(now)
+        claims = {counter: user for counter, (user, _) in _window_claims.items()}
+    count = queue_tracker._num_counters
+    return {
+        "call_mode": "auto" if queue_tracker.auto_call else "staff",
+        "num_counters": count,
+        "my_window": next((c for c, u in claims.items() if u == username), None),
+        "windows": [
+            {"counter_number": c, "claimed_by": claims.get(c)} for c in range(1, count + 1)
+        ],
+    }
+
+
+def set_call_mode(mode: str, actor_username: str | None = None) -> str:
+    """Switch every window between staff calling (Call next) and automatic
+    calling. Lasts until changed again or the server restarts, when
+    QUEUE_CALL_MODE applies again."""
+    global _call_mode
+    if mode not in ("staff", "auto"):
+        raise ValueError('Call mode must be "staff" or "auto".')
+    _call_mode = mode
+    queue_tracker.auto_call = mode == "auto"
+    # Switching to automatic fills the free windows at once, not on the next
+    # camera update; switching to staff calling leaves current calls as they are.
+    queue_tracker._recalculate_positions()
+    print(f"[QueueService] call mode set to {mode} by {actor_username or 'unknown'}")
+    return mode
+
+
+def call_next(counter_number: int, username: str) -> tuple[str, dict | None]:
+    """The staff member at `counter_number` calls the next number. Their
+    hold on the window is checked (and renewed) first."""
+    claim_window(username, counter_number)
+    outcome, person = queue_tracker.call_next(counter_number)
+    if outcome == "called" and person is not None:
+        invalidate_ticket_cache(person.get("queue_number"))
+    return outcome, person
+
+
 def mark_done(queue_number: int, actor_username: str | None = None) -> dict | None:
     # Read before the entry is retired; afterwards the tracker no longer has it.
     called_seconds_ago = _seconds_since_called(queue_number)
@@ -734,6 +829,10 @@ def school_time_today(clock) -> datetime:
 def school_iso(moment: datetime | None) -> str | None:
     """A server-local time as ISO 8601 with the school's offset, for clients."""
     return moment.astimezone().astimezone(SCHOOL_TZ).isoformat() if moment else None
+
+def school_time_label(moment: datetime) -> str:
+    """'1:00 PM' on the school's clock, for messages to staff."""
+    return moment.astimezone().astimezone(SCHOOL_TZ).strftime("%I:%M %p").lstrip("0")
 
 def set_counters_closed_until(until: datetime | None) -> datetime | None:
     """Close every counter until `until` (lunch), or reopen with None."""
