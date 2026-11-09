@@ -37,7 +37,8 @@ from routers import students  # noqa: E402
 # Settings copied from the deployed tracker so the tests exercise the real
 # thresholds (0.30 / 0.15, 20-frame confirmation) rather than class defaults.
 DEPLOYED_SETTINGS = (
-    "MAX_MISSING_FRAMES", "MIN_CONFIRM_FRAMES", "MIN_MOTION_PIXELS",
+    "MAX_MISSING_FRAMES", "MIN_CONFIRM_FRAMES", "MIN_CONFIRM_SECONDS",
+    "MIN_CONFIRM_FACE_FRAMES", "MIN_MOTION_PIXELS",
     "STATIC_STDEV_THRESHOLD", "STATIC_CONF_BYPASS_THRESHOLD",
     "MIN_PORTRAIT_ASPECT", "FACE_MATCH_THRESHOLD", "FACE_MARGIN_THRESHOLD",
     "PENDING_LINK_TIMEOUT_SECONDS", "DEDUP_IOU_THRESH", "DEDUP_CENTRE_FRAC",
@@ -135,6 +136,77 @@ def test_student_who_joined_is_issued_a_number_without_manual_input(system):
     person = system.tracker.get_person_by_student_id(101)
     assert person.linked_via == "face_only", "no kiosk ticket and no staff input"
     assert system.tickets == [state["queue_number"]], "a ticket is generated"
+
+
+def test_a_face_in_the_zone_for_a_second_is_confirmed_without_the_full_count(system):
+    # The cloud backend gets 2-3 updates a second, so the 14-update count
+    # alone took 5-7 s. With a face seen, one second and three updates do.
+    ana = face(3)
+    for i in range(3):
+        queue_service.process_tracked_persons(frame((7, 100, near(ana, 70 + i, 0.3))), i)
+    assert 7 not in system.tracker.active_queue, "under a second: not yet"
+
+    system.tracker._candidates[7]["first_seen"] -= timedelta(seconds=1.5)
+    queue_service.process_tracked_persons(frame((7, 100, near(ana, 79, 0.3))), 3)
+    assert 7 in system.tracker.active_queue
+
+
+def test_several_students_arriving_together_each_get_a_number_and_ticket(system):
+    sids = [140, 141, 142, 143]
+    faces = {sid: face(sid) for sid in sids}
+    system.enrolled.update(faces)
+    for sid in sids:
+        tap_join(sid)
+
+    def people(update):
+        return [(60 + i, 100 + 400 * i, near(faces[sid], 1000 * update + i, 0.3))
+                for i, sid in enumerate(sids)]
+
+    for k in range(3):
+        queue_service.process_tracked_persons(frame(*people(k)), k)
+    assert not system.tickets, "under a second: nobody confirmed yet"
+
+    for candidate in system.tracker._candidates.values():
+        candidate["first_seen"] -= timedelta(seconds=1.5)
+    queue_service.process_tracked_persons(frame(*people(3)), 3)
+
+    numbers = [app_state(sid)["queue_number"] for sid in sids]
+    assert None not in numbers
+    assert len(set(numbers)) == 4, "each student gets their own number"
+    assert sorted(system.tickets) == sorted(numbers), "one ticket each"
+    assert sorted(system.tracker.get_position(n) for n in numbers) == [1, 2, 3, 4]
+
+
+def test_a_face_and_a_faceless_detection_together(system):
+    # A student facing the camera is confirmed at once; someone with their
+    # back turned in the same frames waits for the full count, then joins too.
+    ana = face(144)
+    system.enrolled[144] = ana
+    tap_join(144)
+    for k in range(3):
+        queue_service.process_tracked_persons(frame((70, 100, near(ana, 2000 + k, 0.3)), (71, 900, None)), k)
+    for candidate in system.tracker._candidates.values():
+        candidate["first_seen"] -= timedelta(seconds=1.5)
+    queue_service.process_tracked_persons(frame((70, 100, near(ana, 2003, 0.3)), (71, 900, None)), 3)
+
+    assert app_state(144)["queue_number"] is not None
+    assert 71 not in system.tracker.active_queue
+
+    for k in range(4, system.tracker.MIN_CONFIRM_FRAMES + 1):
+        queue_service.process_tracked_persons(frame((70, 100, near(ana, 2000 + k, 0.3)), (71, 900, None)), k)
+    assert 71 in system.tracker.active_queue, "confirmed by count; staff link a walk-in by hand"
+
+
+def test_without_a_face_the_full_count_still_applies(system):
+    for i in range(3):
+        queue_service.process_tracked_persons(frame((8, 400, None)), i)
+    system.tracker._candidates[8]["first_seen"] -= timedelta(seconds=5)
+    queue_service.process_tracked_persons(frame((8, 400, None)), 3)
+    assert 8 not in system.tracker.active_queue, "time alone is not enough without a face"
+
+    for i in range(4, system.tracker.MIN_CONFIRM_FRAMES + 1):
+        queue_service.process_tracked_persons(frame((8, 400, None)), i)
+    assert 8 in system.tracker.active_queue
 
 
 def test_app_shows_the_right_state_before_and_after_joining(system):

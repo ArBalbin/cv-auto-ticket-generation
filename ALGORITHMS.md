@@ -59,6 +59,8 @@ defaults inside `QueueTracker` are overwritten at startup by
 | `MAX_BBOX_FRAC` | 0.85 | Reject boxes covering most of the frame |
 | `QUEUE_MIN_PORTRAIT_ASPECT` | 0.60 | Reject non-person-shaped boxes |
 | `QUEUE_MIN_CONFIRM_FRAMES` | 20 | Frames before presence is confirmed |
+| `QUEUE_MIN_CONFIRM_SECONDS` | 1.0 | With a face seen: time in the zone that confirms presence instead |
+| `QUEUE_MIN_CONFIRM_FACE_FRAMES` | 3 | With a face seen: fewest frames for the time rule |
 | `QUEUE_MIN_MOTION_PIXELS` | 7 | Static-object rejection threshold |
 | `QUEUE_STATIC_CONF_BYPASS` | 0.70 | Confidence that skips the motion test |
 | `QUEUE_MAX_MISSING_FRAMES` | 240 | Frames absent before removal |
@@ -128,6 +130,15 @@ inside = zone.x1 ≤ (x1+x2)/2 ≤ zone.x2  AND  zone.y1 ≤ (y1+y2)/2 ≤ zone.
 `QUEUE_MIN_CONFIRM_FRAMES` (20) frames. This is the anti-ghost filter — a
 person walking past the camera, or a one-frame false positive, never
 reaches 20.
+
+The frame count assumed the tracker received about 14 updates a second, so it
+meant roughly one second. With the backend in the cloud, the detector reaches
+it 2–3 times a second (each update waits for the server's reply), and the same
+count took 5–7 seconds. So a candidate whose face the detector has captured is
+also confirmed after `QUEUE_MIN_CONFIRM_SECONDS` (1 s) over at least
+`QUEUE_MIN_CONFIRM_FACE_FRAMES` (3) frames, which restores the intended one
+second. A candidate without a face still needs the full count, so the
+static-object check below keeps enough positions to judge it.
 
 **Static-object rejection:** a candidate whose bounding-box centre moves
 less than `QUEUE_MIN_MOTION_PIXELS` (8 px) across the accumulation window

@@ -161,6 +161,13 @@ class QueueZone:
 class QueueTracker:
     MAX_MISSING_FRAMES            = 300
     MIN_CONFIRM_FRAMES            = 15
+    # Confirmation by time as well as by count. MIN_CONFIRM_FRAMES was set
+    # when the tracker got about 14 updates a second (~1 s). With the backend
+    # in the cloud the detector reaches it 2-3 times a second, so 15 updates
+    # took 5-7 s. Someone whose face the camera has seen is confirmed after
+    # MIN_CONFIRM_SECONDS over at least MIN_CONFIRM_FACE_FRAMES updates.
+    MIN_CONFIRM_SECONDS           = 1.0
+    MIN_CONFIRM_FACE_FRAMES       = 3
     DONE_COOLDOWN_FRAMES          = 150
     # How long an "on the way" banner stays on the staff dashboard. The alert
     # is a transient prompt — a student has said they are walking over — but
@@ -562,6 +569,21 @@ class QueueTracker:
                 return True
         return False
 
+    def _confirmed_by_time(self, cand: dict) -> bool:
+        """Whether a candidate is confirmed by time rather than by count.
+
+        Only for a candidate whose face the detector has captured. One without
+        a face still needs the full MIN_CONFIRM_FRAMES, so the static-object
+        check below has enough positions to judge a poster or a chair."""
+        if self.MIN_CONFIRM_SECONDS <= 0 or not cand.get('face_embeds'):
+            return False
+        if cand['count'] < self.MIN_CONFIRM_FACE_FRAMES:
+            return False
+        first_seen = cand.get('first_seen')
+        if first_seen is None:
+            return False
+        return (datetime.now() - first_seen).total_seconds() >= self.MIN_CONFIRM_SECONDS
+
     def _has_sufficient_motion(self, centers: list, avg_conf: float = 0.0,
                                 has_face_embedding: bool = False) -> bool:
         if avg_conf >= self.STATIC_CONF_BYPASS_THRESHOLD:
@@ -756,7 +778,7 @@ class QueueTracker:
                     self._restore_missing_person(early_person, early_tid, track_id, bbox, live_embedding)
                     continue
 
-            if cand['count'] < self.MIN_CONFIRM_FRAMES:
+            if cand['count'] < self.MIN_CONFIRM_FRAMES and not self._confirmed_by_time(cand):
                 if cand['count'] % 5 == 0:
                     print(f"[QueueTracker] DEBUG tid={track_id} accumulating "
                           f"count={cand['count']}/{self.MIN_CONFIRM_FRAMES}")
