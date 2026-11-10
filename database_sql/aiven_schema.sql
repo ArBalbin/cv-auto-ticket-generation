@@ -151,6 +151,10 @@ CREATE TABLE `queue_records` (
   `called_at`                datetime     DEFAULT NULL,
   -- Window that served the ticket (2026_11_service_window_migration.sql).
   `cashier_window`           tinyint      DEFAULT NULL,
+  -- From the app's join form (2026_11_payment_details_migration.sql).
+  `payment_type`             varchar(60)  DEFAULT NULL,
+  `payment_amount`           decimal(10,2) DEFAULT NULL,
+  `payment_note`             varchar(120) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_queue_number`          (`queue_number`),
   KEY `idx_service_date_queue`    (`service_date`,`queue_number`),

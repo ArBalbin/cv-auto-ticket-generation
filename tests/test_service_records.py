@@ -97,10 +97,11 @@ def test_download_is_staff_only_and_csv(monkeypatch):
         "ticket_created_at": datetime(2026, 11, 10, 9, 0), "service_started_at": datetime(2026, 11, 10, 9, 4),
         "service_completed_at": datetime(2026, 11, 10, 9, 6), "actual_wait_seconds": 240,
         "actual_service_seconds": 120, "people_ahead_at_issue": 3, "active_counters_at_issue": 3,
-        "cashier_window": 2, "predicted_wait_min": 2.0, "wait_model_version": "queue-engine",
+        "cashier_window": 2, "payment_type": "Tuition fee", "predicted_wait_min": 2.0,
+        "wait_model_version": "queue-engine",
     }])
     response = route(username="staff")
     body = response.body.decode()
     assert response.media_type == "text/csv"
     assert body.splitlines()[0] == ",".join(queue.SERVICE_RECORD_FIELDS)
-    assert ",240,120,3,3,2,2.0,queue-engine" in body
+    assert ",240,120,3,3,2,Tuition fee,2.0,queue-engine" in body

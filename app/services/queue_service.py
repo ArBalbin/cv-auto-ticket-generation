@@ -86,6 +86,7 @@ def _on_number_linked(
     to "a real kiosk number was linked.\""""
     position = queue_tracker.get_position(queue_number)
     counters = runtime_config()["active_counters"]
+    person = queue_tracker._person_by_queue_number(queue_number)
     try:
         ticket_service.enqueue_ticket(
             queue_number=queue_number,
@@ -99,6 +100,9 @@ def _on_number_linked(
             people_ahead=max(0, position - 1),
             active_counters=counters,
             estimator_version=estimator_version(),
+            payment_type=getattr(person, "payment_type", None),
+            payment_amount=getattr(person, "payment_amount", None),
+            payment_note=getattr(person, "payment_note", None),
         )
         print(f"[QueueService] Q{queue_number:03d} ({linked_via}) queued for ticket generation")
     except Exception:

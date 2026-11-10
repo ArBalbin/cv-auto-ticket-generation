@@ -390,6 +390,13 @@ _WAIT_LOG_COLUMNS = {**_WAIT_LOG_ISSUE_COLUMNS, "called_at": "DATETIME DEFAULT N
 # Which window served the ticket, written with called_at. Kept out of
 # _WAIT_LOG_COLUMNS so the wait log keeps working on a table without it.
 _SERVICE_LOG_COLUMNS = {"cashier_window": "TINYINT DEFAULT NULL"}
+# What the student said they are paying for, from the app's join form
+# (database_sql/2026_11_payment_details_migration.sql).
+_PAYMENT_COLUMNS = {
+    "payment_type": "VARCHAR(60) DEFAULT NULL",
+    "payment_amount": "DECIMAL(10,2) DEFAULT NULL",
+    "payment_note": "VARCHAR(120) DEFAULT NULL",
+}
 
 
 def ensure_wait_log_columns() -> bool:
@@ -406,7 +413,8 @@ def ensure_wait_log_columns() -> bool:
     try:
         conn = pool.get_connection()
         cursor = conn.cursor()
-        _add_missing_columns(cursor, "queue_records", {**_WAIT_LOG_COLUMNS, **_SERVICE_LOG_COLUMNS})
+        _add_missing_columns(cursor, "queue_records",
+                             {**_WAIT_LOG_COLUMNS, **_SERVICE_LOG_COLUMNS, **_PAYMENT_COLUMNS})
         conn.commit()
         return True
     except Exception as exc:
@@ -475,7 +483,7 @@ def fetch_completed_transactions() -> list[dict]:
             "TIMESTAMPDIFF(SECOND, called_at, served_at) AS actual_service_seconds",
         ]
         for name in ("people_ahead_at_issue", "active_counters_at_issue", "cashier_window",
-                     "predicted_wait_min", "wait_model_version"):
+                     "payment_type", "predicted_wait_min", "wait_model_version"):
             if name in columns:
                 fields.append(name)
         cursor.execute(
@@ -525,7 +533,8 @@ def save_ticket_record(ticket: dict) -> bool:
             if has_identity_cols else ""
         )
         # The wait estimate logged at issue, on schemas that have the columns.
-        wait_cols = [c for c in _WAIT_LOG_ISSUE_COLUMNS if c in columns and c in ticket]
+        wait_cols = [c for c in (*_WAIT_LOG_ISSUE_COLUMNS, *_PAYMENT_COLUMNS)
+                     if c in columns and c in ticket]
         identity_fields += "".join(f", {c}" for c in wait_cols)
         identity_placeholders += ", %s" * len(wait_cols)
         identity_values += tuple(ticket[c] for c in wait_cols)

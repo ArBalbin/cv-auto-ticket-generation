@@ -282,6 +282,60 @@ def test_without_a_face_the_full_count_still_applies(system):
     assert 8 in system.tracker.active_queue
 
 
+def join_with(student_id, **form):
+    return run(students.join_queue(students.JoinBody(**form), student_id=student_id))
+
+
+def test_the_payment_on_the_join_form_reaches_the_cashier(system):
+    from routers import queue as queue_router
+
+    ana = face(160)
+    system.enrolled[160] = ana
+    joined = join_with(160, payment_type="tuition fee", payment_amount=5000)
+    assert joined["payment_type"] == "Tuition fee", "matched to the list's own spelling"
+    system.stand((95, 100, near(ana, 5000, 0.3)))
+
+    person = system.tracker.get_person_by_student_id(160)
+    entry = person.to_dict()
+    assert (entry["payment_type"], entry["payment_amount"], entry["payment_note"]) == ("Tuition fee", 5000.0, None)
+    # The public display board never shows what anyone is paying.
+    board = queue_router.queue_display()
+    assert all("payment_amount" not in p for p in board["active_queue"])
+
+
+def test_other_fees_need_a_description_and_every_payment_a_total(system):
+    from fastapi import HTTPException
+
+    for form, message in (
+        ({"payment_type": "Parking"}, "from the list"),
+        ({"payment_type": "Other fees", "payment_amount": 300}, "which fees"),
+        ({"payment_type": "Balance"}, "total"),
+        ({"payment_type": "Balance", "payment_amount": 0}, "total"),
+    ):
+        with pytest.raises(HTTPException) as refused:
+            join_with(161, **form)
+        assert refused.value.status_code == 422 and message in refused.value.detail
+
+    joined = join_with(161, payment_type="Other fees", payment_amount=350.5,
+                       payment_note="  ID replacement and library fine ")
+    assert joined["payment_note"] == "ID replacement and library fine"
+    assert joined["payment_amount"] == 350.5
+
+
+def test_an_older_app_without_the_form_can_still_join(system):
+    ana = face(162)
+    system.enrolled[162] = ana
+    tap_join(162)
+    system.stand((96, 100, near(ana, 5100, 0.3)))
+    assert system.tracker.get_person_by_student_id(162).payment_type is None
+
+
+def test_the_app_reads_the_fee_list_from_the_server():
+    listing = students.payment_types()
+    assert listing["payment_types"][:3] == ["Tuition fee", "Enrollment fee", "Balance"]
+    assert listing["other_type"] == "Other fees" and listing["other_type"] in listing["payment_types"]
+
+
 def test_app_shows_the_right_state_before_and_after_joining(system):
     system.enrolled[102] = face(2)
     assert app_state(102)["state"] == "not_joined"

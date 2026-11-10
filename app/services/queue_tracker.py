@@ -36,6 +36,9 @@ class QueuePerson:
         # person as 'done_pending' while they walk away; the app needs to
         # know which, to tell a skipped student why their number ended.
         'retired_as',
+        # What the student said they are paying for, and how much, when they
+        # joined in the app. Shown to the cashier; None for walk-ins.
+        'payment_type', 'payment_amount', 'payment_note',
         # Evaluation instrumentation (recognition_metrics) — first_seen_at is
         # the very first frame this person appeared in, which is earlier than
         # entered_at (the moment presence was *confirmed*).
@@ -68,6 +71,9 @@ class QueuePerson:
         self.linked_at            = datetime.now() if queue_number is not None else None
         self.called_at            = None
         self.retired_as           = None
+        self.payment_type         = None
+        self.payment_amount       = None
+        self.payment_note         = None
         self.first_seen_at        = None
         self.embed_attempts       = 0
         self.embed_successes      = 0
@@ -152,6 +158,9 @@ class QueuePerson:
                 if self.counter_number is not None and self.called_at is not None else None
             ),
             'retired_as':        self.retired_as,
+            'payment_type':      self.payment_type,
+            'payment_amount':    self.payment_amount,
+            'payment_note':      self.payment_note,
         }
 
 
@@ -256,6 +265,8 @@ class QueueTracker:
         # (student_id -> armed_at). Recognition alone is NOT consent to be
         # queued; without an entry here a recognized student is ignored.
         self._join_intents: dict          = {}
+        # student_id -> {'payment_type', 'payment_amount'} from the join form
+        self._join_details: dict          = {}
 
 
     # LOOKUP BY QUEUE NUMBER (O(1) via secondary index)
@@ -307,7 +318,7 @@ class QueueTracker:
 
     # JOIN INTENT — explicit consent to be issued a number on recognition
 
-    def arm_join_intent(self, student_id: int) -> datetime:
+    def arm_join_intent(self, student_id: int, payment: dict | None = None) -> datetime:
         """Student tapped "join the queue" in the app. Tapping again just
         refreshes the timestamp.
 
@@ -320,6 +331,8 @@ class QueueTracker:
         """
         now = datetime.now()
         self._join_intents[student_id] = now
+        if payment is not None:
+            self._join_details[student_id] = dict(payment)
 
         for person in self.active_queue.values():
             if (person.identity_status == 'bystander'
@@ -331,6 +344,7 @@ class QueueTracker:
 
     def clear_join_intent(self, student_id: int) -> None:
         self._join_intents.pop(student_id, None)
+        self._join_details.pop(student_id, None)
 
     def has_join_intent(self, student_id: int) -> bool:
         """True only if this student armed themselves and the intent has not
@@ -416,6 +430,10 @@ class QueueTracker:
         self._by_queue_number[queue_number] = track_id
         if student_id is not None:
             self._by_student_id[student_id] = track_id
+            details = self._join_details.get(student_id) or {}
+            person.payment_type = details.get('payment_type')
+            person.payment_amount = details.get('payment_amount')
+            person.payment_note = details.get('payment_note')
             # Intent is spent once it produces a number — the student must
             # opt in again for their next visit.
             self.clear_join_intent(student_id)

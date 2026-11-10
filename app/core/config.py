@@ -168,6 +168,17 @@ WAIT_ESTIMATOR = os.getenv("WAIT_ESTIMATOR", "queue").strip().lower()
 # Who calls the next number to a window:
 #   "staff" - the staff member at that window presses Call next (default);
 #   "auto"  - the system calls the next number as soon as a window is free.
+# What a student can say they are paying for when they join, shown to the
+# cashier. Comma-separated; change it here without rebuilding the app.
+PAYMENT_TYPES = [
+    t.strip() for t in os.getenv(
+        "PAYMENT_TYPES", "Tuition fee,Enrollment fee,Balance,Other fees",
+    ).split(",") if t.strip()
+]
+# Choosing this one asks the student to write which fees they are paying.
+PAYMENT_OTHER_TYPE = os.getenv("PAYMENT_OTHER_TYPE", "Other fees").strip()
+PAYMENT_AMOUNT_MAX = env_float("PAYMENT_AMOUNT_MAX", 1_000_000.0)
+PAYMENT_NOTE_MAX_CHARS = 120
 QUEUE_CALL_MODE = os.getenv("QUEUE_CALL_MODE", "staff").strip().lower()
 if QUEUE_CALL_MODE not in {"staff", "auto"}:
     QUEUE_CALL_MODE = "staff"

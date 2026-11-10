@@ -21,6 +21,9 @@ def enqueue_ticket(
     people_ahead: int | None = None,
     active_counters: int | None = None,
     estimator_version: str | None = None,
+    payment_type: str | None = None,
+    payment_amount: float | None = None,
+    payment_note: str | None = None,
 ) -> None:
     ticket_queue.put_nowait({
         "queue_number": queue_number,
@@ -32,6 +35,9 @@ def enqueue_ticket(
         "people_ahead": people_ahead,
         "active_counters": active_counters,
         "estimator_version": estimator_version,
+        "payment_type": payment_type,
+        "payment_amount": payment_amount,
+        "payment_note": payment_note,
     })
 
 
@@ -91,6 +97,10 @@ def _ticket_worker() -> None:
             ticket["student_id"] = job.get("student_id")
             ticket["linked_via"] = job.get("linked_via", "manual")
             ticket["is_walkin"] = job.get("is_walkin", True)
+            if job.get("payment_type") is not None:
+                ticket["payment_type"] = job["payment_type"]
+                ticket["payment_amount"] = job.get("payment_amount")
+                ticket["payment_note"] = job.get("payment_note")
             if job.get("people_ahead") is not None:
                 ticket["people_ahead_at_issue"] = job["people_ahead"]
                 ticket["active_counters_at_issue"] = job.get("active_counters")

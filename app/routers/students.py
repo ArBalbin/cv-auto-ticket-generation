@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
+from typing import Annotated
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
 
 from core.config import (
@@ -7,6 +9,10 @@ from core.config import (
     FACE_MATCH_THRESHOLD,
     FACE_MODEL_PACK,
     JOIN_INTENT_TIMEOUT_MINUTES,
+    PAYMENT_AMOUNT_MAX,
+    PAYMENT_NOTE_MAX_CHARS,
+    PAYMENT_OTHER_TYPE,
+    PAYMENT_TYPES,
 )
 from core.security import (
     clear_student_session,
@@ -41,6 +47,48 @@ from services import queue_service
 
 
 router = APIRouter()
+
+
+class JoinBody(BaseModel):
+    # What the student is paying for and the total, for the cashier. Older app
+    # versions send no body; they join without payment details.
+    payment_type: str | None = None
+    payment_amount: float | None = None
+    # Which fees, when payment_type is PAYMENT_OTHER_TYPE.
+    payment_note: str | None = None
+
+
+def _payment_details(body: "JoinBody | None") -> dict | None:
+    if body is None or body.payment_type is None:
+        return None
+    wanted = body.payment_type.strip().lower()
+    match = next((t for t in PAYMENT_TYPES if t.lower() == wanted), None)
+    if match is None:
+        raise HTTPException(status_code=422, detail="Choose what you are paying for from the list.")
+
+    note = (body.payment_note or "").strip()
+    if match.lower() == PAYMENT_OTHER_TYPE.lower():
+        if not note:
+            raise HTTPException(status_code=422, detail="Write which fees you are paying.")
+        if len(note) > PAYMENT_NOTE_MAX_CHARS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Keep the description under {PAYMENT_NOTE_MAX_CHARS} characters.",
+            )
+    else:
+        note = ""
+
+    amount = body.payment_amount
+    if amount is None or not (0 < amount <= PAYMENT_AMOUNT_MAX):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Enter the total you will pay, from 1 to {PAYMENT_AMOUNT_MAX:,.0f} pesos.",
+        )
+    return {
+        "payment_type": match,
+        "payment_amount": round(float(amount), 2),
+        "payment_note": note or None,
+    }
 
 
 class GoogleAuthBody(BaseModel):
@@ -229,7 +277,10 @@ async def get_my_profile(student_id: int = Depends(require_student)):
     summary="Student - ask to be issued a queue number on recognition",
     tags=["Students"],
 )
-async def join_queue(student_id: int = Depends(require_student)):
+async def join_queue(
+    body: Annotated[JoinBody | None, Body()] = None,
+    student_id: int = Depends(require_student),
+):
     """
     Arms this student for recognition. Being seen by the camera is not by
     itself a request to join the queue — without this, any registered
@@ -238,12 +289,28 @@ async def join_queue(student_id: int = Depends(require_student)):
     spent as soon as it produces a number.
     """
     _require_consent(student_id)
+    payment = _payment_details(body)
     touch_student_activity(student_id)
-    armed_at = queue_service.queue_tracker.arm_join_intent(student_id)
+    armed_at = queue_service.queue_tracker.arm_join_intent(student_id, payment)
     return {
         "joined": True,
         "armed_at": armed_at.isoformat(),
         "expires_in_minutes": JOIN_INTENT_TIMEOUT_MINUTES,
+        **(payment or {}),
+    }
+
+
+@router.get(
+    "/api/payment_types",
+    summary="What a student can choose to pay for when joining - PUBLIC",
+    tags=["Students"],
+)
+def payment_types():
+    return {
+        "payment_types": PAYMENT_TYPES,
+        "other_type": PAYMENT_OTHER_TYPE,
+        "amount_max": PAYMENT_AMOUNT_MAX,
+        "note_max_chars": PAYMENT_NOTE_MAX_CHARS,
     }
 
 

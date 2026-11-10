@@ -241,8 +241,8 @@ def queue_prediction_accuracy(username: str = Depends(require_staff)):
 SERVICE_RECORD_FIELDS = (
     "ticket_created_at", "service_started_at", "service_completed_at",
     "actual_wait_seconds", "actual_service_seconds", "people_ahead_at_issue",
-    "active_counters_at_issue", "cashier_window", "predicted_wait_min",
-    "wait_model_version",
+    "active_counters_at_issue", "cashier_window", "payment_type",
+    "predicted_wait_min", "wait_model_version",
 )
 
 
