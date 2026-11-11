@@ -286,40 +286,60 @@ def join_with(student_id, **form):
     return run(students.join_queue(students.JoinBody(**form), student_id=student_id))
 
 
-def test_the_payment_on_the_join_form_reaches_the_cashier(system):
+def test_the_payment_slip_lines_reach_the_cashier(system):
     from routers import queue as queue_router
 
     ana = face(160)
     system.enrolled[160] = ana
-    joined = join_with(160, payment_type="tuition fee", payment_amount=5000)
-    assert joined["payment_type"] == "Tuition fee", "matched to the list's own spelling"
+    joined = join_with(160, payment_items=[
+        {"type": "special exam", "amount": 300, "detail": " Math 101 "},
+        {"type": "Tuition", "amount": 5000},
+    ])
+    assert joined["payment_type"] == "Tuition, Special Exam", "in the slip's order and spelling"
+    assert joined["payment_amount"] == 5300.0, "the TOTAL"
+    assert joined["payment_note"] == "Special Exam: Math 101"
     system.stand((95, 100, near(ana, 5000, 0.3)))
 
-    person = system.tracker.get_person_by_student_id(160)
-    entry = person.to_dict()
-    assert (entry["payment_type"], entry["payment_amount"], entry["payment_note"]) == ("Tuition fee", 5000.0, None)
+    entry = system.tracker.get_person_by_student_id(160).to_dict()
+    assert entry["payment_amount"] == 5300.0
+    assert entry["payment_items"] == [
+        {"type": "Tuition", "amount": 5000.0, "detail": None},
+        {"type": "Special Exam", "amount": 300.0, "detail": "Math 101"},
+    ], "each line with its own amount, for the cashier"
     # The public display board never shows what anyone is paying.
     board = queue_router.queue_display()
-    assert all("payment_amount" not in p for p in board["active_queue"])
+    assert all("payment_amount" not in p and "payment_items" not in p for p in board["active_queue"])
 
 
-def test_other_fees_need_a_description_and_every_payment_a_total(system):
+def test_slip_lines_are_checked_like_the_paper_slip(system):
     from fastapi import HTTPException
 
     for form, message in (
-        ({"payment_type": "Parking"}, "from the list"),
-        ({"payment_type": "Other fees", "payment_amount": 300}, "which fees"),
-        ({"payment_type": "Balance"}, "total"),
-        ({"payment_type": "Balance", "payment_amount": 0}, "total"),
+        ({"payment_items": []}, "at least one"),
+        ({"payment_items": [{"type": "Parking", "amount": 50}]}, "from the list"),
+        ({"payment_items": [{"type": "Books"}]}, "amount for Books"),
+        ({"payment_items": [{"type": "Books", "amount": 0}]}, "amount for Books"),
+        ({"payment_items": [{"type": "Special Exam", "amount": 300}]}, "subject"),
+        ({"payment_items": [{"type": "Others", "amount": 150}]}, "please specify"),
+        ({"payment_items": [{"type": "Books", "amount": 800}, {"type": "books", "amount": 1}]}, "twice"),
+        ({"payment_items": [{"type": "Others", "amount": 5, "detail": "x" * 41}]}, "under 40"),
     ):
         with pytest.raises(HTTPException) as refused:
             join_with(161, **form)
-        assert refused.value.status_code == 422 and message in refused.value.detail
+        assert refused.value.status_code == 422 and message in refused.value.detail, refused.value.detail
 
-    joined = join_with(161, payment_type="Other fees", payment_amount=350.5,
-                       payment_note="  ID replacement and library fine ")
-    assert joined["payment_note"] == "ID replacement and library fine"
-    assert joined["payment_amount"] == 350.5
+    joined = join_with(161, payment_items=[
+        {"type": "Others", "amount": 150.5, "detail": "ID replacement"},
+        {"type": "Books", "amount": 800, "detail": "ignored: Books asks for no detail"},
+    ])
+    assert joined["payment_note"] == "Others: ID replacement"
+    assert joined["payment_amount"] == 950.5
+
+
+def test_app_version_1_0_11_sending_one_line_still_joins(system):
+    joined = join_with(163, payment_type="Others", payment_amount=350, payment_note="Library fine")
+    assert (joined["payment_type"], joined["payment_amount"], joined["payment_note"]) == (
+        "Others", 350.0, "Others: Library fine")
 
 
 def test_an_older_app_without_the_form_can_still_join(system):
@@ -330,10 +350,15 @@ def test_an_older_app_without_the_form_can_still_join(system):
     assert system.tracker.get_person_by_student_id(162).payment_type is None
 
 
-def test_the_app_reads_the_fee_list_from_the_server():
+def test_the_app_reads_the_slip_lines_from_the_server():
     listing = students.payment_types()
-    assert listing["payment_types"][:3] == ["Tuition fee", "Enrollment fee", "Balance"]
-    assert listing["other_type"] == "Other fees" and listing["other_type"] in listing["payment_types"]
+    assert listing["items"] == [
+        {"name": "Tuition", "detail_prompt": None},
+        {"name": "Books", "detail_prompt": None},
+        {"name": "Special Exam", "detail_prompt": "Subject"},
+        {"name": "Others", "detail_prompt": "Please specify"},
+    ], "the lines of Payment Slip NCF-F-CSH-09"
+    assert listing["other_type"] in listing["payment_types"], "still readable by app 1.0.11"
 
 
 def test_app_shows_the_right_state_before_and_after_joining(system):

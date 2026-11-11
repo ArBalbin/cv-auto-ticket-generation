@@ -172,11 +172,24 @@ WAIT_ESTIMATOR = os.getenv("WAIT_ESTIMATOR", "queue").strip().lower()
 # cashier. Comma-separated; change it here without rebuilding the app.
 PAYMENT_TYPES = [
     t.strip() for t in os.getenv(
-        "PAYMENT_TYPES", "Tuition fee,Enrollment fee,Balance,Other fees",
+        # The lines of the cashier's Payment Slip (NCF-F-CSH-09).
+        "PAYMENT_TYPES", "Tuition,Books,Special Exam,Others",
     ).split(",") if t.strip()
 ]
 # Choosing this one asks the student to write which fees they are paying.
-PAYMENT_OTHER_TYPE = os.getenv("PAYMENT_OTHER_TYPE", "Other fees").strip()
+PAYMENT_OTHER_TYPE = os.getenv("PAYMENT_OTHER_TYPE", "Others").strip()
+# Lines that ask for a detail, and what to ask, as on the slip:
+# "Special Exam: ____ Subject" and "Others (Pls. specify)".
+PAYMENT_DETAIL_PROMPTS = {
+    name.strip(): prompt.strip()
+    for name, _, prompt in (
+        pair.partition(":") for pair in os.getenv(
+            "PAYMENT_DETAIL_PROMPTS", "Special Exam:Subject;Others:Please specify",
+        ).split(";")
+    )
+    if name.strip() and prompt.strip()
+}
+PAYMENT_DETAIL_MAX_CHARS = 40
 PAYMENT_AMOUNT_MAX = env_float("PAYMENT_AMOUNT_MAX", 1_000_000.0)
 PAYMENT_NOTE_MAX_CHARS = 120
 QUEUE_CALL_MODE = os.getenv("QUEUE_CALL_MODE", "staff").strip().lower()

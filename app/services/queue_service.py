@@ -924,7 +924,7 @@ def _as_datetime(value) -> datetime | None:
 
 NO_SHOW_MESSAGE = (
     "Staff marked you as not present when your number was called, so your "
-    "number was skipped. Tap Join the Queue again if you still need the cashier."
+    "number was skipped. Tap Get a Queue Number if you still need the cashier."
 )
 
 

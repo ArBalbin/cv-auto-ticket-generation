@@ -10,6 +10,8 @@ from core.config import (
     FACE_MODEL_PACK,
     JOIN_INTENT_TIMEOUT_MINUTES,
     PAYMENT_AMOUNT_MAX,
+    PAYMENT_DETAIL_MAX_CHARS,
+    PAYMENT_DETAIL_PROMPTS,
     PAYMENT_NOTE_MAX_CHARS,
     PAYMENT_OTHER_TYPE,
     PAYMENT_TYPES,
@@ -49,45 +51,90 @@ from services import queue_service
 router = APIRouter()
 
 
+class PaymentItem(BaseModel):
+    type: str
+    amount: float | None = None
+    # The slip's "Subject" for Special Exam, or what "Others" are.
+    detail: str | None = None
+
+
 class JoinBody(BaseModel):
-    # What the student is paying for and the total, for the cashier. Older app
-    # versions send no body; they join without payment details.
+    # The lines of the Payment Slip the student will pay, each with its amount.
+    payment_items: list[PaymentItem] | None = None
+    # One line only, as app version 1.0.11 sends it. Apps older than that
+    # send no body and join without payment details.
     payment_type: str | None = None
     payment_amount: float | None = None
-    # Which fees, when payment_type is PAYMENT_OTHER_TYPE.
     payment_note: str | None = None
 
 
-def _payment_details(body: "JoinBody | None") -> dict | None:
-    if body is None or body.payment_type is None:
-        return None
-    wanted = body.payment_type.strip().lower()
+def _payment_type(name: str) -> str:
+    wanted = name.strip().lower()
     match = next((t for t in PAYMENT_TYPES if t.lower() == wanted), None)
     if match is None:
         raise HTTPException(status_code=422, detail="Choose what you are paying for from the list.")
+    return match
 
-    note = (body.payment_note or "").strip()
-    if match.lower() == PAYMENT_OTHER_TYPE.lower():
-        if not note:
-            raise HTTPException(status_code=422, detail="Write which fees you are paying.")
-        if len(note) > PAYMENT_NOTE_MAX_CHARS:
+
+def _detail_prompt(name: str) -> str | None:
+    if name in PAYMENT_DETAIL_PROMPTS:
+        return PAYMENT_DETAIL_PROMPTS[name]
+    return "Please specify" if name.lower() == PAYMENT_OTHER_TYPE.lower() else None
+
+
+def _payment_details(body: "JoinBody | None") -> dict | None:
+    """The slip lines as one record: which lines, the TOTAL, and the details.
+    Each line's own amount is kept with the queue entry for the cashier; the
+    database keeps the lines, the total and the details."""
+    if body is None:
+        return None
+    if body.payment_items is not None:
+        raw = body.payment_items
+    elif body.payment_type is not None:
+        raw = [PaymentItem(type=body.payment_type, amount=body.payment_amount, detail=body.payment_note)]
+    else:
+        return None
+    if not raw:
+        raise HTTPException(status_code=422, detail="Choose at least one thing you are paying for.")
+
+    items, seen = [], set()
+    for entry in raw:
+        name = _payment_type(entry.type)
+        if name in seen:
+            raise HTTPException(status_code=422, detail=f"{name} is listed twice.")
+        seen.add(name)
+        if entry.amount is None or not (0 < entry.amount <= PAYMENT_AMOUNT_MAX):
             raise HTTPException(
                 status_code=422,
-                detail=f"Keep the description under {PAYMENT_NOTE_MAX_CHARS} characters.",
+                detail=f"Enter the amount for {name}, from 1 to {PAYMENT_AMOUNT_MAX:,.0f} pesos.",
             )
-    else:
-        note = ""
+        detail = (entry.detail or "").strip()
+        prompt = _detail_prompt(name)
+        if prompt is None:
+            detail = ""
+        elif not detail:
+            raise HTTPException(status_code=422, detail=f"Fill in {name}: {prompt.lower()}.")
+        elif len(detail) > PAYMENT_DETAIL_MAX_CHARS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Keep {name} under {PAYMENT_DETAIL_MAX_CHARS} characters.",
+            )
+        items.append({"type": name, "amount": round(float(entry.amount), 2), "detail": detail or None})
 
-    amount = body.payment_amount
-    if amount is None or not (0 < amount <= PAYMENT_AMOUNT_MAX):
+    # In the slip's order, whatever order the app sent them in.
+    items.sort(key=lambda i: PAYMENT_TYPES.index(i["type"]))
+    total = round(sum(i["amount"] for i in items), 2)
+    if total > PAYMENT_AMOUNT_MAX:
         raise HTTPException(
             status_code=422,
-            detail=f"Enter the total you will pay, from 1 to {PAYMENT_AMOUNT_MAX:,.0f} pesos.",
+            detail=f"The total is over {PAYMENT_AMOUNT_MAX:,.0f} pesos.",
         )
+    note = " | ".join(f"{i['type']}: {i['detail']}" for i in items if i["detail"])
     return {
-        "payment_type": match,
-        "payment_amount": round(float(amount), 2),
-        "payment_note": note or None,
+        "payment_type": ", ".join(i["type"] for i in items),
+        "payment_amount": total,
+        "payment_note": note[:PAYMENT_NOTE_MAX_CHARS] or None,
+        "payment_items": items,
     }
 
 
@@ -307,10 +354,14 @@ async def join_queue(
 )
 def payment_types():
     return {
+        # The slip's lines, each with the detail it asks for (if any).
+        "items": [{"name": t, "detail_prompt": _detail_prompt(t)} for t in PAYMENT_TYPES],
+        "detail_max_chars": PAYMENT_DETAIL_MAX_CHARS,
+        "amount_max": PAYMENT_AMOUNT_MAX,
+        # Read by app version 1.0.11, which sends one line only.
         "payment_types": PAYMENT_TYPES,
         "other_type": PAYMENT_OTHER_TYPE,
-        "amount_max": PAYMENT_AMOUNT_MAX,
-        "note_max_chars": PAYMENT_NOTE_MAX_CHARS,
+        "note_max_chars": PAYMENT_DETAIL_MAX_CHARS,
     }
 
 

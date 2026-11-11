@@ -39,6 +39,8 @@ class QueuePerson:
         # What the student said they are paying for, and how much, when they
         # joined in the app. Shown to the cashier; None for walk-ins.
         'payment_type', 'payment_amount', 'payment_note',
+        # Each slip line with its own amount, for the cashier; kept in memory only.
+        'payment_items',
         # Evaluation instrumentation (recognition_metrics) — first_seen_at is
         # the very first frame this person appeared in, which is earlier than
         # entered_at (the moment presence was *confirmed*).
@@ -74,6 +76,7 @@ class QueuePerson:
         self.payment_type         = None
         self.payment_amount       = None
         self.payment_note         = None
+        self.payment_items        = None
         self.first_seen_at        = None
         self.embed_attempts       = 0
         self.embed_successes      = 0
@@ -161,6 +164,7 @@ class QueuePerson:
             'payment_type':      self.payment_type,
             'payment_amount':    self.payment_amount,
             'payment_note':      self.payment_note,
+            'payment_items':     self.payment_items,
         }
 
 
@@ -434,6 +438,7 @@ class QueueTracker:
             person.payment_type = details.get('payment_type')
             person.payment_amount = details.get('payment_amount')
             person.payment_note = details.get('payment_note')
+            person.payment_items = details.get('payment_items')
             # Intent is spent once it produces a number — the student must
             # opt in again for their next visit.
             self.clear_join_intent(student_id)
