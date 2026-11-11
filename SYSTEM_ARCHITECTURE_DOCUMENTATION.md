@@ -2,18 +2,23 @@
 
 ## Current Progress Snapshot
 
-Last updated: May 19, 2026
+Last updated: November 11, 2026
 
-QueueFlow is currently implemented as a FastAPI backend plus a separate local
-YOLOv8n/OpenCV detector process. The backend, queue tracker, ticket worker,
-MySQL persistence, dashboard routes, detector upload endpoints, prediction
-service, optional Redis cache, and optional S3-compatible ticket object storage
-are already present in the codebase.
+QueueFlow (now shown to students as QueuEx) has four parts:
 
-The production target is thermal-printer ticket output at the queue area. The
-current prototype uses PDF tickets as a demo fallback while printer hardware is
-not yet attached. Cloud deployment supports the backend, but the detector still
-runs on the camera-connected local machine and pushes frames to the hosted API.
+- the QueuEx app (Flutter) on the student's phone;
+- the detector (`app/detector.py`, YOLOv8 + InsightFace) on the office laptop
+  that has the camera;
+- the staff dashboard and display board (React, served by Vercel);
+- the FastAPI backend on Render (0.5 CPU, 512 MB), with Aiven MySQL, Upstash
+  Redis, Supabase Storage for ticket PDFs, and Google for Gbox sign-in.
+
+A student asks for a number in the app and fills the payment slip; the number
+is assigned when the camera sees them in line and their face matches. Only the
+512-number face embedding leaves the laptop, never a face image. Staff call
+numbers to their own window with Call next, or switch to automatic calling.
+Sections 1 and 12 hold the current diagrams; some later sections still
+describe the May 2026 build.
 
 ## 1. Architecture Overview
 
@@ -22,34 +27,33 @@ It separates camera detection, backend API services, queue business logic,
 ticket generation, data persistence, live cache, dashboard pages, and mobile
 queue tracking.
 
-High-level architecture:
+High-level architecture (November 2026):
 
 ```text
-Mobile App
-Dashboard Browser
-      |
-      v
-FastAPI Backend
-      |
-      +--> Queue Service
-      |       |
-      |       v
-      |   Queue Tracker
-      |
-      +--> Ticket Service
-      |       |
-      |       v
-      |   Ticket Printer / PDF Generator
-      |
-      +--> MySQL Database
-      |
-      +--> Redis Cache, optional
+Student's phone                    Cashier office (NCF campus)
+  QueuEx app (Flutter)               Camera -> Detector (laptop: YOLOv8 + InsightFace)
+        |                            Staff dashboard (React, Vercel)
+        |                            Display board (/queue-display)
+        |                                   |
+        +-----------------+-----------------+
+                          | HTTPS
+                          v
+             FastAPI backend (Render, 0.5 CPU, 512 MB)
+                          |
+                          +--> Sign-in & join (Gbox or face, consent, payment slip)
+                          +--> Queue tracker + face match (1:N embedding index)
+                          +--> Calling & windows (Call next, or automatic)
+                          +--> Status & wait estimate (queue engine)
+                          +--> Wait log & prediction accuracy
+                          +--> Ticket worker (PDF ticket)
+                          +--> Retention scheduler (archive, then delete)
+                          |
+                          +--> Aiven MySQL      (accounts, embeddings, queue records)
+                          +--> Upstash Redis    (sessions, latest frame, crowd stats)
+                          +--> Supabase Storage (ticket PDFs)
+                          +--> Google           (verifies the Gbox sign-in)
 
-Detector Process
-      |
-      +--> Camera
-      +--> YOLO Model
-      +--> FastAPI Backend
+The detector also serves the dashboard's live view directly at 127.0.0.1:8765.
 ```
 
 ## 2. Main Architectural Layers
@@ -703,58 +707,71 @@ MySQL so all instances share the same queue state.
 ## 12. Component Interaction Diagram
 
 ```text
-                 +----------------------+
-                 |      Mobile App      |
-                 |  QR Scan + Status UI |
-                 +----------+-----------+
-                            |
-                            | GET /api/queue/status
-                            v
-+------------+     +--------+---------+      +----------------+
-|  Detector  | --> | FastAPI Backend  | ---> | MySQL Database |
-| YOLO + CV  |     | API + Dashboard  |      | Ticket Records |
-+-----+------+     +--------+---------+      +----------------+
-      |                     |
-      | POST /yolo/update   |
-      | POST /yolo/push     |
-      v                     v
-+------------+     +------------------+
-|  Camera    |     | Redis, optional  |
-|  Frames    |     | Live State Cache |
-+------------+     +------------------+
-                            ^
-                            |
-                 +----------+-----------+
-                 |   Dashboard Browser  |
-                 | Analytics + Snapshot |
-                 +----------------------+
+                         +--------------------------+
+                         |   QueuEx app (Flutter)   |
+                         | join, status, Window N   |
+                         +----+---------------^-----+
+   POST /api/students/me/join |               | GET /api/students/me/queue
+   (payment slip)             v               | (every 2 s)
++------------------+     +----+---------------+-----+     +------------------+
+| Detector         |---->|  FastAPI backend (Render)|<--->| Aiven MySQL      |
+| YOLOv8 tracking  | (1) |                          |     +------------------+
+| InsightFace      |<----|  sign-in & join          |<--->| Upstash Redis    |
+| embeddings       | (2) |  queue tracker + face    |     +------------------+
++--+-----------+---+     |    match (1:N index)     |---->| Supabase Storage |
+   ^           |         |  calling & windows       |     +------------------+
+   | frames    |         |  wait estimate + log     |<--->| Google sign-in   |
++--+-----+     | (5)     |  ticket worker           |     +------------------+
+| Camera |     |         |  retention scheduler     |
++--------+     v         +----+---------------+-----+
+     +---------------------+  ^               | (6)
+     | Staff dashboard     |<-+ (3) (4)       v
+     | (React, Vercel)     |            +---------------+
+     +---------------------+            | Display board |
+                                        +---------------+
+
+(1) POST /yolo/push-frame: tracked people + face embeddings, 2-3 a second.
+    POST /yolo/update: the annotated frame for the backup camera stream.
+    Only the 512-number embedding leaves the laptop, never a face image.
+(2) Reply to each push: the line state and who to clear.
+(3) POST /api/queue/call_next, /done, /no_show; the staff account's window
+    claim is renewed every 30 s.
+(4) GET /api/queue/list (the line and each payment slip), prediction
+    accuracy, service records CSV; GET /api/crowd/video as the backup stream.
+(5) Live view straight from the detector: http://127.0.0.1:8765/video.
+(6) GET /api/queue/display: number, place in line, window. No names.
 ```
 
 ## 13. Request Flow Examples
 
-### 13.1 New Queue Person
+### 13.1 New Queue Number
 
 ```text
-Camera detects person
-  -> detector.py processes frame
+Student taps Get a Queue Number and fills the payment slip
+  -> POST /api/students/me/join (payment_items)
+  -> queue_tracker.arm_join_intent holds the request and the slip
+Student walks to the camera at the line
+  -> detector.py tracks the person; InsightFace makes the face embedding
   -> POST /yolo/push-frame
-  -> queue_service filters detection
-  -> queue_tracker confirms new person
-  -> ticket_service queues ticket job
-  -> ticket_printer creates PDF and QR
-  -> database_handler saves ticket record
+  -> queue_tracker confirms the person (1 s in line, 3 face frames)
+  -> embedding_index matches the face to the student who asked (1:N)
+  -> the queue number is linked to the student, with the payment slip
+  -> ticket_service builds the PDF ticket and uploads it to Supabase
+  -> database_handler saves the queue record
 ```
 
-### 13.2 Mobile Queue Status
+### 13.2 Mobile Queue Status and Calling
 
 ```text
-User scans QR
-  -> mobile extracts q and token
-  -> GET /api/queue/status
-  -> queue.py validates short code
-  -> MySQL validates JWT record
-  -> queue_tracker checks active queue
-  -> API returns live queue status
+QueuEx app polls GET /api/students/me/queue every 2 s while in line
+  -> number, people ahead, wait estimate, Now serving
+Staff press Call next (POST /api/queue/call_next)
+  -> the next number is called to that staff account's window
+  -> the app shows "It's your turn" with the window number
+  -> the dashboard shows the payment slip lines and TOTAL
+Staff press Done or No-show
+  -> the wait log saves the estimate, the real wait and the window
+  -> the app shows the Done screen, or Skipped after a No-show
 ```
 
 ### 13.3 Dashboard Analytics
@@ -774,8 +791,9 @@ Detector draws overlay
   -> encodes frame as JPEG
   -> POST /yolo/update
   -> state.set_snapshot
-  -> optional Redis cache
-  -> dashboard reads /api/snapshot or /api/crowd/video
+  -> Upstash Redis cache
+  -> dashboard shows the detector's local view (127.0.0.1:8765/video),
+     or /api/crowd/video with the staff token when that is not reachable
 ```
 
 ## 14. Architecture Summary
@@ -795,14 +813,14 @@ Business services:
 MySQL:
   permanent ticket and user records
 
-Redis:
-  optional cloud cache for temporary live data
+Redis (Upstash):
+  sessions, latest camera frame, crowd stats
 
-Mobile app:
-  QR scanning and user queue status
+Mobile app (QueuEx):
+  sign-in, Get a Queue Number with the payment slip, queue status, your turn
 
 Web dashboard:
-  staff monitoring, analytics, live video/snapshot
+  Call next per window, payment slip, analytics, prediction accuracy, live view
 ```
 
 This separation keeps computer vision processing independent from API request
