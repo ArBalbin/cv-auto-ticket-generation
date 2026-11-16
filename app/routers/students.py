@@ -1,10 +1,13 @@
+import asyncio
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from core.config import (
     CONSENT_VERSION,
+    FACE_EMBED_CONCURRENCY,
     FACE_MARGIN_THRESHOLD,
     FACE_MATCH_THRESHOLD,
     FACE_MODEL_PACK,
@@ -49,6 +52,38 @@ from services import queue_service
 
 
 router = APIRouter()
+
+
+# Turning a photo into a face signature keeps the CPU busy for a second or
+# more. These endpoints used to do it directly on the request loop, and the
+# backend runs a single process, so while one photo was being processed the
+# whole server stood still: other students signing in, every app's status
+# check, the staff dashboard. In the user acceptance test, with many students
+# registering at once, phones gave up with "Cannot connect" and registrations
+# hung for minutes. The work now runs in a worker thread, so the loop keeps
+# answering everyone else, and at most FACE_EMBED_CONCURRENCY photos are
+# processed at a time so the small cloud server is not run out of memory.
+_face_slots = asyncio.Semaphore(FACE_EMBED_CONCURRENCY)
+
+
+async def _embed_photo(data: bytes):
+    async with _face_slots:
+        return await run_in_threadpool(face_service.compute_embedding_from_photo, data)
+
+
+FACE_SIGNIN_NEEDS_ACCOUNT = (
+    "Face sign-in works only for the account last used on this phone. "
+    "Sign in with Gbox first."
+)
+FACE_SIGNIN_NOT_REGISTERED = (
+    "Your face isn't registered yet. Sign in with Gbox, then register your face."
+)
+FACE_SIGNIN_NO_MATCH = (
+    "Your face didn't match this account. Try again in good light, or sign in with Gbox."
+)
+FACE_NOT_SEEN = (
+    "We couldn't see a face clearly. Face the camera in good light and try again."
+)
 
 
 class PaymentItem(BaseModel):
@@ -238,36 +273,53 @@ async def student_google_auth(body: GoogleAuthBody):
     summary="Student - log in with face alone (no Google sign-in)",
     tags=["Students"],
 )
-async def student_face_auth(photo: UploadFile = File(...)):
+async def student_face_auth(
+    photo: UploadFile = File(...),
+    expected_student_id: int | None = Form(None),
+):
     """
-    Quick-login alternative to Google sign-in, for a student who has already
-    completed registration (school_id + Gbox account) and captured their
-    face at least once. Identifies against every enrolled student (1:N) —
-    unlike queue-zone matching this has no "already served today" filter,
-    since it's authenticating account access, not linking a queue number.
-    Uses the same accept-only-if-clearly-best philosophy as everywhere else
-    face matching happens in this system.
+    Quick-login alternative to Google sign-in, for the student whose account
+    was last used on this phone and who has registered a face.
+
+    The face is matched against every enrolled student with the same
+    accept-only-if-clearly-best rule used everywhere else, but the sign-in
+    succeeds only if the clear best match is the account the phone names
+    (expected_student_id). Matching against everyone and opening whichever
+    account came out on top let a student whose own face was not registered
+    land in a look-alike classmate's account; in the user acceptance test a
+    student signed in and saw another student's name. A face can now open
+    only the account already on the phone, and anyone else signs in with Gbox.
     """
+    if expected_student_id is None:
+        raise HTTPException(status_code=401, detail=FACE_SIGNIN_NEEDS_ACCOUNT)
+
+    student = get_student_by_id(expected_student_id)
+    if student is None:
+        raise HTTPException(status_code=401, detail=FACE_SIGNIN_NEEDS_ACCOUNT)
+    if not student.get("face_enrolled_at"):
+        # Checked before any photo work: the student who could not sign in
+        # during the test had never registered a face, waited on a slow
+        # request, and was told only that the server could not be reached.
+        raise HTTPException(status_code=401, detail=FACE_SIGNIN_NOT_REGISTERED)
+
     data = await photo.read()
-    embedding = face_service.compute_embedding_from_photo(data)
+    embedding = await _embed_photo(data)
     if embedding is None:
-        raise HTTPException(
-            status_code=422,
-            detail="No confident face detected - retake and retry",
-        )
+        raise HTTPException(status_code=422, detail=FACE_NOT_SEEN)
 
     match = queue_service.embedding_index.match(
         embedding,
         match_threshold=FACE_MATCH_THRESHOLD,
         margin_threshold=FACE_MARGIN_THRESHOLD,
     )
-    record_face_match_event(match.student_id, None, match.score, match.margin, match.accepted)
-    if not match.accepted:
-        raise HTTPException(status_code=401, detail="Face not recognized - try Google sign-in instead")
-
-    student = get_student_by_id(match.student_id)
-    if student is None:
-        raise HTTPException(status_code=404, detail="Student not found")
+    accepted = match.accepted and match.student_id == student["id"]
+    if match.accepted and not accepted:
+        print("[FaceAuth] Refused: the face matched a different account than the one on this phone")
+    record_face_match_event(
+        student["id"] if accepted else None, None, match.score, match.margin, accepted,
+    )
+    if not accepted:
+        raise HTTPException(status_code=401, detail=FACE_SIGNIN_NO_MATCH)
 
     touch_student_last_login(student["id"])
     token = create_student_session(student["id"])
@@ -473,15 +525,12 @@ async def register_my_face(
     embeddings = []
     for photo in photos:
         data = await photo.read()
-        embedding = face_service.compute_embedding_from_photo(data)
+        embedding = await _embed_photo(data)
         if embedding is not None:
             embeddings.append(embedding)
 
     if not embeddings:
-        raise HTTPException(
-            status_code=422,
-            detail="No confident face detected in any submitted photo - retake and retry",
-        )
+        raise HTTPException(status_code=422, detail=FACE_NOT_SEEN)
 
     canonical = face_service.build_enrollment_embedding(embeddings)
 

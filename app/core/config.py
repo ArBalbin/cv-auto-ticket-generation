@@ -221,6 +221,13 @@ FACE_MATCH_THRESHOLD = env_float("FACE_MATCH_THRESHOLD", 0.30)
 FACE_MARGIN_THRESHOLD = env_float("FACE_MARGIN_THRESHOLD", 0.15)
 FACE_MIN_DETECT_CONF = env_float("FACE_MIN_DETECT_CONF", 0.60)
 
+# How many face photos the backend turns into face signatures at the same
+# time (registration and face sign-in). The work runs off the request loop,
+# so other requests are never held up by it; this only caps the CPU and
+# memory it takes at once on the small cloud instance. Raise it on a bigger
+# machine.
+FACE_EMBED_CONCURRENCY = max(1, env_int("FACE_EMBED_CONCURRENCY", 1))
+
 # Per SOP #2 (reconfirmed by the panel after the pre-oral revision meeting):
 # a registered student recognized at the queue-zone camera gets a queue
 # number minted directly by the system — no kiosk button press needed. This
