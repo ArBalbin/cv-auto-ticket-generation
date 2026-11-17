@@ -98,7 +98,9 @@ def _on_number_linked(
             # Logged with the ticket, so the estimate the student saw can
             # later be checked against the wait they actually had.
             people_ahead=max(0, position - 1),
-            active_counters=counters,
+            # The windows the estimate counted, so the log shows what it
+            # assumed (the configured count when calling is automatic).
+            active_counters=len(serving_windows(counters)),
             estimator_version=estimator_version(),
             payment_type=getattr(person, "payment_type", None),
             payment_amount=getattr(person, "payment_amount", None),
@@ -869,6 +871,32 @@ def _waiting_ahead(line: list[dict], position: int) -> int | None:
     # while the tracker is empty) count everyone before them as waiting.
     return sum(1 for q in known if q["counter_number"] is None) + max(0, position - 1 - len(known))
 
+def serving_windows(counters: int, line: list[dict] | None = None) -> list[int]:
+    """The windows the wait estimate counts as serving.
+
+    In automatic calling every open window takes the next person. In staff
+    calling a window takes people only while a staff member holds it, so only
+    the windows held count, together with any where someone is being served.
+    Counting every configured window instead made the estimate assume windows
+    nobody was working: in the user acceptance test three were set open while
+    one was staffed, and every student was told there was no wait.
+
+    With staff calling and no window held, nobody is calling yet. One window
+    is assumed, which overstates the wait rather than promising none.
+    """
+    configured = list(range(1, max(1, counters) + 1))
+    if queue_tracker.auto_call:
+        return configured
+    now = time.monotonic()
+    with _window_claims_lock:
+        _purge_expired_claims(now)
+        held = {c for c in _window_claims if c in configured}
+    if line is None:
+        line = queue_tracker.line_snapshot()
+    busy = {q["counter_number"] for q in line if q.get("counter_number") in configured}
+    return sorted(held | busy) or [1]
+
+
 def _queue_engine_wait(position: int, counters: int, service_min: float) -> float:
     now = datetime.now()
     line = queue_tracker.line_snapshot()
@@ -879,7 +907,7 @@ def _queue_engine_wait(position: int, counters: int, service_min: float) -> floa
     closed = counters_closed_until()
     states = [
         queue_engine.CounterState(busy_since=called.get(n), closed_until=closed)
-        for n in range(1, max(1, counters) + 1)
+        for n in serving_windows(counters, line)
     ]
     return queue_engine.wait_minutes(now, states, ahead, service_min)
 
@@ -890,7 +918,7 @@ def estimate_wait_for_position(position: int, counters: int) -> float:
     if USE_QUEUE_ENGINE:
         service_min = runtime_config()["avg_service_time"]
         return round(_queue_engine_wait(position, counters, service_min), 1)
-    return round(wait_model.predict_minutes(position - 1, counters), 1)
+    return round(wait_model.predict_minutes(position - 1, len(serving_windows(counters))), 1)
 
 def wait_range_fields(wait_min: float, in_line: bool = True) -> dict:
     """The usual range around an estimate, for the app to show beside it.

@@ -64,6 +64,8 @@ def test_fewer_counters_means_a_longer_wait():
 
 def test_position_means_people_ahead_plus_one(monkeypatch):
     monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", False)
+    # Automatic calling, so all three windows count (see test_wait_windows.py).
+    monkeypatch.setattr(queue_service.queue_tracker, "auto_call", True)
     first = queue_service.estimate_wait_for_position(1, 3)
     assert first == pytest.approx(round(wait_model.BASE_MINUTES, 1))
     assert queue_service.estimate_wait_for_position(11, 3) == pytest.approx(
@@ -140,6 +142,8 @@ def test_the_wait_now_follows_the_line_at_once(detector):
 
 def test_queue_prediction_response_uses_the_model(monkeypatch):
     monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", False)
+    # Automatic calling, so all three windows count (see test_wait_windows.py).
+    monkeypatch.setattr(queue_service.queue_tracker, "auto_call", True)
     line = [
         {"queue_number": 5001, "queue_label": "Q5001", "status": "waiting", "position_in_line": 1},
         {"queue_number": 5002, "queue_label": "Q5002", "status": "waiting", "position_in_line": 2},

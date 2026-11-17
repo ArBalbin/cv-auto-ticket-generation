@@ -28,7 +28,7 @@ The engine simulates the live line instead of fitting a curve to it:
 |---|---|
 | Line order and who is at which counter | The live tracker |
 | When each person at a counter was called | `called_at`, set when the counter is assigned |
-| Counters open | Staff, on the dashboard |
+| Windows counted | Automatic calling: the windows set open on the dashboard. Call next: only the windows a staff member holds, plus any where someone is being served; one if none is held (`serving_windows()`). Counting every configured window told every student "no wait" in the 17 Nov UAT, when three were set open and one was staffed. |
 | Closure until a time (lunch) | Staff, on the dashboard ("Close all counters until") |
 | Service time | `AVG_SERVICE_TIME` seed (2.0, the median in the cashier logs), then Algorithm 7's measurement |
 
