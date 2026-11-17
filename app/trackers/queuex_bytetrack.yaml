@@ -1,0 +1,18 @@
+# ByteTrack for the QueuEx queue-zone camera (the tracker the manuscript
+# specifies; Ultralytics otherwise defaults to BoT-SORT, whose camera-motion
+# compensation costs CPU on every frame and buys nothing on a fixed camera).
+#
+# ByteTrack keeps following a partly hidden person by matching their weaker
+# detections to the track they already have. The detector now passes
+# detections down to TRACK_CONF so this second stage has something to work
+# with; previously everything under 0.55 was discarded before tracking, so a
+# person who crossed behind someone was lost and returned as a new track.
+# A NEW track still needs a confident detection (new_track_thresh), so a
+# chair or poster does not become a person.
+tracker_type: bytetrack
+track_high_thresh: 0.50   # first-stage match: confident detections
+track_low_thresh: 0.15    # second stage: weaker detections may only continue an existing track
+new_track_thresh: 0.55    # same confidence as before for starting a new person
+track_buffer: 45          # frames a lost track is kept (~4.5 s at 10 YOLO frames/s)
+match_thresh: 0.80
+fuse_score: True

@@ -487,6 +487,18 @@ def done_pending_people() -> list:
         if p.status == "done_pending"
     ]
 
+
+def face_resolved_track_ids() -> list:
+    """Tracks whose identity is settled, so the detector need only refresh
+    their faces now and then: students with a number, numbered walk-ins, and
+    students recognized but not queueing (a fresh face from them is still
+    used, at a slower pace, if they tap join). Everyone else gets the
+    detector's face budget first."""
+    return [
+        tid for tid, p in queue_tracker.active_queue.items()
+        if p.queue_number is not None or p.identity_status in ("linked", "bystander")
+    ]
+
 def is_queue_number_active(queue_number: int) -> bool:
     return any(
         p.queue_number == queue_number and p.status in ("waiting", "missing")

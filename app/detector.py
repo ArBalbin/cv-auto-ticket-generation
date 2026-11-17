@@ -39,6 +39,7 @@ print("[Detector] Loading Ultralytics/YOLO...", flush=True)
 from ultralytics import YOLO
 from services.prediction_service import PredictionService
 from services import face_service
+from services.face_schedule import FaceSchedule, attach_fresh_embeddings, resolved_track_ids
 print("[Detector] Detector libraries loaded.", flush=True)
 
 # Rolling live face-detection tally: [attempts, successes]. Reported on the
@@ -140,6 +141,25 @@ MIN_BBOX_AREA  = int(os.getenv("MIN_BBOX_AREA",    "1500"))
 MAX_BBOX_FRAC  = float(os.getenv("MAX_BBOX_FRAC",  "0.70"))
 DETECTION_DEBUG_EVERY = int(os.getenv("DETECTION_DEBUG_EVERY", "30"))
 BBOX_EMA_ALPHA  = float(os.getenv("BBOX_EMA_ALPHA",  "0.50"))
+
+# Tracking. The tracker is ByteTrack (app/trackers/queuex_bytetrack.yaml).
+# It now sees detections down to TRACK_CONF: a weak detection may only
+# continue a person already being tracked, which keeps someone who is partly
+# hidden from being lost and coming back as a new person. A new person still
+# needs YOLO_CONF.
+TRACK_CONF = float(os.getenv("TRACK_CONF", "0.15"))
+TRACKER_CONFIG = os.getenv(
+    "TRACKER_CONFIG", str(app_root / "trackers" / "queuex_bytetrack.yaml")
+)
+
+# Face signatures run in their own worker on a budget, newest unidentified
+# people first (services/face_schedule.py), instead of for every person on
+# every frame inside the tracking loop.
+FACE_PER_ROUND       = max(1, int(os.getenv("FACE_PER_ROUND", "2")))
+FACE_RETRY_GAP       = float(os.getenv("FACE_RETRY_GAP", "0.15"))
+FACE_SLOW_GAP        = float(os.getenv("FACE_SLOW_GAP", "1.0"))
+FACE_WARMUP          = int(os.getenv("FACE_WARMUP", "6"))
+FACE_REFRESH_SECONDS = float(os.getenv("FACE_REFRESH_SECONDS", "2.0"))
 
 
 CAMERA_BACKEND_CODES = {
@@ -311,6 +331,8 @@ def _push_to_api(payload: dict) -> None:
         with _state_lock:
             _shared_state["api_queue_state"] = queue_state
             _shared_state["done_pending"]    = done_pending
+            # The people the backend no longer needs faces for.
+            _shared_state["face_resolved"]   = resolved_track_ids(data)
 
     except requests.RequestException as e:
         _push_errors += 1
@@ -802,6 +824,10 @@ def run() -> None:
     print(f"[Detector] Snapshot fps : {SNAPSHOT_FPS:.1f}")
     print(f"[Detector] Upload slots : {SNAPSHOT_UPLOAD_WORKERS}")
     print(f"[Detector] Snapshot push: {'on' if SNAPSHOT_UPLOAD_ENABLED else 'off'}")
+    print(f"[Detector] Tracker      : {Path(TRACKER_CONFIG).name} "
+          f"(sees detections >= {TRACK_CONF:g}, new person >= {YOLO_CONF:g})")
+    print(f"[Detector] Face budget  : {FACE_PER_ROUND} per round, new people first, "
+          f"identified people every {FACE_REFRESH_SECONDS:g}s")
 
     try:
         model = YOLO(MODEL_PATH)
@@ -833,6 +859,18 @@ def run() -> None:
     _yolo_queue: _queue.Queue = _queue.Queue(maxsize=1)
     _api_push_queue: _queue.Queue = _queue.Queue(maxsize=1)
     _snapshot_encode_queue: _queue.Queue = _queue.Queue(maxsize=1)
+    # The newest tracked frame for the face worker, and the face signatures
+    # it has computed but not yet sent (track_id -> embedding).
+    _face_queue: _queue.Queue = _queue.Queue(maxsize=1)
+    _fresh_lock = threading.Lock()
+    _fresh_embeddings: dict = {}
+    face_schedule = FaceSchedule(
+        per_round=FACE_PER_ROUND,
+        retry_gap=FACE_RETRY_GAP,
+        slow_gap=FACE_SLOW_GAP,
+        warmup=FACE_WARMUP,
+        refresh_seconds=FACE_REFRESH_SECONDS,
+    )
 
     # Latest YOLO results - written by YOLO thread, read by capture loop.
     _result_lock = threading.Lock()
@@ -873,7 +911,7 @@ def run() -> None:
             try:
                 results = model.track(
                     small, imgsz=YOLO_IMGSZ, persist=True,
-                    conf=YOLO_CONF, verbose=False,
+                    conf=TRACK_CONF, tracker=TRACKER_CONFIG, verbose=False,
                 )
             except Exception as e:
                 print(f"[Detector] WARNING YOLO error: {e}")
@@ -887,10 +925,16 @@ def run() -> None:
                     try:
                         if int(box.cls[0]) != 0:
                             continue
+                        conf = float(box.conf[0]) if box.conf is not None else 0.5
+                        # A tracked box is the tracker's decision: a weak one
+                        # only ever continues a person already tracked. A box
+                        # the tracker did not claim must be as confident as a
+                        # new person has to be.
+                        if box.id is None and conf < YOLO_CONF:
+                            continue
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         tid  = (int(box.id[0]) if box.id is not None
                                 else _fallback_id((x1+x2)//2, (y1+y2)//2))
-                        conf = float(box.conf[0]) if box.conf is not None else 0.5
                         raw.append({"track_id": tid,
                                     "bbox": (x1, y1, x2, y2),
                                     "conf": conf})
@@ -947,28 +991,13 @@ def run() -> None:
                       f"scale={FRAME_SCALE:.2f}")
             avg_d, max_d = predictor.calculate_density(persons, w_frame, h_frame)
 
-            # Face embedding (Algorithm 4) runs here, in the detector process,
-            # where the raw frame is available. Only the resulting vector ever
-            # crosses the wire to the backend, never a face crop.
-            for tp in tracked_persons:
-                tid = tp["track_id"]
-                bbox_t = tuple(tp["bbox"])
-
-                try:
-                    embedding = face_service.compute_embedding(small, bbox_t)
-                    tp["face_embedding"] = embedding.tolist() if embedding is not None else None
-                    # Live face-detection rate. A miss is a retry, not a wrong
-                    # answer — it still costs a full extraction (~260ms), so
-                    # this ratio is what drives time-to-recognition.
-                    _face_stats[0] += 1
-                    if embedding is not None:
-                        _face_stats[1] += 1
-                except Exception as e:
-                    tp["face_embedding"] = None
-                    _face_stats[0] += 1
-                    if DETECTION_DEBUG_EVERY > 0 and yolo_frame_idx[0] % DETECTION_DEBUG_EVERY == 0:
-                        print(f"[Detector] WARNING face embedding error: {e}")
-
+            # Face signatures are computed by the face worker, from this same
+            # frame, so tracking never waits for them. Only the resulting
+            # vector ever crosses the wire to the backend, never a face crop.
+            _queue_latest(
+                _face_queue,
+                (small, {tp["track_id"]: tuple(tp["bbox"]) for tp in tracked_persons}),
+            )
 
             with _data_lock:
                 current_data.update({
@@ -1044,6 +1073,39 @@ def run() -> None:
                     }
                 _queue_latest(_api_push_queue, payload)
 
+    def _face_worker() -> None:
+        """Computes face signatures for the people the schedule picks, on the
+        newest tracked frame, while tracking carries on."""
+        while not _shutdown.is_set():
+            try:
+                frame, boxes = _face_queue.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+
+            now = time.time()
+            with _state_lock:
+                resolved = set(_shared_state.get("face_resolved", ()))
+            face_schedule.forget_absent(set(boxes), now)
+            with _fresh_lock:
+                for tid in list(_fresh_embeddings):
+                    if tid not in face_schedule.state:
+                        del _fresh_embeddings[tid]
+
+            for tid in face_schedule.choose(list(boxes), resolved, now):
+                try:
+                    embedding = face_service.compute_embedding(frame, boxes[tid])
+                except Exception as e:
+                    embedding = None
+                    print(f"[Detector] WARNING face embedding error: {e}")
+                face_schedule.record(tid, embedding is not None, time.time())
+                # Live face-detection rate. A miss is a retry, not a wrong
+                # answer, but it still costs a full extraction (~260 ms).
+                _face_stats[0] += 1
+                if embedding is not None:
+                    _face_stats[1] += 1
+                    with _fresh_lock:
+                        _fresh_embeddings[tid] = embedding.tolist()
+
     def _api_push_worker() -> None:
         interval = 1.0 / max(0.1, API_PUSH_FPS)
 
@@ -1054,6 +1116,12 @@ def run() -> None:
             except _queue.Empty:
                 continue
 
+            # Each new face signature goes out once, on the next update.
+            with _fresh_lock:
+                payload = dict(payload)
+                payload["tracked_persons"] = attach_fresh_embeddings(
+                    payload["tracked_persons"], _fresh_embeddings,
+                )
             _push_to_api(payload)
 
             delay = interval - (time.time() - started)
@@ -1174,6 +1242,10 @@ def run() -> None:
     yolo_thread = threading.Thread(target=_supervised(_yolo_worker, "YOLO worker"),
                                    name="YOLOWorker", daemon=True)
     yolo_thread.start()
+
+    face_thread = threading.Thread(target=_supervised(_face_worker, "Face worker"),
+                                   name="FaceWorker", daemon=True)
+    face_thread.start()
 
     api_push_thread = threading.Thread(
         target=_supervised(_api_push_worker, "API push worker"),
@@ -1301,6 +1373,7 @@ def run() -> None:
         if snapshot_encode_thread is not None:
             snapshot_encode_thread.join(timeout=2.0)
         api_push_thread.join(timeout=2.0)
+        face_thread.join(timeout=2.0)
         yolo_thread.join(timeout=2.0)
         print("[Detector] Stopped.")
 
