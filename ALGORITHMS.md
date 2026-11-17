@@ -35,10 +35,27 @@ changes matter when comparing against the earlier version:
    registered students stopped needing kiosk tickets, that code path became
    unreachable and was deleted rather than left running for no purpose.
 
-**Algorithm count: 16 → 9.** Ticket generation (JWT/QR/PDF) and TTS
-announcements are documented as *system features* rather than algorithms —
-neither performs CV or predictive reasoning; both are deterministic output
-formatting triggered by decisions made elsewhere.
+**Algorithm count: 16 → 4 major algorithms.** The manuscript (Section 3.2)
+groups the sections below the same way:
+
+| Manuscript | Sections here | |
+|---|---|---|
+| **Algorithm 1** Person detection and tracking | 1 and 3 | major |
+| **Algorithm 2** Presence confirmation | 2 | major |
+| **Algorithm 3** Face identity validation and number issuance | 4 and 5 | major |
+| **Algorithm 4** Wait-time estimation | 6 and 7 | major |
+| Procedure A/B — calling to a window (Call next, or automatic) | 8 | supporting rule |
+| Procedure C — ticket generation | System features | supporting rule |
+
+Calling, ticket generation (JWT/QR/PDF) and TTS announcements apply fixed
+rules; none performs detection, recognition or prediction.
+
+**Gradient Boosting is not deployed.** A Gradient Boosting predictor was
+trained on the historical cashier log and evaluated offline (MAE 2.35 min),
+but nothing in `app/` loads it: simpler models were as accurate or better on
+the data, its runtime calibration was never built, and scikit-learn would use
+about 100 MB of the 512 MB server. The manuscript states this in its scope and
+delimitation.
 
 ---
 
@@ -436,11 +453,17 @@ so staff can see which is in use.
 
 ---
 
-## 8. Sticky Counter Assignment
+## 8. Calling to a Window
 
-**Where:** `queue_tracker._recalculate_positions()`
+**Where:** `queue_tracker.call_next()` (default), `queue_tracker._recalculate_positions()` (automatic mode)
 
-People within counter range (position ≤ active counter count) are assigned
+**By default staff call numbers** (`QUEUE_CALL_MODE=staff`). Each staff
+account holds one window (a claim renewed by the dashboard, lapsing after
+120 s). Pressing **Call next** gives the first waiting number to that window,
+unless the window is closed or still serving someone. A switch on the
+dashboard changes to automatic calling, which uses the sticky rule below.
+
+**Automatic mode — sticky assignment.** People within counter range (position ≤ active counter count) are assigned
 to whichever counters are currently free. Assignment is **sticky**: the
 loop skips anyone who already holds a counter, so once a person is given
 counter 2 they keep counter 2 as the queue shifts behind them.
@@ -479,13 +502,13 @@ towards `total_served`, since nobody was served.
 | # | Algorithm | Technique | Refuses when |
 |---|---|---|---|
 | 1 | Person detection & tracking | YOLOv8n + ByteTrack, 5 gates, EMA | Fails any gate |
-| 2 | Presence confirmation | Centroid-in-zone + 20-frame buffer + motion test | Too few frames, or static |
+| 2 | Presence confirmation | Centroid-in-zone + frame buffer and motion test, or 1 s with 3 face frames | Too few frames, or static |
 | 3 | Track stability | IoU/centroid remap + dedup | — |
-| 4 | Face recognition | ArcFace 512-d + threshold & margin rule | Score < 0.30 or margin < 0.15 |
-| 5 | System-minted number | Reserved 5000+ range, one-per-student | Student already holds an entry |
-| 6 | Wait-time prediction | Median regression on people ahead + count projection | — |
+| 4 | Face recognition | ArcFace 512-d + threshold & margin rule, in-memory index | Score < 0.30 or margin < 0.15 |
+| 5 | System-minted number | Reserved 5000+ range, one-per-student, only after a request | Student already holds an entry, or did not ask |
+| 6 | Wait-time prediction | Queue simulation per window (default); median regression on people ahead (fallback) | — |
 | 7 | Service-time measurement | Inter-departure gap blending | — |
-| 8 | Counter assignment | Sorted position, sticky | — |
+| 8 | Calling to a window | Call next per staff window (default); sticky assignment (automatic mode) | Window busy or closed |
 
 Four of the eight (1, 2, 4, 5) have an explicit refuse-and-escalate
 branch. That is the design stance: the system is built to hand ambiguous
