@@ -110,8 +110,16 @@ def test_a_face_cannot_open_another_students_account(system):
     with pytest.raises(HTTPException) as err:
         face_sign_in("ana", phone_account=2)
     assert err.value.status_code == 401
-    assert err.value.detail == students.FACE_SIGNIN_NO_MATCH
+    # Ana is told the phone holds another account, not that her face failed.
+    assert err.value.detail == students.FACE_SIGNIN_OTHER_ACCOUNT
     assert system.events == [(None, False)]
+
+
+def test_an_unrecognised_face_is_told_to_try_again(system, monkeypatch):
+    monkeypatch.setitem(FACES, "stranger", unit(99))
+    with pytest.raises(HTTPException) as err:
+        face_sign_in("stranger", phone_account=1)
+    assert err.value.detail == students.FACE_SIGNIN_NO_MATCH
 
 
 def test_without_an_account_on_the_phone_face_sign_in_is_not_attempted(system):

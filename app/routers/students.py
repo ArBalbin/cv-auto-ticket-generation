@@ -79,7 +79,16 @@ FACE_SIGNIN_NOT_REGISTERED = (
     "Your face isn't registered yet. Sign in with Gbox, then register your face."
 )
 FACE_SIGNIN_NO_MATCH = (
-    "Your face didn't match this account. Try again in good light, or sign in with Gbox."
+    "We couldn't recognise your face clearly. Face the camera and try again, "
+    "or sign in with Gbox."
+)
+# Said when the face is clearly recognised but belongs to another account than
+# the one last used on the phone, usually because someone else signed in on
+# it. A tester whose phone had been used by students in the UAT was told only
+# that the face "didn't match", and kept retrying in better light.
+FACE_SIGNIN_OTHER_ACCOUNT = (
+    "Your face belongs to a different account from the one last used on this "
+    "phone. Sign in with Gbox to use your own account here."
 )
 FACE_NOT_SEEN = (
     "We couldn't see a face clearly. Face the camera in good light and try again."
@@ -319,7 +328,8 @@ async def student_face_auth(
         student["id"] if accepted else None, None, match.score, match.margin, accepted,
     )
     if not accepted:
-        raise HTTPException(status_code=401, detail=FACE_SIGNIN_NO_MATCH)
+        detail = FACE_SIGNIN_OTHER_ACCOUNT if match.accepted else FACE_SIGNIN_NO_MATCH
+        raise HTTPException(status_code=401, detail=detail)
 
     touch_student_last_login(student["id"])
     token = create_student_session(student["id"])
