@@ -270,6 +270,55 @@ def test_a_served_student_is_still_reported_as_served(system):
     assert system.tracker.get_person_by_student_id(152).to_dict()["status"] == "done_pending"
 
 
+def test_you_are_done_clears_after_a_couple_of_minutes(system):
+    """The finished entry lingers until the camera sees the student leave,
+    which never happens with the camera off. The app must still move on from
+    "You're done" instead of showing it every time the student opens it."""
+    ben = face(153)
+    system.enrolled[153] = ben
+    tap_join(153)
+    system.stand((92, 100, near(ben, 4200, 0.3)))
+    queue_service.mark_done(app_state(153)["queue_number"])
+    assert app_state(153)["state"] == "recently_served"
+
+    person = system.tracker.get_person_by_student_id(153)
+    person.retired_at -= timedelta(seconds=system.tracker.RECENTLY_DONE_SECONDS + 1)
+    assert person.status == "done_pending", "still held: nobody saw them leave"
+    assert app_state(153)["state"] == "not_joined"
+
+
+def test_skipped_clears_after_a_couple_of_minutes_too(system):
+    cara = face(154)
+    system.enrolled[154] = cara
+    tap_join(154)
+    system.stand((93, 100, near(cara, 4300, 0.3)))
+    queue_service.mark_no_show(app_state(154)["queue_number"])
+    assert app_state(154)["state"] == "recently_skipped"
+
+    person = system.tracker.get_person_by_student_id(154)
+    person.retired_at -= timedelta(seconds=system.tracker.RECENTLY_DONE_SECONDS + 1)
+    assert app_state(154)["state"] == "not_joined"
+
+
+def test_asking_again_after_the_card_clears_still_works(system):
+    """Tapping Get a Queue Number later still releases the old entry, so the
+    student is matched again by the camera."""
+    dan = face(155)
+    system.enrolled[155] = dan
+    tap_join(155)
+    system.stand((94, 100, near(dan, 4400, 0.3)))
+    first = app_state(155)["queue_number"]
+    queue_service.mark_done(first)
+    person = system.tracker.get_person_by_student_id(155)
+    person.retired_at -= timedelta(seconds=system.tracker.RECENTLY_DONE_SECONDS + 1)
+
+    tap_join(155)
+    assert app_state(155)["state"] in ("waiting_for_camera", "identifying")
+    system.stand((94, 100, near(dan, 4401, 0.3)))
+    again = app_state(155)
+    assert again["state"] == "active" and again["queue_number"] != first
+
+
 def test_without_a_face_the_full_count_still_applies(system):
     for i in range(3):
         queue_service.process_tracked_persons(frame((8, 400, None)), i)

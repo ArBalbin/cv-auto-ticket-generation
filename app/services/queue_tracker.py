@@ -36,6 +36,9 @@ class QueuePerson:
         # person as 'done_pending' while they walk away; the app needs to
         # know which, to tell a skipped student why their number ended.
         'retired_as',
+        # When staff retired it, so the app says "You're done" or "skipped"
+        # only for a short while, not for as long as the entry lingers.
+        'retired_at',
         # What the student said they are paying for, and how much, when they
         # joined in the app. Shown to the cashier; None for walk-ins.
         'payment_type', 'payment_amount', 'payment_note',
@@ -73,6 +76,7 @@ class QueuePerson:
         self.linked_at            = datetime.now() if queue_number is not None else None
         self.called_at            = None
         self.retired_as           = None
+        self.retired_at           = None
         self.payment_type         = None
         self.payment_amount       = None
         self.payment_note         = None
@@ -207,6 +211,11 @@ class QueueTracker:
     DUPLICATE_COOLDOWN_SECONDS    = 3.0
     DONE_LEAVE_SECONDS            = 1.0
     DONE_LEAVE_MIN_FRAMES         = 3
+    # How long the app keeps saying "You're done" (or "skipped") after staff
+    # retire a number. The finished entry itself lingers until the camera sees
+    # the student leave, which never happens if the camera is off or the
+    # student stays in view, so the app must not rely on it.
+    RECENTLY_DONE_SECONDS         = 120.0
     # How long an "on the way" banner stays on the staff dashboard. The alert
     # is a transient prompt — a student has said they are walking over — but
     # nothing expired it, so the list was trimmed only once twenty newer
@@ -608,6 +617,12 @@ class QueueTracker:
     def _is_in_done_cooldown(self, bbox, threshold=0.35) -> bool:
         return any(self._iou(e['bbox'], bbox) > threshold for e in self._done_cooldowns)
 
+    def is_recently_retired(self, person) -> bool:
+        """Whether staff marked this entry done or a no-show within the last
+        RECENTLY_DONE_SECONDS."""
+        at = getattr(person, 'retired_at', None)
+        return at is not None and (datetime.now() - at).total_seconds() <= self.RECENTLY_DONE_SECONDS
+
     def _tick_done_cooldowns(self):
         now = datetime.now()
         self._done_cooldowns = [e for e in self._done_cooldowns if e['until'] > now]
@@ -981,6 +996,7 @@ class QueueTracker:
 
         p.status           = 'done_pending'
         p.retired_as       = reason
+        p.retired_at       = datetime.now()
         p.position_in_line = 0
         self._done_cooldowns.append({
             'bbox': p.bbox,

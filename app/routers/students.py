@@ -472,6 +472,19 @@ async def get_my_queue_entry(student_id: int = Depends(require_student)):
 
     person = tracker.get_person_by_student_id(student_id)
 
+    # A served/no-show person lingers in active_queue as 'done_pending' until
+    # the done-cooldown clears them. Reporting that as still-active makes the
+    # app's dashboard poll drag the student straight back into the "session
+    # ended" screen they just dismissed, so treat it as finished here: "You're
+    # done" (or "skipped") for a couple of minutes, then a fresh start. The
+    # entry can linger for hours when the camera never sees the student leave
+    # (or is off), and reporting it all that time kept the app on "You're
+    # done", even after the student signed out and back in.
+    if person is not None and person.status == "done_pending":
+        if tracker.is_recently_retired(person):
+            return payload("recently_skipped" if person.retired_as == "no_show" else "recently_served")
+        person = None
+
     if person is None:
         # Recognized earlier, but no join intent was armed at that moment, so
         # nothing was issued. Arming the intent revives the track, but only
@@ -487,13 +500,6 @@ async def get_my_queue_entry(student_id: int = Depends(require_student)):
         if tracker.has_unidentified_person():
             return payload("identifying")
         return payload("waiting_for_camera")
-
-    # A served/no-show person lingers in active_queue as 'done_pending' until
-    # the done-cooldown clears them. Reporting that as still-active makes the
-    # app's dashboard poll drag the student straight back into the "session
-    # ended" screen they just dismissed, so treat it as finished here.
-    if person.status == "done_pending":
-        return payload("recently_skipped" if person.retired_as == "no_show" else "recently_served")
 
     if person.queue_number is None:
         return {
