@@ -1331,25 +1331,25 @@ def run() -> None:
                 _fps_t0     = time.time()
                 _fps_frames = 0
 
-            # Downscale for YOLO only. Dashboard encoding happens in a
-            # separate worker from the original frame.
-            if FRAME_SCALE < 1.0:
-                h_orig, w_orig = frame.shape[:2]
-                small = cv2.resize(
-                    frame,
-                    (int(w_orig * FRAME_SCALE), int(h_orig * FRAME_SCALE)),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-            else:
-                small = frame
-
             # Feed YOLO thread every YOLO_EVERY frames.
             # put_nowait() drops the frame if YOLO is still busy - this is
             # intentional; we never want the camera read to stall.
             if frame_idx % YOLO_EVERY == 0:
-                # The small frame is for tracking; the full one is kept for
-                # the face worker, which cuts faces from it.
-                yolo_frame = (small.copy(), frame.copy())
+                # Downscale for YOLO only, and only for the frames YOLO gets:
+                # resizing every frame cost the camera loop time on frames
+                # nothing used. The full frame goes along for the face worker,
+                # which cuts faces from it. Dashboard encoding happens in a
+                # separate worker from the original frame.
+                if FRAME_SCALE < 1.0:
+                    h_orig, w_orig = frame.shape[:2]
+                    small = cv2.resize(
+                        frame,
+                        (int(w_orig * FRAME_SCALE), int(h_orig * FRAME_SCALE)),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                else:
+                    small = frame.copy()
+                yolo_frame = (small, frame.copy())
                 try:
                     _yolo_queue.put_nowait(yolo_frame)
                 except _queue.Full:
