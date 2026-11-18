@@ -238,6 +238,9 @@ class QueueTracker:
         # the same printed ticket to two different people.
         self._used_numbers: set          = set()
         self._done_cooldowns: list       = []
+        # Students just served and still in view who asked for another
+        # number; applied at the start of the next frame (see arm_join_intent).
+        self._rejoin_requests: set       = set()
         self.completed_queue: list       = []
         self.total_served                = 0
         self.appearance_rejections: list = []
@@ -338,13 +341,50 @@ class QueueTracker:
         if payment is not None:
             self._join_details[student_id] = dict(payment)
 
-        for person in self.active_queue.values():
-            if (person.identity_status == 'bystander'
-                    and person.student_id == student_id):
+        for person in list(self.active_queue.values()):
+            if person.student_id != student_id:
+                continue
+            if person.identity_status == 'bystander':
                 person.identity_status = 'pending_link'
                 print(f"🔓 Student {student_id} joined — re-evaluating "
                       f"track {person.track_id}")
+            elif person.status == 'done_pending':
+                # Released by the camera thread on its next frame, not here:
+                # this runs on a request thread while frames are processed.
+                with self._lock:
+                    self._rejoin_requests.add(student_id)
         return now
+
+    def _apply_rejoin_requests(self) -> None:
+        """Release students just served (or skipped), still in view, who
+        asked for another number.
+
+        A finished entry stays on its track until the person leaves the
+        camera's view, and for DONE_COOLDOWN_SECONDS nobody new is confirmed
+        where they stood. Both guard against someone being re-queued by
+        accident as they walk away; neither should stop a student who asks
+        again, who otherwise had to walk out of view and wait. The entry is
+        dropped and the cooldown at their spot lifted, so their next
+        sightings go through presence confirmation and the face check like
+        anyone arriving.
+        """
+        with self._lock:
+            requests, self._rejoin_requests = self._rejoin_requests, set()
+        if not requests:
+            return
+        for tid, person in list(self.active_queue.items()):
+            if person.student_id not in requests or person.status != 'done_pending':
+                continue
+            del self.active_queue[tid]
+            if person.queue_number is not None:
+                self._by_queue_number.pop(person.queue_number, None)
+            self._by_student_id.pop(person.student_id, None)
+            self._done_cooldowns = [
+                e for e in self._done_cooldowns if self._iou(e['bbox'], person.bbox) <= 0.3
+            ]
+            self._candidates.pop(tid, None)
+            print(f"🔁 Student {person.student_id} asked for another number — "
+                  f"track {tid} released")
 
     def clear_join_intent(self, student_id: int) -> None:
         self._join_intents.pop(student_id, None)
@@ -696,6 +736,7 @@ class QueueTracker:
 
     def process_frame(self, tracked_persons: list) -> dict:
         self._tick_done_cooldowns()
+        self._apply_rejoin_requests()
         self._claimed_this_frame = {}
         current_in_zone = set()
 

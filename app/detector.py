@@ -902,7 +902,7 @@ def run() -> None:
     def _yolo_worker() -> None:
         while not _shutdown.is_set():
             try:
-                small = _yolo_queue.get(timeout=0.5)
+                small, full = _yolo_queue.get(timeout=0.5)
             except _queue.Empty:
                 continue
 
@@ -994,9 +994,19 @@ def run() -> None:
             # Face signatures are computed by the face worker, from this same
             # frame, so tracking never waits for them. Only the resulting
             # vector ever crosses the wire to the backend, never a face crop.
+            #
+            # Faces are cut from the full-resolution camera frame, not the
+            # frame shrunk for tracking: at 1.5-2 m a face in the 480x360
+            # tracking frame was only about 25-30 px wide, too small to find
+            # reliably or to match with confidence, and on 17 Nov more than
+            # half the face checks failed. Boxes are scaled up to match.
+            up = 1.0 / FRAME_SCALE if FRAME_SCALE < 1.0 else 1.0
             _queue_latest(
                 _face_queue,
-                (small, {tp["track_id"]: tuple(tp["bbox"]) for tp in tracked_persons}),
+                (full, {
+                    tp["track_id"]: tuple(int(v * up) for v in tp["bbox"])
+                    for tp in tracked_persons
+                }),
             )
 
             with _data_lock:
@@ -1337,7 +1347,9 @@ def run() -> None:
             # put_nowait() drops the frame if YOLO is still busy - this is
             # intentional; we never want the camera read to stall.
             if frame_idx % YOLO_EVERY == 0:
-                yolo_frame = small.copy()
+                # The small frame is for tracking; the full one is kept for
+                # the face worker, which cuts faces from it.
+                yolo_frame = (small.copy(), frame.copy())
                 try:
                     _yolo_queue.put_nowait(yolo_frame)
                 except _queue.Full:
