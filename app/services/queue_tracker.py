@@ -583,6 +583,32 @@ class QueueTracker:
         self._candidates.pop(track_id, None)
         self._claimed_this_frame[ret_tid] = track_id
 
+    def return_to_track(self, person: QueuePerson, track_id: int, live_embedding=None) -> bool:
+        """Put a missing student's entry back on the track they came back on.
+
+        Re-entry matching compares a returning face with the last capture of
+        it, often a turned head as the student walked away, so a student who
+        stepped out of view can come back as a new, unidentified person while
+        their own number stays "missing". Once that new person is recognised
+        as the same enrolled student, their entry moves onto the new track and
+        the unidentified duplicate is dropped.
+
+        Only for an entry that is out of view (missing_frames > 0) and not yet
+        finished, and only onto a track that is still unidentified."""
+        newcomer = self.active_queue.get(track_id)
+        if newcomer is None or newcomer is person:
+            return False
+        if newcomer.identity_status != 'pending_link' or newcomer.queue_number is not None:
+            return False
+        if person.status == 'done_pending' or person.missing_frames <= 0:
+            return False
+        old_tid = next((tid for tid, p in self.active_queue.items() if p is person), None)
+        if old_tid is None:
+            return False
+        embedding = None if live_embedding is None else np.array(live_embedding, dtype=np.float32)
+        self._restore_missing_person(person, old_tid, track_id, newcomer.bbox, embedding)
+        return True
+
 
     def get_pending_link_alerts(self) -> list:
         """Staff alert list for people confirmed present but still

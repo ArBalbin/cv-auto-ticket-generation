@@ -330,6 +330,19 @@ def _try_link_students(raw_tracked: list) -> None:
             if not match.accepted:
                 continue
 
+            # A student who stepped out of view and came back: their face no
+            # longer matched the last capture of it, so the camera confirmed
+            # them as a new, unidentified person while their own number sat
+            # "missing" on the staff screen. Their registration signature does
+            # match, so their number goes back to them on this track. This
+            # comes before the join-intent check, because the request that
+            # produced their number was used up when the number was issued.
+            existing = queue_tracker.get_person_by_student_id(match.student_id)
+            if existing is not None and queue_tracker.return_to_track(existing, track_id, live_embedding):
+                label = f"Q{existing.queue_number:03d}" if existing.queue_number is not None else "(entry)"
+                print(f"↩️  {label} is back: student {match.student_id} recognised on track {track_id}")
+                continue
+
             # Recognition is not consent. A registered student only gets a
             # number if they asked for one in the app first — otherwise
             # anyone merely walking past the camera (accompanying a friend,

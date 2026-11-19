@@ -270,6 +270,50 @@ def test_a_served_student_is_still_reported_as_served(system):
     assert system.tracker.get_person_by_student_id(152).to_dict()["status"] == "done_pending"
 
 
+def test_a_student_back_in_view_gets_their_own_number_back(system):
+    """Re-entry compares a returning face with the last capture of it. When
+    that capture was a turned head on the way out, the student came back as
+    a new, unidentified person while their number stayed "missing". Their
+    registration signature still matches, so the number must follow them."""
+    eve = face(160)
+    system.enrolled[160] = eve
+    tap_join(160)
+    system.stand((95, 100, near(eve, 5000, 0.3)))
+    number = app_state(160)["queue_number"]
+    assert number is not None
+
+    # The last capture before she left no longer looks like her.
+    system.tracker.get_person_by_student_id(160).face_embedding = face(9999)
+
+    system.stand(frames=5)                                   # out of view
+    assert system.tracker.get_person_by_student_id(160).missing_frames > 0
+
+    system.stand((96, 300, near(eve, 5001, 0.3)))            # back, on a new track
+    back = system.tracker.get_person_by_student_id(160)
+    assert back.queue_number == number
+    assert back.missing_frames == 0 and back.status == "waiting"
+    assert system.tracker.active_queue.get(96) is back
+    unidentified = [p for p in system.tracker.active_queue.values()
+                    if p.identity_status == "pending_link"]
+    assert unidentified == [], "no unidentified duplicate beside her on the staff screen"
+    assert app_state(160)["queue_number"] == number
+    assert system.tickets == [number], "no second number"
+
+
+def test_a_student_still_in_view_keeps_their_number_on_their_own_track(system):
+    """Only a missing entry moves. If the same face shows up on a second
+    track while the student is visible, the number stays where it is."""
+    fay = face(161)
+    system.enrolled[161] = fay
+    tap_join(161)
+    system.stand((97, 100, near(fay, 5100, 0.3)))
+    number = app_state(161)["queue_number"]
+    system.stand((97, 100, near(fay, 5101, 0.3)), (98, 600, near(fay, 5102, 0.3)))
+    assert system.tracker.active_queue[97].queue_number == number
+    assert system.tracker.get_person_by_student_id(161) is system.tracker.active_queue[97]
+    assert system.tickets == [number]
+
+
 def test_you_are_done_clears_after_a_couple_of_minutes(system):
     """The finished entry lingers until the camera sees the student leave,
     which never happens with the camera off. The app must still move on from
