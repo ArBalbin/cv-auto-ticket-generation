@@ -7,6 +7,7 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 
 from services import face_service
+from core.school_time import CLOCK_FULL, clock
 from core.config import FACE_ONLY_QUEUE_NUMBER_START, JOIN_INTENT_TIMEOUT_MINUTES
 
 
@@ -123,11 +124,11 @@ class QueuePerson:
 
     @property
     def joined_at_str(self) -> str:
-        return self.entered_at.strftime("%I:%M:%S %p")
+        return clock(self.entered_at)
 
     @property
     def joined_at_full(self) -> str:
-        return self.entered_at.strftime("%b %d, %Y %I:%M:%S %p")
+        return clock(self.entered_at, CLOCK_FULL)
 
     def to_dict(self):
         return {
@@ -146,7 +147,7 @@ class QueuePerson:
             'access_token':      self.short_code if self.short_code else self.access_token,
             'on_the_way':        self.on_the_way,
             'on_the_way_at':     self.on_the_way_at.isoformat() if self.on_the_way_at else None,
-            'on_the_way_at_display': self.on_the_way_at.strftime("%I:%M:%S %p") if self.on_the_way_at else None,
+            'on_the_way_at_display': clock(self.on_the_way_at) if self.on_the_way_at else None,
             # How long this person has been out of the camera's view, for the
             # staff deciding whether somebody has genuinely not turned up.
             # Nothing acts on it: it is shown so the judgement is informed,
@@ -765,8 +766,8 @@ class QueueTracker:
         now = datetime.now()
         entry = p.to_dict()
         entry.update({
-            'completed_at':      now.strftime("%I:%M:%S %p"),
-            'completed_at_full': now.strftime("%b %d, %Y %I:%M:%S %p"),
+            'completed_at':      clock(now),
+            'completed_at_full': clock(now, CLOCK_FULL),
             'total_wait_time':   p.wait_time_str,
             'bump_reason':       bump_reason,
         })
@@ -1090,7 +1091,7 @@ class QueueTracker:
             'queue_number': queue_number,
             'queue_label': label,
             'created_at': when.isoformat(),
-            'created_at_display': when.strftime("%I:%M:%S %p"),
+            'created_at_display': clock(when),
             'message': f"{label} is on the way to the queue zone.",
         }
         if not any(item.get('id') == notification['id'] for item in self.on_way_notifications):

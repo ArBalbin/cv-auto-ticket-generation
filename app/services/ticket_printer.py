@@ -1,4 +1,5 @@
 import os
+from core.school_time import clock
 import io
 import jwt
 import secrets
@@ -488,7 +489,7 @@ def generate_ticket_pdf(
     c.setFillColor(COLOR_MUTED)
     c.setFont("Helvetica", 5.5)
     c.drawCentredString(W / 2, 6 * mmUnit,
-                        now.strftime("%b %d, %Y  ·  %I:%M %p"))
+                        clock(now, "%b %d, %Y  ·  %I:%M %p"))
 
     c.save()
     print(f"[TicketPrinter] ✅ Saved → {filepath}")

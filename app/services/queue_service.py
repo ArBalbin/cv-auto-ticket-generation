@@ -44,6 +44,7 @@ from services.queue_tracker import QueueTracker, QueueZone
 from services import face_service, queue_engine, ticket_service, wait_model
 from services.embedding_index import EmbeddingIndex
 from services.ticket_printer import delete_all_tickets, invalidate_ticket_cache
+from core.school_time import CLOCK_FULL, db_clock
 
 queue_zone = QueueZone(x1=10, y1=10, x2=1910, y2=1070)
 queue_tracker = QueueTracker(zone=queue_zone)
@@ -1003,11 +1004,11 @@ def ticket_record_status_response(record: dict) -> dict:
         "position_in_line": 0,
         "wait_time": format_seconds(wait_seconds),
         "wait_time_seconds": wait_seconds,
-        "joined_at": created_at.strftime("%I:%M:%S %p"),
-        "joined_at_full": created_at.strftime("%b %d, %Y %I:%M:%S %p"),
+        "joined_at": db_clock(created_at),
+        "joined_at_full": db_clock(created_at, CLOCK_FULL),
         "joined_at_iso": created_at.isoformat(),
-        "completed_at": ended_at.strftime("%I:%M:%S %p"),
-        "completed_at_full": ended_at.strftime("%b %d, %Y %I:%M:%S %p"),
+        "completed_at": db_clock(ended_at),
+        "completed_at_full": db_clock(ended_at, CLOCK_FULL),
         "completed_at_iso": ended_at.isoformat(),
 
         "message": messages.get(status, "This queue ticket is no longer active."),
@@ -1031,8 +1032,8 @@ def ticket_record_waiting_response(record: dict) -> dict:
         "position_in_line": 0,
         "wait_time": format_seconds(wait_seconds),
         "wait_time_seconds": wait_seconds,
-        "joined_at": created_at.strftime("%I:%M:%S %p"),
-        "joined_at_full": created_at.strftime("%b %d, %Y %I:%M:%S %p"),
+        "joined_at": db_clock(created_at),
+        "joined_at_full": db_clock(created_at, CLOCK_FULL),
         "joined_at_iso": created_at.isoformat(),
 
         "message": (
@@ -1066,8 +1067,8 @@ def _fallback_person_from_ticket(record: dict, position: int) -> dict:
         "position": position,
         "wait_time": format_seconds(wait_seconds),
         "wait_time_seconds": wait_seconds,
-        "joined_at": created_at.strftime("%I:%M:%S %p"),
-        "joined_at_full": created_at.strftime("%b %d, %Y %I:%M:%S %p"),
+        "joined_at": db_clock(created_at),
+        "joined_at_full": db_clock(created_at, CLOCK_FULL),
         "joined_at_iso": created_at.isoformat(),
         "on_the_way": False,
         "on_the_way_at": None,
