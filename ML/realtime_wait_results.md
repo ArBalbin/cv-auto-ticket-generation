@@ -90,3 +90,62 @@ Four services of 2:00 were timed earlier. Times are min:sec of waiting left.
 The old estimates stop moving after 30 seconds. The new ones count down while
 Q1 takes a usual time, then grow while Q1 keeps going, and each student's
 estimated time of service moves later the whole time.
+
+## Pressure test on the real backend code (20 Nov 2026)
+
+`ML/pressure_test_realtime_wait.py` runs the real queue tracker, queue
+service and engine with the database switched off and a simulated clock.
+Students arrive at random and get a number; staff at each window press Call
+next, serve for a time drawn from the October log, press Done, and call again
+five seconds later. One transaction per run takes 9 minutes. Every waiting
+student's phone asks for its estimate every 5 seconds, and each answer is
+checked against when that student was really called. The old engine is asked
+the same question at the same moment. Three runs per row.
+
+| Students | Windows | Busy | Mean wait | Longest wait | Longest line | Phone checks | Live R² new | Live MAE new | Live R² old | Live MAE old | At-join R² new | At-join MAE new | Frozen 60 s+ new | Frozen 60 s+ old |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 24 | 1 | 85% | 5.1 min | 11.6 min | 5 | 1478 | 0.704 | 53 s | 0.700 | 69 s | 0.651 | 85 s | 1 | 43 |
+| 24 | 1 | 85% | 8.8 min | 15.0 min | 7 | 2545 | 0.848 | 57 s | 0.796 | 75 s | 0.751 | 99 s | 0 | 70 |
+| 24 | 1 | 85% | 6.2 min | 13.1 min | 6 | 1800 | 0.864 | 49 s | 0.832 | 58 s | 0.775 | 72 s | 2 | 56 |
+| 30 | 2 | 90% | 2.8 min | 7.2 min | 7 | 1013 | 0.680 | 49 s | 0.676 | 51 s | 0.713 | 58 s | 1 | 28 |
+| 30 | 2 | 90% | 5.8 min | 9.8 min | 11 | 2091 | 0.715 | 59 s | 0.802 | 50 s | 0.681 | 78 s | 0 | 60 |
+| 30 | 2 | 90% | 4.7 min | 9.2 min | 9 | 1678 | 0.719 | 54 s | 0.734 | 52 s | 0.677 | 77 s | 2 | 48 |
+| 40 | 3 | 95% | 0.9 min | 4.2 min | 5 | 422 | 0.367 | 41 s | 0.240 | 47 s | 0.701 | 25 s | 0 | 12 |
+| 40 | 3 | 95% | 7.1 min | 14.6 min | 18 | 3398 | 0.852 | 59 s | 0.875 | 53 s | 0.763 | 97 s | 0 | 115 |
+| 40 | 3 | 95% | 3.8 min | 8.7 min | 12 | 1816 | 0.826 | 37 s | 0.795 | 42 s | 0.848 | 39 s | 0 | 55 |
+
+Pooled over the 9 runs (282 students, 16,241 phone checks): live R² 0.834
+(MAE 53 s) new, 0.829 (MAE 56 s) old; at join, R² 0.818 (MAE 67 s) new.
+These days run at exactly October's pace, which the old engine assumes, so
+the two are about equally accurate here; the difference is that the old
+estimates froze. "Frozen 60 s+" counts each time a waiting student's
+estimate stayed identical for a minute or more while someone was at a window.
+
+The panel's case inside the first run: the 9-minute transaction of Q5005 at
+the only window, and the waits of the next two in line (min:sec).
+
+| Minutes at window | Next in line: new | old | Second in line: new | old |
+|---|---|---|---|---|
+| 2 | 0:43 | 1:24 | 2:33 | 3:16 |
+| 3 | 0:44 | 1:24 | 2:37 | 3:16 |
+| 4 | 0:46 | 1:24 | 2:43 | 3:16 |
+| 5 | 0:49 | 1:24 | 2:51 | 3:16 |
+| 6 | 0:53 | 1:24 | 2:58 | 3:16 |
+| 7 | 0:57 | 1:24 | 3:06 | 3:16 |
+| 8 | 1:01 | 1:24 | 3:13 | 3:16 |
+
+## Load test (20 Nov 2026)
+
+A local server with the real queue router (database off), 25 students in
+line, two windows calling and finishing a transaction every 12 seconds, and
+25 phones each asking for their status and the queue prediction every 2
+seconds (twice the app's rate) for 60 seconds, all at once.
+
+| Requests | Errors | Median | 95th percentile | Slowest |
+|---|---|---|---|---|
+| 750 status | 0 | 5.5 ms | 35.3 ms | 214.9 ms |
+| 750 prediction | 0 | 10.0 ms | 39.6 ms | 175.7 ms |
+
+All 23 students seen waiting had an estimate that changed during the run;
+the 7 called to a window were sent the 60-second arrival time. On this
+laptop, not on Render, whose free instance is slower and adds network time.
