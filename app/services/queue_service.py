@@ -1,5 +1,7 @@
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -31,9 +33,9 @@ from core.config import (
     WAIT_ESTIMATOR,
 )
 from database.database_handler import (
+    fetch_recent_service_seconds,
     fetch_waiting_queue_records,
     get_all_active_embeddings,
-    measure_avg_service_time,
     record_counter_config_change,
     record_face_match_event,
     record_recognition_metric,
@@ -44,7 +46,7 @@ from services.queue_tracker import QueueTracker, QueueZone
 from services import face_service, queue_engine, ticket_service, wait_model
 from services.embedding_index import EmbeddingIndex
 from services.ticket_printer import delete_all_tickets, invalidate_ticket_cache
-from core.school_time import CLOCK_FULL, db_clock
+from core.school_time import CLOCK_FULL, clock, db_clock
 
 queue_zone = QueueZone(x1=10, y1=10, x2=1910, y2=1070)
 queue_tracker = QueueTracker(zone=queue_zone)
@@ -111,23 +113,61 @@ def _on_number_linked(
     except Exception:
         print(f"[QueueService] Ticket queue full - Q{queue_number:03d} skipped")
 
-def _service_time_refresh_loop() -> None:
-    """Background thread: re-measure avg_service_time from DB every 5 minutes."""
-    while True:
-        time.sleep(300)
-        try:
-            num_counters = max(1, int(QUEUE_CONFIG.get("num_counters", 3)))
-            measured = measure_avg_service_time(num_counters)
-            if measured is not None:
-                with _config_lock:
-                    old = QUEUE_CONFIG.get("avg_service_time", 3.0)
-                    # Blend: 70% measured, 30% previous to avoid sudden jumps
-                    blended = round(0.7 * measured + 0.3 * old, 2)
-                    QUEUE_CONFIG["avg_service_time"] = blended
-                print(f"[QueueService] avg_service_time updated: "
-                      f"{old:.2f} → {blended:.2f} min (measured={measured:.2f})")
-        except Exception as exc:
-            print(f"[QueueService] service time refresh error: {exc}")
+# HOW LONG RECENT SERVICES TOOK
+#
+# Each service staff mark done is timed from the call to the window to Done,
+# and kept here with when it finished. The wait estimate's current average
+# service time is the last ten of these from the past two hours
+# (queue_engine.service_model). Timed here, not re-read from the database, so
+# the next estimate already knows; read from the database once after a
+# restart, which empties this.
+#
+# Services shorter than MIN_TIMED_SERVICE_SECONDS are a mis-click or a test;
+# longer than MAX_TIMED_SERVICE_SECONDS, a Done that was forgotten.
+MIN_TIMED_SERVICE_SECONDS = 5
+MAX_TIMED_SERVICE_SECONDS = 30 * 60
+_recent_services: deque = deque(maxlen=50)   # (time.monotonic() at Done, seconds)
+_recent_services_lock = threading.Lock()
+_recent_services_seeded = False
+
+
+def record_service_time(service_seconds: int | None, finished_ago_seconds: float = 0.0) -> bool:
+    """Count one finished service in the current average. False when ignored."""
+    if service_seconds is None:
+        return False
+    if not MIN_TIMED_SERVICE_SECONDS <= service_seconds <= MAX_TIMED_SERVICE_SECONDS:
+        return False
+    with _recent_services_lock:
+        _recent_services.append((time.monotonic() - max(0.0, finished_ago_seconds), int(service_seconds)))
+    return True
+
+
+def recent_service_minutes() -> list[float]:
+    """Services finished in the past two hours, oldest first, in minutes."""
+    horizon = time.monotonic() - queue_engine.RECENT_WINDOW_MIN * 60
+    with _recent_services_lock:
+        return [seconds / 60 for finished, seconds in _recent_services if finished >= horizon]
+
+
+def seed_recent_services() -> None:
+    """At startup: the services finished in the past two hours, from the
+    database, so a restart does not drop the average back to the long-run one."""
+    global _recent_services_seeded
+    if _recent_services_seeded:
+        return
+    _recent_services_seeded = True
+    try:
+        rows = fetch_recent_service_seconds(int(queue_engine.RECENT_WINDOW_MIN),
+                                            queue_engine.RECENT_SERVICES)
+        with _recent_services_lock:
+            already = len(_recent_services)
+        if already:
+            return
+        for finished_ago, seconds in rows:
+            record_service_time(seconds, finished_ago)
+        print(f"[QueueService] {len(rows)} recent service time(s) read for the live average")
+    except Exception as exc:
+        print(f"[QueueService] could not read recent service times: {exc}")
 
 def wire_callbacks() -> None:
     queue_tracker.on_number_linked = _on_number_linked
@@ -149,15 +189,6 @@ def wire_callbacks() -> None:
     queue_tracker._num_counters = max(1, int(QUEUE_CONFIG.get('num_counters', 3)))
     queue_tracker.counters_closed_until = _counters_closed_until
 
-    # Store the .env default so build_queue_prediction can label the source.
-    QUEUE_CONFIG.setdefault("_default_avg_service_time",
-                            QUEUE_CONFIG.get("avg_service_time", 3.0))
-
-    threading.Thread(
-        target=_service_time_refresh_loop,
-        daemon=True,
-        name="ServiceTimeRefresh",
-    ).start()
 
 def _bbox_iou(a: tuple, b: tuple) -> float:
     ix1 = max(a[0], b[0])
@@ -659,6 +690,8 @@ def mark_done(queue_number: int, actor_username: str | None = None) -> dict | No
     if not queue_tracker.mark_transaction_done(queue_number):
         return None
 
+    # Timed from the call to Done; the next estimate counts it.
+    record_service_time(called_seconds_ago)
     invalidate_ticket_cache(queue_number)
     threading.Thread(
         target=_update_status_then_invalidate,
@@ -841,12 +874,30 @@ def format_seconds(seconds: int) -> str:
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes}m" if minutes else f"{hours}h"
 
-def eta_iso(wait_minutes: float) -> str:
-    return (datetime.now() + timedelta(minutes=max(0.0, wait_minutes))).isoformat()
+def format_wait_seconds(seconds: float) -> str:
+    """A wait in minutes and seconds: '3 min 05 sec', '45 sec', 'now'."""
+    seconds = max(0, int(round(seconds)))
+    if seconds == 0:
+        return "now"
+    if seconds < 60:
+        return f"{seconds} sec"
+    minutes, rest = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {rest:02d} sec"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} hr {minutes} min"
+
+def clock_label(moment: datetime) -> str:
+    """'2:41:30 PM' on the school's clock."""
+    return clock(moment, "%I:%M:%S %p").lstrip("0")
+
+# Logged with each ticket (wait_model_version), so estimates made before and
+# after the real-time engine can be told apart when checked against real waits.
+ENGINE_VERSION = "queue-engine-v2"
 
 def estimator_version() -> str:
     """Logged with each ticket, so its estimate can be traced to its method."""
-    return "queue-engine" if USE_QUEUE_ENGINE else wait_model.MODEL_VERSION
+    return ENGINE_VERSION if USE_QUEUE_ENGINE else wait_model.MODEL_VERSION
 
 def counters_closed_until() -> datetime | None:
     until = queue_tracker.counters_closed_until
@@ -911,28 +962,91 @@ def serving_windows(counters: int, line: list[dict] | None = None) -> list[int]:
     return sorted(held | busy) or [1]
 
 
-def _queue_engine_wait(position: int, counters: int, service_min: float) -> float:
+@dataclass(frozen=True)
+class LineState:
+    """What one round of estimates is worked out from, read once per request
+    so every person in the same response is timed against the same moment."""
+    now: datetime
+    line: list
+    model: queue_engine.ServiceModel
+    counters: list
+
+
+def line_state(counters: int) -> LineState:
+    """The line now: who is at which serving window and since when, and the
+    current average service time (queue_engine.service_model)."""
     now = datetime.now()
     line = queue_tracker.line_snapshot()
-    ahead = _waiting_ahead(line, position)
-    if ahead is None:
-        return 0.0
     called = {q["counter_number"]: q["called_at"] for q in line if q["counter_number"] is not None}
+    at_window = [(now - at).total_seconds() / 60 for at in called.values() if at is not None]
+    model = queue_engine.service_model(
+        recent_service_minutes(), at_window, prior_min=runtime_config()["avg_service_time"],
+    )
     closed = counters_closed_until()
     states = [
         queue_engine.CounterState(busy_since=called.get(n), closed_until=closed)
         for n in serving_windows(counters, line)
     ]
-    return queue_engine.wait_minutes(now, states, ahead, service_min)
+    return LineState(now=now, line=line, model=model, counters=states)
 
-def estimate_wait_for_position(position: int, counters: int) -> float:
+
+def wait_minutes_for_position(position: int, counters: int, state: LineState | None = None) -> float:
+    """Minutes until the person at `position` reaches a window, unrounded."""
     # Position 0 means not in the live line, e.g. a ticket already served.
     if position <= 0:
         return 0.0
-    if USE_QUEUE_ENGINE:
-        service_min = runtime_config()["avg_service_time"]
-        return round(_queue_engine_wait(position, counters, service_min), 1)
-    return round(wait_model.predict_minutes(position - 1, len(serving_windows(counters))), 1)
+    if not USE_QUEUE_ENGINE:
+        return wait_model.predict_minutes(position - 1, len(serving_windows(counters)))
+    state = state or line_state(counters)
+    ahead = _waiting_ahead(state.line, position)
+    if ahead is None:
+        return 0.0
+    return queue_engine.wait_minutes(state.now, state.counters, ahead, state.model)
+
+
+def estimate_wait_for_position(position: int, counters: int) -> float:
+    return round(wait_minutes_for_position(position, counters), 1)
+
+
+def windows_running_long(state: LineState) -> list[dict]:
+    """Windows whose transaction has run longer than the current average."""
+    average = state.model.mean_min * 60
+    out = []
+    for q in state.line:
+        if q["counter_number"] is None or q["called_at"] is None:
+            continue
+        elapsed = (state.now - q["called_at"]).total_seconds()
+        if elapsed > average:
+            out.append({"counter_number": q["counter_number"], "queue_number": q["queue_number"],
+                        "serving_seconds": int(elapsed)})
+    return sorted(out, key=lambda w: w["counter_number"])
+
+
+def adjustment_note(state: LineState) -> str:
+    """Why a waiting student's time is moving later, when it is."""
+    slow = windows_running_long(state)
+    if not slow:
+        return ""
+    w = slow[0]
+    return (
+        f"Window {w['counter_number']} has been serving Q{w['queue_number']:03d} for "
+        f"{format_wait_seconds(w['serving_seconds'])}, longer than the average of "
+        f"{format_wait_seconds(state.model.mean_min * 60)}, so your time moved later."
+    )
+
+
+def average_service_fields(model: queue_engine.ServiceModel) -> dict:
+    """The current average service time, for students and staff to see."""
+    seconds = int(round(model.mean_min * 60))
+    if model.timed:
+        basis = f"last {model.timed} service{'' if model.timed == 1 else 's'}"
+    else:
+        basis = "usual pace"
+    return {
+        "avg_service_seconds": seconds,
+        "avg_service_label": format_wait_seconds(seconds),
+        "avg_service_basis": basis,
+    }
 
 def wait_range_fields(wait_min: float, in_line: bool = True) -> dict:
     """The usual range around an estimate, for the app to show beside it.
@@ -950,20 +1064,34 @@ def wait_range_fields(wait_min: float, in_line: bool = True) -> dict:
 
 def prediction_for_position(
     position: int,
-    avg_service_time: float,
     counters: int,
+    state: LineState | None = None,
 ) -> dict:
-    wait_min = estimate_wait_for_position(position, counters)
-    service_min = round(max(0.1, avg_service_time), 1)
+    """One person's wait in seconds, the clock time their turn is expected
+    (estimated time of service), and the average service time behind it.
+    Worked out again on every request, so it moves with the line: the app
+    counts the seconds down between requests and takes the new figure each
+    time it asks."""
+    state = state or line_state(counters)
+    minutes = wait_minutes_for_position(position, counters, state)
+    seconds = int(round(minutes * 60))
+    start = state.now + timedelta(seconds=seconds)
+    service_min = state.model.mean_min
+    waiting = position > 0 and seconds > 0
     return {
         "position": position,
-        "estimated_wait_time": wait_min,
-        "estimated_wait_time_minutes": wait_min,
-        "estimated_wait_time_label": format_minutes(wait_min),
-        **wait_range_fields(wait_min, in_line=position > 0),
-        "estimated_service_start_at": eta_iso(wait_min),
-        "estimated_service_finish_at": eta_iso(wait_min + service_min),
-        "estimated_service_time_min": service_min,
+        "estimated_wait_time": round(minutes, 1),
+        "estimated_wait_time_minutes": round(minutes, 1),
+        "estimated_wait_seconds": seconds,
+        "estimated_wait_time_label": format_wait_seconds(seconds),
+        **wait_range_fields(minutes, in_line=position > 0),
+        "estimated_service_start_at": school_iso(start),
+        "estimated_service_start_label": clock_label(start),
+        "estimated_service_finish_at": school_iso(start + timedelta(minutes=service_min)),
+        "estimated_service_time_min": round(service_min, 2),
+        **average_service_fields(state.model),
+        "computed_at": school_iso(state.now),
+        "adjustment_note": adjustment_note(state) if waiting else "",
     }
 
 def _as_datetime(value) -> datetime | None:
@@ -1012,11 +1140,7 @@ def ticket_record_status_response(record: dict) -> dict:
         "completed_at_iso": ended_at.isoformat(),
 
         "message": messages.get(status, "This queue ticket is no longer active."),
-        "prediction": prediction_for_position(
-            0,
-            config["avg_service_time"],
-            config["active_counters"],
-        ),
+        "prediction": prediction_for_position(0, config["active_counters"]),
     }
 
 def ticket_record_waiting_response(record: dict) -> dict:
@@ -1041,11 +1165,7 @@ def ticket_record_waiting_response(record: dict) -> dict:
             "in the live queue. Please return to the queue zone and ask staff "
             "if your number is not shown."
         ),
-        "prediction": prediction_for_position(
-            0,
-            config["avg_service_time"],
-            config["active_counters"],
-        ),
+        "prediction": prediction_for_position(0, config["active_counters"]),
     }
 
 def _active_ticket_numbers() -> set[int]:
@@ -1181,20 +1301,23 @@ def build_queue_prediction() -> dict:
     queue_count = len(active_queue)
     config = runtime_config()
     counters = config["active_counters"]
-    avg_service_time = config["avg_service_time"]
+    # One reading of the line for everyone in this response.
+    line = line_state(counters)
+    model = line.model
     data_age_seconds = max(0.0, time.time() - as_float(metrics["timestamp"], time.time()))
+    new_arrival = prediction_for_position(queue_count + 1, counters, line)
     if USE_QUEUE_ENGINE:
-        new_arrival_wait = estimate_wait_for_position(queue_count + 1, counters)
+        new_arrival_wait = new_arrival["estimated_wait_time_minutes"]
         # The line ahead of a later arrival, projected with the camera's rate
         # of growth in people per minute (never negative). Not validated.
         growth = max(0.0, as_float(metrics["arrival_rate"], 0.0))
         horizon_waits = {
-            h: min(120.0, estimate_wait_for_position(queue_count + 1 + round(growth * h), counters))
+            h: min(120.0, round(wait_minutes_for_position(queue_count + 1 + round(growth * h), counters, line), 1))
             for h in (5, 15, 30)
         }
     else:
         current_wait = as_float(metrics["estimated_wait_time"], 0.0)
-        fallback_new_wait = estimate_wait_for_position(queue_count + 1, counters)
+        fallback_new_wait = new_arrival["estimated_wait_time_minutes"]
         new_arrival_wait = round(
             current_wait if current_wait > 0 else fallback_new_wait,
             1,
@@ -1211,24 +1334,29 @@ def build_queue_prediction() -> dict:
             "queue_number": person.get("queue_number"),
             "queue_label": person.get("queue_label"),
             "status": person.get("status"),
-            **prediction_for_position(position, avg_service_time, counters),
+            **prediction_for_position(position, counters, line),
         })
 
-    _default_svc_time = float(QUEUE_CONFIG.get("_default_avg_service_time",
-                                               QUEUE_CONFIG.get("avg_service_time", 3.0)))
-    service_time_source = (
-        "measured" if abs(avg_service_time - _default_svc_time) > 0.05 else "default"
-    )
+    # Who is at each window and for how long, for the app's "Now serving"
+    # card. The same numbers the public display board shows; no ticket codes.
+    def serving_entry(person: dict) -> dict:
+        seconds = person.get("seconds_at_counter")
+        entry = {
+            "counter_number": as_int(person.get("counter_number"), 0),
+            "queue_number": person.get("queue_number"),
+            "queue_label": person.get("queue_label"),
+            "serving_seconds": seconds,
+            "expected_remaining_seconds": None,
+            "running_long": False,
+        }
+        if seconds is not None:
+            entry["expected_remaining_seconds"] = int(round(model.remaining(seconds / 60) * 60))
+            entry["running_long"] = seconds > model.mean_min * 60
+        return entry
 
-    # Who is at each window, for the app's "Now serving" card. The same
-    # numbers the public display board shows; no ticket codes.
     now_serving = sorted(
         (
-            {
-                "counter_number": as_int(person.get("counter_number"), 0),
-                "queue_number": person.get("queue_number"),
-                "queue_label": person.get("queue_label"),
-            }
+            serving_entry(person)
             for person in active_queue
             if person.get("counter_number") is not None and person.get("queue_number") is not None
         ),
@@ -1239,8 +1367,10 @@ def build_queue_prediction() -> dict:
         "queue_length": queue_count,
         "active_counters": counters,
         "now_serving": now_serving,
-        "avg_service_time_min": round(avg_service_time, 2),
-        "service_time_source": service_time_source,
+        "avg_service_time_min": round(model.mean_min, 2),
+        **average_service_fields(model),
+        "service_time_source": "live" if model.timed else "usual pace",
+        "computed_at": school_iso(line.now),
         "arrival_rate_per_min": as_float(metrics["arrival_rate"], 0.0),
         "system_utilization": as_float(metrics["system_utilization"], 0.0),
         "data_age_seconds": round(data_age_seconds, 1),
@@ -1248,12 +1378,9 @@ def build_queue_prediction() -> dict:
         "wait_estimator": estimator_version(),
         "counters_closed_until": school_iso(closed_until),
         "new_arrival": {
-            "position": queue_count + 1,
+            **new_arrival,
             "estimated_wait_time": new_arrival_wait,
             "estimated_wait_time_minutes": new_arrival_wait,
-            "estimated_wait_time_label": format_minutes(new_arrival_wait),
-            "estimated_service_start_at": eta_iso(new_arrival_wait),
-            **wait_range_fields(new_arrival_wait),
         },
         "forecast": {
             "now": {

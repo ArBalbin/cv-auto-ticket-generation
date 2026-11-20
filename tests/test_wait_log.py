@@ -215,7 +215,7 @@ def test_too_few_days_writes_nothing(tmp_path, monkeypatch):
 
 def test_the_app_is_told_the_usual_range(monkeypatch):
     monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", False)
-    shown = queue_service.prediction_for_position(11, 2.0, 3)
+    shown = queue_service.prediction_for_position(11, 3)
     low, high = shown["estimated_wait_range_minutes"]
     assert low <= shown["estimated_wait_time_minutes"] <= high
     assert shown["estimated_wait_range_label"] == f"usually {low}–{high} mins"
@@ -223,11 +223,11 @@ def test_the_app_is_told_the_usual_range(monkeypatch):
 
 def test_the_queue_engine_shows_no_unmeasured_range(monkeypatch):
     monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", True)
-    assert queue_service.prediction_for_position(11, 2.0, 3)["estimated_wait_range_label"] == ""
+    assert queue_service.prediction_for_position(11, 3)["estimated_wait_range_label"] == ""
 
 
 def test_no_range_for_a_ticket_out_of_the_line():
-    shown = queue_service.prediction_for_position(0, 2.0, 3)
+    shown = queue_service.prediction_for_position(0, 3)
     assert shown["estimated_wait_range_label"] == ""
 
 

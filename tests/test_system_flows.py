@@ -748,7 +748,7 @@ def test_the_dashboard_forecast_comes_from_the_engine(system, monkeypatch):
     monkeypatch.setitem(queue_service.state.latest_state, "arrival_rate", 1.0)   # one more person a minute
 
     forecast = queue_service.build_queue_prediction()
-    assert forecast["wait_estimator"] == "queue-engine"
+    assert forecast["wait_estimator"] == "queue-engine-v2"
     now = forecast["forecast"]["now"]["estimated_wait_time_minutes"]
     later = [forecast["forecast"][f"in_{h}min"]["estimated_wait_time_minutes"] for h in (5, 15, 30)]
     assert now == forecast["new_arrival"]["estimated_wait_time_minutes"]
@@ -762,7 +762,8 @@ def test_the_app_is_told_who_is_at_each_window(system):
     serving = queue_service.build_queue_prediction()["now_serving"]
     assert [(s["counter_number"], s["queue_number"]) for s in serving] == [
         (1, 6300), (2, 6301), (3, 6302)], "three windows, the first three in line"
-    assert all(set(s) == {"counter_number", "queue_number", "queue_label"} for s in serving)
+    assert all(set(s) == {"counter_number", "queue_number", "queue_label", "serving_seconds",
+                          "expected_remaining_seconds", "running_long"} for s in serving)
 
     queue_service.mark_done(6301)
     serving = queue_service.build_queue_prediction()["now_serving"]
@@ -791,6 +792,9 @@ def test_staff_and_app_see_who_is_at_each_window_and_for_how_long(system, monkey
                         lambda t, q, pool: {"queue_number": q, "status": "waiting"})
     status = queue_router.queue_status(6401, token)
     assert status["counter_number"] == 2 and status["status"] == "waiting"
+    # The app counts down the time to reach the window from the call.
+    assert status["arrive_within_seconds"] == queue_router.ARRIVE_WITHIN_SECONDS
+    assert 89 <= status["seconds_at_counter"] <= 95
 
 
 # ------------------------------------------------- wait log (WAIT_TIME_MODEL.md)

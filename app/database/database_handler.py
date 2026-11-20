@@ -757,66 +757,44 @@ def record_counter_config_change(
         close_db_resources(cursor, conn)
 
 
-def measure_avg_service_time(num_counters: int, window_minutes: int = 120,
-                              min_samples: int = 5) -> float | None:
-    """Estimate avg service time (minutes/person/counter) from recent served records.
-
-    Uses consecutive inter-departure gaps from served_at timestamps.
-    With c parallel counters all busy: inter_departure ≈ avg_service_time / c,
-    so avg_service_time = mean(gap) * c.
-
-    Gaps > 15 min are excluded (idle counter, not a service completion).
-    Returns None when there are fewer than min_samples valid gaps.
-    """
+def fetch_recent_service_seconds(window_minutes: int = 120, limit: int = 10) -> list[tuple[int, int]]:
+    """How long the last `limit` services finished in the past `window_minutes`
+    took, oldest first, as (seconds since it finished, service seconds). Read
+    only; seeds the live average service time after a restart. Both ages come
+    from the database's own clock, so this process's clock does not matter."""
     pool = _ensure_db_pool()
     if pool is None:
-        return None
+        return []
 
     conn = cursor = None
     try:
         conn = pool.get_connection()
         cursor = conn.cursor(dictionary=True)
-        if not _table_exists(cursor, "queue_records"):
-            return None
-
+        if not {"called_at", "served_at", "status"} <= _get_table_columns(cursor, "queue_records"):
+            return []
         cursor.execute(
             """
-            SELECT served_at
+            SELECT TIMESTAMPDIFF(SECOND, served_at, NOW()) AS finished_ago,
+                   TIMESTAMPDIFF(SECOND, called_at, served_at) AS service_seconds
             FROM queue_records
             WHERE status = 'served'
-              AND served_at IS NOT NULL
-              AND served_at >= DATE_SUB(NOW(), INTERVAL %s MINUTE)
-            ORDER BY served_at ASC
+              AND called_at IS NOT NULL
+              AND served_at >= called_at
+              AND served_at >= NOW() - INTERVAL %s MINUTE
+            ORDER BY served_at DESC
+            LIMIT %s
             """,
-            (window_minutes,),
+            (int(window_minutes), int(limit)),
         )
         rows = cursor.fetchall() or []
-        timestamps = [
-            row["served_at"].timestamp() if hasattr(row["served_at"], "timestamp")
-            else float(row["served_at"])
-            for row in rows
-            if row.get("served_at") is not None
+        return [
+            (max(0, int(r["finished_ago"])), int(r["service_seconds"]))
+            for r in reversed(rows)
+            if r.get("finished_ago") is not None and r.get("service_seconds") is not None
         ]
-
-        if len(timestamps) < min_samples + 1:
-            return None
-
-        gaps = []
-        for i in range(1, len(timestamps)):
-            delta_min = (timestamps[i] - timestamps[i - 1]) / 60.0
-            if 0.1 <= delta_min <= 15.0:
-                gaps.append(delta_min)
-
-        if len(gaps) < min_samples:
-            return None
-
-        measured = (sum(gaps) / len(gaps)) * max(1, num_counters)
-        measured = max(0.5, min(measured, 30.0))
-        return round(measured, 2)
-
     except Exception as exc:
-        print(f"[DB] measure_avg_service_time error: {exc}")
-        return None
+        print(f"[DB] fetch_recent_service_seconds error: {exc}")
+        return []
     finally:
         close_db_resources(cursor, conn)
 

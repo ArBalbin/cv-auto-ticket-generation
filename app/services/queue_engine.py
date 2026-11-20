@@ -1,29 +1,139 @@
 """
-When will each person in line reach a counter? (Estimated time of service.)
+When will each person in line reach a window? (Estimated time of service.)
 
-The line is simulated rather than fitted. Each counter is free now, free when
-the transaction at it is expected to end, or closed until a set time (lunch).
-People still waiting are taken in queue order, each by whichever counter frees
-up first, and that counter is then busy for one service time. The moment a
-person is taken is when their turn starts.
+Worked out again on every request (the app asks every few seconds) from what
+the system knows at that moment: who is at which window and for how long, the
+order of the line, which windows are open, and how long the transactions
+finished recently took. Nothing is added or taken away in fixed steps; every
+estimate moves with the line.
 
-This uses what the system knows exactly at the moment: who is at which counter
-and since when, the order of the line, how many counters are open, and whether
-they are closed. The trained regression (wait_model.py) only knows a count of
-people ahead, and was fitted on an overcounted reconstruction of it, which is
-why it under-estimates long lines (WAIT_TIME_MODEL.md).
+Two things are learned from data.
+
+The SHAPE of a transaction's length. How long a transaction that has already
+run e minutes still has to go is its mean residual life, E[S - e | S > e].
+It comes from the 511 transactions timed at the NCF cashier in October 2026,
+logged in whole minutes: 191 took 1, 238 took 2, 56 took 3, 12 took 4, 11 took
+5, 2 took 6 and 1 took 8. A lognormal fitted to those by maximum likelihood
+(each logged minute v standing for v - 0.5 to v + 0.5) has a mean of 1.87
+minutes and a log-spread of 0.425. The lognormal is the usual finding for
+service times (Brown et al., 2005). Its mean residual life falls while a
+transaction runs normally and rises again once one runs long, as the log does:
+on average one that had taken 1 minute had 0.99 left (log: 1.13), one at 2
+minutes 0.74 (log: 0.78), and one at 3 to 4 minutes about 0.75 (log: about 1).
+
+The SPEED of the cashier right now: the average length of the last 20
+services finished in the past two hours, pulled toward the long-run average when only a
+few have been timed. A student still at a window counts too, at the time
+taken so far, once that is longer than the average. That window is
+evidently slower than usual, so everyone behind it is told so at once.
+
+A window's remaining time is then average x shape: avg * m(elapsed / avg),
+where m is the fitted mean residual life in units of its own mean.
+
+The line is then played forward. Each window is free now, free when its
+transaction is expected to end, or closed until a set time (lunch). People
+still waiting are taken in queue order, each by whichever window frees up
+first, and that window is then busy for one average service. The moment a
+person is taken is their estimated time of service.
 
 Pure functions, no I/O: the caller passes the line's state.
 """
 import heapq
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-# A transaction that has already run past its usual length is not about to
-# end: in the October log, one that had taken 1, 2 or 3 minutes so far went on
-# for another 1.40, 1.55 and 1.73 minutes on average (median service 2.0). So
-# the expected remainder never drops below three quarters of a service time.
-MIN_REMAINING_FRACTION = 0.75
+# The October 2026 cashier log, as fitted above.
+HISTORY_MEAN_MIN = 1.87
+SHAPE_SIGMA = 0.425
+
+# The services that set the current average: the last twenty that finished in
+# the past two hours, with the long-run average counted as ten more. Chosen on
+# replayed lines (normal, 40 % slower, 25 % faster, and turning slower
+# mid-day): ten services with a weight of three swung too much on normal days,
+# thirty with twenty followed a slower or faster day too slowly.
+PRIOR_WEIGHT = 10
+RECENT_SERVICES = 20
+RECENT_WINDOW_MIN = 120.0
+
+# A transaction is never assumed to run past this many average lengths.
+_MAX_FRACTION = 60.0
+
+
+def _phi(z: float) -> float:
+    """Standard normal distribution function, accurate far into the tails."""
+    return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+
+def remaining_fraction(x: float) -> float:
+    """
+    Mean remaining length of a transaction that has run `x` average lengths
+    so far, in average lengths: E[X - x | X > x] for a lognormal X with mean 1.
+    """
+    if x <= 0:
+        return 1.0
+    x = min(x, _MAX_FRACTION)
+    s = SHAPE_SIGMA
+    log_x = math.log(x)
+    # With X = exp(N(-s^2/2, s^2)):  P(X > x) = phi((-s^2/2 - ln x) / s)
+    # and E[X; X > x] = phi((s^2/2 - ln x) / s).
+    survive = _phi((-s * s / 2 - log_x) / s)
+    beyond = _phi((s * s / 2 - log_x) / s)
+    return max(0.0, beyond / survive - x)
+
+
+@dataclass(frozen=True)
+class ServiceModel:
+    mean_min: float = HISTORY_MEAN_MIN   # the current average service time
+    timed: int = 0                       # recent services behind that average
+
+    def remaining(self, elapsed_min: float) -> float:
+        """Expected minutes left in a transaction that has run `elapsed_min`."""
+        mean = max(0.1, self.mean_min)
+        return mean * remaining_fraction(max(0.0, elapsed_min) / mean)
+
+
+def current_average(
+    finished_min: list[float],
+    at_window_min: list[float] = (),
+    prior_min: float = HISTORY_MEAN_MIN,
+    prior_weight: float = PRIOR_WEIGHT,
+) -> float:
+    """
+    The average service time now: the services just finished, plus the
+    long-run average counted as `prior_weight` services, plus any transaction
+    still at a window that has already run longer than that average, counted at
+    its length so far (it will be at least that long).
+    """
+    total = prior_weight * prior_min + sum(finished_min)
+    count = prior_weight + len(finished_min)
+    average = total / count
+    long_running = [e for e in at_window_min if e > average]
+    return (total + sum(long_running)) / (count + len(long_running))
+
+
+def service_model(
+    finished_min: list[float],
+    at_window_min: list[float] = (),
+    prior_min: float = HISTORY_MEAN_MIN,
+) -> ServiceModel:
+    recent = list(finished_min)[-RECENT_SERVICES:]
+    return ServiceModel(
+        mean_min=current_average(recent, list(at_window_min), prior_min),
+        timed=len(recent),
+    )
+
+
+def _as_model(service) -> ServiceModel:
+    """A bare number of minutes is a model with that average."""
+    if isinstance(service, ServiceModel):
+        return service
+    return ServiceModel(mean_min=max(0.1, float(service)))
+
+
+def expected_remaining(elapsed_min: float, service) -> float:
+    """Minutes left in a transaction that has run `elapsed_min` so far."""
+    return _as_model(service).remaining(elapsed_min)
 
 
 @dataclass(frozen=True)
@@ -32,17 +142,13 @@ class CounterState:
     closed_until: datetime | None = None  # no one is called before this time
 
 
-def expected_remaining(elapsed_min: float, service_min: float) -> float:
-    """Minutes left in a transaction that has run `elapsed_min` so far."""
-    return max(service_min - max(0.0, elapsed_min), MIN_REMAINING_FRACTION * service_min)
-
-
-def free_at(counter: CounterState, now: datetime, service_min: float) -> datetime:
+def free_at(counter: CounterState, now: datetime, service) -> datetime:
     """When this counter can take the next person."""
+    model = _as_model(service)
     free = now
     if counter.busy_since is not None:
         elapsed = (now - counter.busy_since).total_seconds() / 60
-        free = now + timedelta(minutes=expected_remaining(elapsed, service_min))
+        free = now + timedelta(minutes=model.remaining(elapsed))
     if counter.closed_until is not None and counter.closed_until > free:
         free = counter.closed_until
     return free
@@ -52,7 +158,7 @@ def start_times(
     now: datetime,
     counters: list[CounterState],
     waiting: int,
-    service_min: float,
+    service,
 ) -> list[datetime]:
     """
     When each of the next `waiting` people in line reaches a counter, in queue
@@ -60,14 +166,15 @@ def start_times(
     """
     if not counters or waiting <= 0:
         return []
-    service = timedelta(minutes=max(0.1, service_min))
-    free = [free_at(c, now, service_min) for c in counters]
+    model = _as_model(service)
+    length = timedelta(minutes=max(0.1, model.mean_min))
+    free = [free_at(c, now, model) for c in counters]
     heapq.heapify(free)
     starts = []
     for _ in range(waiting):
         start = heapq.heappop(free)
         starts.append(start)
-        heapq.heappush(free, start + service)
+        heapq.heappush(free, start + length)
     return starts
 
 
@@ -75,11 +182,11 @@ def wait_minutes(
     now: datetime,
     counters: list[CounterState],
     waiting_ahead: int,
-    service_min: float,
+    service,
 ) -> float:
     """Minutes until someone with `waiting_ahead` people still waiting in front
     of them (not counting those already at a counter) reaches a counter."""
-    starts = start_times(now, counters, waiting_ahead + 1, service_min)
+    starts = start_times(now, counters, waiting_ahead + 1, service)
     if not starts:
         return 0.0
     return max(0.0, (starts[-1] - now).total_seconds() / 60)

@@ -35,7 +35,7 @@ from core.config import (
 )
 from database.database_handler import ensure_privacy_columns, ensure_wait_log_columns, warm_up_db_pool
 from routers import auth, crowd, detector_api, health, queue, retention, students
-from services import retention_service
+from services import queue_service, retention_service
 
 
 @asynccontextmanager
@@ -46,6 +46,9 @@ async def lifespan(app: FastAPI):
     # database never delays startup past the platform's health check.
     threading.Thread(target=ensure_privacy_columns, name="privacy-migration", daemon=True).start()
     threading.Thread(target=ensure_wait_log_columns, name="wait-log-migration", daemon=True).start()
+    # The services finished in the past two hours, for the live average
+    # service time the wait estimate uses (a restart empties it).
+    threading.Thread(target=queue_service.seed_recent_services, name="service-time-seed", daemon=True).start()
     retention_service.start_scheduler()
     yield
 

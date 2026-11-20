@@ -153,12 +153,18 @@ QUEUE_REMAP_DIST_THRESH = env_float("QUEUE_REMAP_DIST_THRESH", 180)
 QUEUE_REMAP_ABSENT_FRAMES = env_int("QUEUE_REMAP_ABSENT_FRAMES", 45)
 
 QUEUE_CONFIG = {
-    # Seed for the service time until Algorithm 7 has measured one. 2.0 is the
-    # median transaction in both the September and October cashier logs; the
-    # earlier 3.0 was a guess.
-    "avg_service_time": env_float("AVG_SERVICE_TIME", 2.0),
+    # The usual pace: the long-run average service time, in minutes, that the
+    # live average starts from and is pulled toward when few services have
+    # been timed (queue_engine.current_average). 1.87 is the mean of the 511
+    # transactions in the October 2026 cashier log; 2.0 was its median.
+    "avg_service_time": env_float("AVG_SERVICE_TIME", 1.87),
     "num_counters": env_int("NUM_COUNTERS", 3),
 }
+
+# How long a called student has to reach their window, shown in the app as a
+# countdown from the call. It only tells the student; skipping a number that
+# does not come is still staff's decision (queue_tracker.mark_no_show).
+ARRIVE_WITHIN_SECONDS = env_int("ARRIVE_WITHIN_SECONDS", 60)
 
 # How a wait is estimated. "queue" simulates the live line counter by counter
 # (services/queue_engine.py); "regression" uses the line fitted on October's

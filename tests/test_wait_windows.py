@@ -10,6 +10,7 @@ With staff calling, a window now counts only while a staff member holds it
 Run:  .venv/Scripts/python.exe -m pytest tests -v
 """
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -93,3 +94,82 @@ def test_each_ticket_records_the_windows_its_estimate_counted(office, monkeypatc
     queue_service._on_number_linked(5001, "0m", "now", "tok", student_id=7, linked_via="face_only")
     assert jobs[0]["active_counters"] == 1
     assert jobs[0]["est_wait_min"] == pytest.approx(SERVICE, abs=0.1)
+
+
+# ---------------------------------------------- real time (the 20 Nov panel's case)
+
+@pytest.fixture
+def untimed(monkeypatch):
+    """No services timed yet in this test."""
+    monkeypatch.setattr(queue_service, "_recent_services", queue_service.deque(maxlen=50))
+
+
+def shown(t, number):
+    return queue_service.prediction_for_position(t.get_position(number), 3)
+
+
+def test_the_panels_case_estimates_move_while_window_1_runs_long(office, untimed):
+    """Q5000 is called to Window 1 and staff take long to mark it done. The
+    estimates of Q5001 and Q5002 must change with it, not stay at 2 and 4."""
+    for n in (5000, 5001, 5002):
+        office.force_new_person(n)
+    queue_service.call_next(1, "alice")
+    at_window = office._person_by_queue_number(5000)
+
+    seen = {}
+    for minutes in (0, 1, 3, 6, 12):
+        at_window.called_at = datetime.now() - timedelta(minutes=minutes)
+        seen[minutes] = (shown(office, 5001), shown(office, 5002))
+
+    q2 = [seen[m][0]["estimated_wait_seconds"] for m in (0, 1, 3, 6, 12)]
+    q3 = [seen[m][1]["estimated_wait_seconds"] for m in (0, 1, 3, 6, 12)]
+    assert q2[1] < q2[0] and q3[1] < q3[0], "a usual transaction: the waits count down"
+    assert q2[2] < q2[3] < q2[4], "the longer Window 1 takes, the longer Q5001 waits"
+    assert q3[2] < q3[3] < q3[4], "and Q5002 behind it"
+
+    # Here the clock stands still and the call moves back, so Q5001's time of
+    # service is read from the call: minutes already spent plus the wait.
+    from_call = [m * 60 + w for m, w in zip((0, 1, 3, 6, 12), q2)]
+    assert from_call == sorted(from_call) and from_call[0] < from_call[-1], \
+        "Q5001's time of service moves later, never earlier"
+
+    late = seen[12][0]
+    assert late["adjustment_note"].startswith("Window 1 has been serving Q5000 for 12 min")
+    assert late["avg_service_seconds"] > seen[0][0]["avg_service_seconds"], \
+        "the long transaction raises the average everyone sees"
+    assert seen[0][0]["adjustment_note"] == "", "nothing to explain while Window 1 is on time"
+
+
+def test_the_student_sees_minutes_seconds_and_a_clock_time(office, untimed):
+    for n in (5000, 5001):
+        office.force_new_person(n)
+    queue_service.call_next(1, "alice")
+    p = shown(office, 5001)
+    assert p["estimated_wait_seconds"] == pytest.approx(SERVICE * 60, abs=2)
+    assert p["estimated_wait_time_label"] in ("1 min 59 sec", "2 min 00 sec")
+    assert p["estimated_service_start_label"].endswith(("AM", "PM"))
+    assert p["estimated_service_start_at"].endswith("+08:00"), "on the school's clock"
+    assert p["avg_service_label"] == "2 min 00 sec"
+    assert p["avg_service_basis"] == "usual pace"
+
+
+def test_each_service_marked_done_counts_in_the_average_at_once(office, untimed):
+    for n in (5000, 5001, 5002):
+        office.force_new_person(n)
+    queue_service.call_next(1, "alice")
+    office._person_by_queue_number(5000).called_at -= timedelta(minutes=5)
+    queue_service.mark_done(5000)
+    assert queue_service.recent_service_minutes() == [pytest.approx(5.0, abs=0.05)]
+
+    queue_service.call_next(1, "alice")
+    p = shown(office, 5002)
+    assert p["avg_service_basis"] == "last 1 service"
+    k = queue_service.queue_engine.PRIOR_WEIGHT
+    assert p["avg_service_seconds"] == pytest.approx((k * SERVICE + 5.0) / (k + 1) * 60, abs=2)
+
+
+def test_a_mis_click_is_not_timed(untimed):
+    assert not queue_service.record_service_time(2)
+    assert not queue_service.record_service_time(None)
+    assert not queue_service.record_service_time(45 * 60), "a Done forgotten for 45 minutes"
+    assert queue_service.recent_service_minutes() == []

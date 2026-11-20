@@ -74,14 +74,23 @@ def test_position_means_people_ahead_plus_one(monkeypatch):
 
 
 def test_a_ticket_out_of_the_line_has_no_wait():
-    prediction = queue_service.prediction_for_position(0, 2.0, 3)
+    prediction = queue_service.prediction_for_position(0, 3)
     assert prediction["estimated_wait_time_minutes"] == 0.0
-    assert prediction["estimated_wait_time_label"] == "less than 1 min"
+    assert prediction["estimated_wait_seconds"] == 0
+    assert prediction["estimated_wait_time_label"] == "now"
+    assert prediction["adjustment_note"] == ""
 
 
-def test_service_finish_still_uses_the_measured_service_time():
-    prediction = queue_service.prediction_for_position(1, 4.5, 3)
+def test_service_finish_is_one_current_average_after_the_start(monkeypatch):
+    monkeypatch.setattr(queue_service, "runtime_config", lambda: {"active_counters": 3, "avg_service_time": 4.5})
+    monkeypatch.setattr(queue_service, "_recent_services", queue_service.deque(maxlen=50))
+    prediction = queue_service.prediction_for_position(1, 3)
     assert prediction["estimated_service_time_min"] == 4.5
+    assert prediction["avg_service_seconds"] == 270
+    assert prediction["avg_service_basis"] == "usual pace"
+    start = datetime.fromisoformat(prediction["estimated_service_start_at"])
+    finish = datetime.fromisoformat(prediction["estimated_service_finish_at"])
+    assert (finish - start).total_seconds() == pytest.approx(270, abs=1)
 
 
 @pytest.fixture

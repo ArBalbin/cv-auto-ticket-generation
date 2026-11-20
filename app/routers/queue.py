@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 import state
 from database.database_handler import fetch_completed_transactions, get_db_pool
+from core.config import ARRIVE_WITHIN_SECONDS
 from core.security import require_staff
 from services import queue_service, wait_accuracy
 from services.ticket_printer import TicketLookupBusy, get_ticket_record_by_short_code
@@ -134,11 +135,11 @@ def queue_status(q: int, token: str):
 
     position = queue_service.as_int(result.get("position_in_line"), 0)
     config = queue_service.runtime_config()
-    result["prediction"] = queue_service.prediction_for_position(
-        position,
-        config["avg_service_time"],
-        config["active_counters"],
-    )
+    result["prediction"] = queue_service.prediction_for_position(position, config["active_counters"])
+    # Called to a window: the app counts this down from the call
+    # (seconds_at_counter) as the time to reach the window.
+    if result.get("counter_number") is not None:
+        result["arrive_within_seconds"] = ARRIVE_WITHIN_SECONDS
     result.pop("access_token", None)
     result.pop("jwt_token", None)
     return result
