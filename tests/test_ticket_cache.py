@@ -170,33 +170,6 @@ def test_a_busy_database_answers_with_the_last_known_ticket(monkeypatch):
     assert lookup(pool)["status"] == "waiting", "not reported as an invalid ticket"
 
 
-def test_waiting_list_refreshes_once_in_the_background(monkeypatch):
-    import threading
-    import time as _time
-    from services import queue_service as qs
-
-    calls = []
-    release = threading.Event()
-
-    def slow_fetch():
-        calls.append(1)
-        release.wait(2)
-        return [{"queue_number": len(calls)}]
-
-    monkeypatch.setattr(qs, "fetch_waiting_queue_records", slow_fetch)
-    monkeypatch.setattr(qs, "_waiting_records_cache", [{"queue_number": 0}])
-    monkeypatch.setattr(qs, "_waiting_records_read_at", _time.monotonic() - 60)   # expired
-    monkeypatch.setattr(qs, "_waiting_records_refreshing", False)
-
-    started = _time.perf_counter()
-    answers = [qs._waiting_queue_records() for _ in range(20)]
-    assert _time.perf_counter() - started < 0.5, "nobody waited for the database"
-    assert all(a == [{"queue_number": 0}] for a in answers), "callers got the last list"
-    release.set()
-    _time.sleep(0.2)
-    assert len(calls) == 1, "one background read, not twenty"
-
-
 def test_an_expired_ticket_answers_at_once_and_refreshes_in_the_background():
     import time as _time
 

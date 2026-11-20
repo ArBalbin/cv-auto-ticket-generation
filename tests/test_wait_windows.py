@@ -173,3 +173,34 @@ def test_a_mis_click_is_not_timed(untimed):
     assert not queue_service.record_service_time(None)
     assert not queue_service.record_service_time(45 * 60), "a Done forgotten for 45 minutes"
     assert queue_service.recent_service_minutes() == []
+
+
+def test_only_people_the_tracker_holds_are_in_line(office, untimed):
+    """20 Nov 2026: after a redeploy two tickets were still 'waiting' in the
+    database but nobody was in the queue area, and the app said "2 in line"
+    and put every estimate behind them. The line is now the tracker's."""
+    forecast = queue_service.build_queue_prediction()
+    assert forecast["queue_length"] == 0
+    assert forecast["new_arrival"]["estimated_wait_seconds"] == 0
+    assert forecast["new_arrival"]["people_ahead"] == 0
+
+
+def test_the_app_is_told_what_each_estimate_rests_on(office, untimed):
+    for n in (5000, 5001):
+        office.force_new_person(n)
+
+    # Nobody holds a window: one is assumed, and the line is not moving.
+    forecast = queue_service.build_queue_prediction()
+    arrival = forecast["new_arrival"]
+    assert arrival["people_ahead"] == 2
+    assert arrival["windows_counted"] == 1 and arrival["windows_calling"] == 0
+    assert forecast["windows_calling"] == 0 and forecast["line_moving"] is False
+    assert arrival["estimated_wait_seconds"] == pytest.approx(2 * SERVICE * 60, abs=2), \
+        "two ahead at one assumed window"
+
+    # Window 1 calls 5000: one window calling, and the line moves.
+    queue_service.call_next(1, "alice")
+    forecast = queue_service.build_queue_prediction()
+    assert forecast["windows_calling"] == 1 and forecast["line_moving"] is True
+    mine = shown(office, 5001)
+    assert mine["people_ahead"] == 0 and mine["line_moving"] is True

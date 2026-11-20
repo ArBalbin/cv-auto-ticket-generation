@@ -34,7 +34,6 @@ from core.config import (
 )
 from database.database_handler import (
     fetch_recent_service_seconds,
-    fetch_waiting_queue_records,
     get_all_active_embeddings,
     record_counter_config_change,
     record_face_match_event,
@@ -936,6 +935,23 @@ def _waiting_ahead(line: list[dict], position: int) -> int | None:
     # while the tracker is empty) count everyone before them as waiting.
     return sum(1 for q in known if q["counter_number"] is None) + max(0, position - 1 - len(known))
 
+def calling_windows(counters: int, line: list[dict] | None = None) -> list[int]:
+    """The windows taking people now: every open one in automatic calling;
+    in staff calling, those a staff member holds or where someone is being
+    served. Empty when no window is calling."""
+    configured = list(range(1, max(1, counters) + 1))
+    if queue_tracker.auto_call:
+        return configured
+    now = time.monotonic()
+    with _window_claims_lock:
+        _purge_expired_claims(now)
+        held = {c for c in _window_claims if c in configured}
+    if line is None:
+        line = queue_tracker.line_snapshot()
+    busy = {q["counter_number"] for q in line if q.get("counter_number") in configured}
+    return sorted(held | busy)
+
+
 def serving_windows(counters: int, line: list[dict] | None = None) -> list[int]:
     """The windows the wait estimate counts as serving.
 
@@ -949,17 +965,7 @@ def serving_windows(counters: int, line: list[dict] | None = None) -> list[int]:
     With staff calling and no window held, nobody is calling yet. One window
     is assumed, which overstates the wait rather than promising none.
     """
-    configured = list(range(1, max(1, counters) + 1))
-    if queue_tracker.auto_call:
-        return configured
-    now = time.monotonic()
-    with _window_claims_lock:
-        _purge_expired_claims(now)
-        held = {c for c in _window_claims if c in configured}
-    if line is None:
-        line = queue_tracker.line_snapshot()
-    busy = {q["counter_number"] for q in line if q.get("counter_number") in configured}
-    return sorted(held | busy) or [1]
+    return calling_windows(counters, line) or [1]
 
 
 @dataclass(frozen=True)
@@ -970,6 +976,13 @@ class LineState:
     line: list
     model: queue_engine.ServiceModel
     counters: list
+    windows_calling: int = 0   # windows actually calling (0: one is assumed)
+
+    @property
+    def moving(self) -> bool:
+        """Someone is at a window, so the line moves on its own. With nobody
+        at one it waits for a window to call, and no estimate counts down."""
+        return any(c.busy_since is not None for c in self.counters)
 
 
 def line_state(counters: int) -> LineState:
@@ -983,11 +996,12 @@ def line_state(counters: int) -> LineState:
         recent_service_minutes(), at_window, prior_min=runtime_config()["avg_service_time"],
     )
     closed = counters_closed_until()
+    calling = calling_windows(counters, line)
     states = [
         queue_engine.CounterState(busy_since=called.get(n), closed_until=closed)
-        for n in serving_windows(counters, line)
+        for n in (calling or [1])
     ]
-    return LineState(now=now, line=line, model=model, counters=states)
+    return LineState(now=now, line=line, model=model, counters=states, windows_calling=len(calling))
 
 
 def wait_minutes_for_position(position: int, counters: int, state: LineState | None = None) -> float:
@@ -1078,6 +1092,7 @@ def prediction_for_position(
     start = state.now + timedelta(seconds=seconds)
     service_min = state.model.mean_min
     waiting = position > 0 and seconds > 0
+    ahead = _waiting_ahead(state.line, position) if position > 0 else 0
     return {
         "position": position,
         "estimated_wait_time": round(minutes, 1),
@@ -1092,6 +1107,11 @@ def prediction_for_position(
         **average_service_fields(state.model),
         "computed_at": school_iso(state.now),
         "adjustment_note": adjustment_note(state) if waiting else "",
+        # What the estimate was worked out from, so the app can say so.
+        "people_ahead": ahead or 0,
+        "windows_counted": len(state.counters),
+        "windows_calling": state.windows_calling,
+        "line_moving": state.moving,
     }
 
 def _as_datetime(value) -> datetime | None:
@@ -1175,106 +1195,20 @@ def _active_ticket_numbers() -> set[int]:
         if p.status in ("waiting", "missing")
     }
 
-def _fallback_person_from_ticket(record: dict, position: int) -> dict:
-    queue_number = as_int(record.get("queue_number"), 0)
-    created_at = _as_datetime(record.get("created_at")) or datetime.now()
-    wait_seconds = max(0, int((datetime.now() - created_at).total_seconds()))
-    return {
-        "queue_number": queue_number,
-        "queue_label": f"Q{queue_number:03d}",
-        "status": "missing",
-        "position_in_line": position,
-        "position": position,
-        "wait_time": format_seconds(wait_seconds),
-        "wait_time_seconds": wait_seconds,
-        "joined_at": db_clock(created_at),
-        "joined_at_full": db_clock(created_at, CLOCK_FULL),
-        "joined_at_iso": created_at.isoformat(),
-        "on_the_way": False,
-        "on_the_way_at": None,
-        "on_the_way_at_display": None,
-        "source": "database_waiting_ticket",
-        "message": (
-            "Ticket is still waiting in the database, but the person is not "
-            "currently visible to the detector."
-        ),
-    }
-
-# Kiosk tickets that are waiting but that the camera has not linked to a
-# tracked person yet — the fallback behind the live tracker. Reading them
-# costs a round trip to the managed database, and /api/queue/prediction is
-# polled every five seconds by every phone as well as the staff dashboard, so
-# the uncached version spent about 2.7s of the deployed instance on every
-# request re-reading rows that change at human speed. Measured on the live
-# database: 242ms to take a pooled connection, 498ms for the select itself.
-#
-# A few seconds of staleness is invisible here. These records only move when
-# somebody takes a ticket at the kiosk or staff marks one served, and the
-# parts of the queue that do change continuously — positions, counts, who is
-# being served — come from the in-memory tracker above and are never cached.
-#
-# The window is longer than every poller's interval on purpose. The staff
-# dashboard asks every 3s and each phone every 5s, so a TTL shorter than
-# those would expire before the next caller arrived and cache nothing. At 10s
-# one read serves every client in that window, whatever their number.
-_WAITING_RECORDS_TTL_SECONDS = 10.0
-_waiting_records_cache: list[dict] = []
-_waiting_records_read_at = 0.0
-_waiting_records_refreshing = False
-_waiting_records_lock = threading.Lock()
-
-
-def _refresh_waiting_records() -> list[dict]:
-    global _waiting_records_cache, _waiting_records_read_at, _waiting_records_refreshing
-    try:
-        records = fetch_waiting_queue_records()
-        with _waiting_records_lock:
-            _waiting_records_cache = records
-            _waiting_records_read_at = time.monotonic()
-        return records
-    finally:
-        with _waiting_records_lock:
-            _waiting_records_refreshing = False
-
-
-def _waiting_queue_records() -> list[dict]:
-    """Stale-while-revalidate. Under load, every request that found the window
-    expired used to read the database at once, and each paid seconds for the
-    round trip. Now a single background read refreshes the list while callers
-    keep the last one; only the very first call, with nothing cached, waits."""
-    global _waiting_records_refreshing
-
-    with _waiting_records_lock:
-        age = time.monotonic() - _waiting_records_read_at
-        if _waiting_records_read_at and age < _WAITING_RECORDS_TTL_SECONDS:
-            return _waiting_records_cache
-        have_previous = bool(_waiting_records_read_at)
-        start_refresh = not _waiting_records_refreshing
-        if start_refresh:
-            _waiting_records_refreshing = True
-        previous = _waiting_records_cache
-
-    if have_previous:
-        if start_refresh:
-            threading.Thread(
-                target=_refresh_waiting_records, daemon=True, name="WaitingRecordsRefresh"
-            ).start()
-        return previous
-    if start_refresh:
-        return _refresh_waiting_records()
-    return previous
-
 def live_or_db_active_queue() -> list[dict]:
+    """The line as the tracker holds it: the same people staff see and call.
+
+    Tickets still 'waiting' in the database but unknown to the tracker used to
+    be added here, a fallback from when kiosk tickets were printed before the
+    camera linked them. A ticket row is now written only after the tracker has
+    the student, so a database-only ticket is one a restart or a queue reset
+    lost. Nobody can call it or mark it done, and counting it showed students
+    people who were not there ("2 in line" with the queue area empty, 20 Nov
+    2026) and pushed every estimate back behind them. The student holding one
+    is told their ticket is active but not in the live queue
+    (ticket_record_waiting_response)."""
     queue_state = queue_tracker.get_state()
     active = list(queue_state.get("active_queue", []))
-    seen_numbers = {as_int(person.get("queue_number"), 0) for person in active}
-
-    for record in _waiting_queue_records():
-        queue_number = as_int(record.get("queue_number"), 0)
-        if not queue_number or queue_number in seen_numbers:
-            continue
-        active.append(_fallback_person_from_ticket(record, len(active) + 1))
-        seen_numbers.add(queue_number)
 
     active.sort(key=lambda person: as_int(person.get("queue_number"), 0))
     for index, person in enumerate(active, start=1):
@@ -1371,6 +1305,8 @@ def build_queue_prediction() -> dict:
         **average_service_fields(model),
         "service_time_source": "live" if model.timed else "usual pace",
         "computed_at": school_iso(line.now),
+        "windows_calling": line.windows_calling,
+        "line_moving": line.moving,
         "arrival_rate_per_min": as_float(metrics["arrival_rate"], 0.0),
         "system_utilization": as_float(metrics["system_utilization"], 0.0),
         "data_age_seconds": round(data_age_seconds, 1),
