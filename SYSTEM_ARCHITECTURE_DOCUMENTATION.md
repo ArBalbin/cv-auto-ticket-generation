@@ -387,7 +387,7 @@ Algorithms:
 
 ```text
 arrival rate estimation
-median regression on people ahead (trained, see WAIT_TIME_MODEL.md)
+median regression on people ahead (trained, see WAIT_TIME_REGRESSION.md)
 linear trend projection
 Holt double exponential smoothing
 mean-reversion forecast

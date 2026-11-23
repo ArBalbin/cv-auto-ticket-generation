@@ -379,7 +379,7 @@ def _insert_queue_event(
 # What the system estimated when a number was issued, and when that person was
 # actually called to a counter. Together they let the wait-time model be
 # checked against real waits, and re-fitted on exact queue counts instead of
-# the reconstruction it was trained on (WAIT_TIME_MODEL.md).
+# the reconstruction it was trained on (WAIT_TIME_MODEL.md, WAIT_TIME_REGRESSION.md).
 _WAIT_LOG_ISSUE_COLUMNS = {
     "people_ahead_at_issue": "INT DEFAULT NULL",
     "active_counters_at_issue": "TINYINT DEFAULT NULL",

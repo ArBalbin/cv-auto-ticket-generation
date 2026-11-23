@@ -226,7 +226,7 @@ this project makes no claim to have improved it.
 ## A5. Wait-time model
 
 **Script:** `ML/train_wait_model.py` → `Model/wait_time_model.json`
-**Details:** `WAIT_TIME_MODEL.md`
+**Details:** `WAIT_TIME_REGRESSION.md`
 **Dataset:** 528 observed transactions, 14 days, 2–19 October 2026
 **Validation:** leave-one-day-out, pooled over all held-out predictions
 
@@ -289,7 +289,7 @@ row 8, because rows 8 and 9 are covered by a single combined section §8.
 | 14 | Holt's Smoothing (15-min) | live (§13) | Forecast error at horizon | α = 0.4, β = 0.2, φ = 0.85 | Better than naive for trending queues |
 | 15 | Linear Projection (5-min) | live (§14) | Short-term trend accuracy | OLS slope, 20-sample window | Accurate for steady arrival rates |
 | 16 | Growth Ratio (30-min) | live (§15) | Long-horizon error bound | 70 % growth + 30 % mean reversion | Capped at 60 min; conservative by design |
-| 17 | Service Time Estimation | live (§16) | Measured vs assumed gap | 70/30 blend, 0.1–15 min filter | Converges to real gap after ~5 transactions |
+| 17 | Service Time Estimation | live (§16) | Wait accuracy built on it | last 20 services, October mean as 10 | Follows a slower or faster day within the first services |
 | 18 | **Face Recognition Validation** | live — **MEASURED** | See Part A §A1 | 0.30 score + 0.15 margin | **Measured, not expected** |
 | 19 | System-Minted Queue Number | live | Number-collision rate | range starts at 5000 | Deterministic — collision-free by construction |
 | 20 | Sticky Counter Assignment | live | Counter-reassignment stability | keeps existing assignment while active | Deterministic |
@@ -947,44 +947,42 @@ correctness (will the queue grow or shrink?), not precise minute counts.
 
 ---
 
-## 16. Dynamic Service Time Measurement
+## 16. Live Average Service Time
 
-**File:** `app/database/database_handler.py` — `measure_avg_service_time()`
+**File:** `app/services/queue_engine.py` — `current_average()`;
+`app/services/queue_service.py` — `record_service_time()`
 
 ### Accuracy Metric
 
-Agreement between measured inter-departure gap (in minutes) and the actual
-average time a cashier spends per person.
+How well the wait estimate built on it predicts real waits (`WAIT_TIME_MODEL.md`,
+section 8), and how quickly it follows a day that runs slower or faster than
+usual.
 
 ### Method
 
 ```
-gap = (timestamp[i] - timestamp[i-1]) / 60.0   (minutes)
-Filter: 0.1 min ≤ gap ≤ 15.0 min
-measured = mean(gaps) × num_counters
-blended  = 0.7 × measured + 0.3 × old_value
+μ = ( k·μ₀ + ΣSᵢ + Σeⱼ ) / ( k + n + L )
+μ₀ = 1.87 min, k = 10; Sᵢ = last n ≤ 20 services in 2 h (5 s to 30 min);
+eⱼ = time so far of the L transactions still open and already longer than the average
 ```
 
-Update interval: every 300 seconds (5 minutes).
+Updated on every Done, and read again from the database after a restart.
 
 ### Expected Performance
 
-| Transaction Count | Convergence |
-|-------------------|-------------|
-| < 5 transactions | Sparse; estimate unreliable |
-| 5–10 transactions | Rough estimate; blending with previous value stabilises |
-| > 15 transactions | Converges toward actual service time |
-
-The 70/30 blend smooths one unusually fast or slow service event. The 0.1–15 min
-filter excludes cashier idle time between customers.
+On replayed lines, a day 40% slower or 25% faster than October is followed
+within the first services: real-time R² 0.904 against 0.761 with a fixed
+average (slow day, 1 window) and 0.817 against 0.414 (fast day, 3 windows).
+Ten services with k = 3 swung too much on normal days; thirty with k = 20 followed
+a change of pace too slowly.
 
 ### Failure Modes
 
 | Mode | Condition | Effect |
 |------|-----------|--------|
-| Few records | New deployment or reset database | Falls back to ENV default (3.0 min) |
-| Irregular service | One very fast cashier and one slow | Mean may not represent either; use separate counter config |
-| Idle periods | Long gap between customers (> 15 min) | Filtered out correctly |
+| Nothing timed | Start of day, or a restart with no services in 2 h | Uses μ₀, the usual pace |
+| Forgotten Done | A window left open | Its time so far raises μ until Done is pressed; ignored if over 30 min |
+| Mis-click | Done within 5 s of Call next | Ignored |
 
 ---
 

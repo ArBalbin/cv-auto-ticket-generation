@@ -91,7 +91,7 @@ Crowd_Monitoring/
 |       |-- face_service.py        # ArcFace embeddings + match decision rule
 |       |-- object_storage_service.py
 |       |-- prediction_service.py  # Trend/Holt/mean-reversion forecasts
-|       |-- wait_model.py          # Trained wait-time model (WAIT_TIME_MODEL.md)
+|       |-- wait_model.py          # Trained wait-time regression, fallback (WAIT_TIME_REGRESSION.md)
 |       |-- queue_service.py       # Queue business logic
 |       |-- queue_tracker.py       # Presence, tracking, re-entry, minting
 |       |-- ticket_printer.py      # PDF ticket, QR, JWT, short code

@@ -384,12 +384,17 @@ number printed on their kiosk ticket.
 **Where:** `app/services/queue_engine.py` (default), `app/services/wait_model.py`
 (fallback), `queue_service.estimate_wait_for_position`
 
-**By default a queue engine simulates the live line.** Each counter is free, busy
-until its current transaction is expected to end, or closed until a set time
-(staff close all counters for lunch from the dashboard). People waiting are
-taken in queue order by whichever counter frees up first, one service time each;
-when a person is taken is when their turn starts. See `WAIT_TIME_MODEL.md`,
-section 0. `WAIT_ESTIMATOR=regression` switches back to the regression below.
+**By default a real-time queue engine plays the live line forward**, again on
+every request. Each window is free, free when its current transaction is
+expected to end, or closed until a set time (lunch). A transaction that has run
+*e* minutes is expected to need R(e) = μ · m(e/μ) more, the mean residual life of
+a lognormal (σ = 0.425) fitted to the October cashier log; μ is the live average
+of the last 20 services (section 7). People waiting are taken in queue order by
+whichever window frees first, μ each; when a person is taken is their estimated
+time of service, sent to the app in seconds. With one window,
+wait = R(e) + people ahead × μ. Formulas, worked example and validation:
+`WAIT_TIME_MODEL.md`. `WAIT_ESTIMATOR=regression` switches back to
+the regression below.
 
 As the benchmark and fallback, a **median regression trained on observed
 cashier transactions** gives the wait for someone with a given number of people
@@ -403,7 +408,7 @@ Trained by `ML/train_wait_model.py` on 528 transactions over 14 days, and stored
 as plain coefficients in `Model/wait_time_model.json`, so neither the server nor
 the detector needs scikit-learn. On unseen days its MAE is **3.00 minutes**
 (RMSE 5.90, R² −0.04, MAPE 72.2%), the same as a constant 2-minute prediction
-but responsive to the queue. See `WAIT_TIME_MODEL.md` for the validation and
+but responsive to the queue. See `WAIT_TIME_REGRESSION.md` for the validation and
 limitations, especially that long lines are under-estimated.
 
 **Each student** gets the model's estimate for their own position, with
@@ -428,28 +433,29 @@ same history for the dashboard, but no longer drive the wait.
 stores the people ahead, the counters open and the estimate shown; when staff
 mark it done, it stores when the person was called to a counter. Comparing the
 two gives the live accuracy, and the same log re-fits the model on exact counts
-(`WAIT_TIME_MODEL.md`, section 6).
+(`WAIT_TIME_MODEL.md`, section 9; `WAIT_TIME_REGRESSION.md`, section 6).
 
 ---
 
-## 7. Dynamic Service-Time Measurement
+## 7. Live Average Service Time
 
-**Where:** `app/services/queue_service.py`
+**Where:** `queue_engine.current_average()`, `queue_service.record_service_time()`
 
-Rather than trusting a configured average, a background thread re-measures
-the real average service time from completed records every 5 minutes and
-blends it into the running estimate:
+Every service staff mark done is timed from Call next to Done and counted at
+once. The average the wait estimate uses is
 
 ```
-avg_service_time = 0.7 · measured + 0.3 · previous
+μ = ( k·μ₀ + ΣSᵢ + Σeⱼ ) / ( k + n + L )
 ```
 
-The 70/30 blend is damping: a single unusually slow transaction should
-nudge the estimate, not redefine it. The result sets a student's estimated
-service finish time and the utilisation figure. It does not scale the wait:
-that was tested and made the wait model worse on unseen days (MAE 3.08 against
-3.00). The dashboard labels the figure "Measured from DB" or "Default (.env)"
-so staff can see which is in use.
+with μ₀ = 1.87 min (`AVG_SERVICE_TIME`, the October mean) counted as k = 10
+services, Sᵢ the last n ≤ 20 services finished in the past two hours (5 s to
+30 min), and eⱼ the L students still at a window who have already taken longer
+than the average, at their time so far. With nothing timed it is the usual
+pace; it then follows the cashier's real pace, and a window running long raises
+it at once. Students and staff see it as "Average service time". It replaced
+the inter-departure gap measurement (a 70/30 blend refreshed every five minutes),
+which could not react within a transaction.
 
 ---
 
@@ -507,7 +513,7 @@ towards `total_served`, since nobody was served.
 | 4 | Face recognition | ArcFace 512-d + threshold & margin rule, in-memory index | Score < 0.30 or margin < 0.15 |
 | 5 | System-minted number | Reserved 5000+ range, one-per-student, only after a request | Student already holds an entry, or did not ask |
 | 6 | Wait-time prediction | Queue simulation per window (default); median regression on people ahead (fallback) | — |
-| 7 | Service-time measurement | Inter-departure gap blending | — |
+| 7 | Service-time measurement | Live average of timed services, shrunk toward the October mean | — |
 | 8 | Calling to a window | Call next per staff window (default); sticky assignment (automatic mode) | Window busy or closed |
 
 Four of the eight (1, 2, 4, 5) have an explicit refuse-and-escalate

@@ -3,7 +3,7 @@
 The wait-time model was trained on a log that never recorded how many people
 were in line, so it had to guess that number from ticket numbers. This sheet
 records the real count. A few days of it can re-fit the model on the input the
-live system actually uses (see `WAIT_TIME_MODEL.md`, section 5).
+live system actually uses (see `WAIT_TIME_REGRESSION.md`, section 5).
 
 Use `recording_sheet.csv`: one row per ticket you follow from start to finish.
 

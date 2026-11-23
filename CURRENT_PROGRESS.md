@@ -90,7 +90,7 @@ Interactive documentation at `/docs`. Error handlers cover every router.
 `app/services/wait_model.py`, `app/services/prediction_service.py`
 
 A median regression trained on 528 observed transactions gives the wait from
-the number of people ahead (see `WAIT_TIME_MODEL.md`). Short-term trend
+the number of people ahead (see `WAIT_TIME_REGRESSION.md`). Short-term trend
 projection, Holt's double exponential smoothing and growth-ratio mean reversion
 project the queue count for the 5-, 15- and 30-minute horizons.
 
@@ -159,7 +159,7 @@ open-set test. See `FACE_RECOGNITION_CALIBRATION.md` and `ACCURACY.md`.
   figures as an upper bound and report the live numbers alongside them.
 - Thermal printer hardware is not wired up; PDF is the demonstration output.
 - The wait-time model has only been validated offline on logged transactions,
-  and it under-estimates long lines (`WAIT_TIME_MODEL.md`, section 5).
+  and it under-estimates long lines (`WAIT_TIME_REGRESSION.md`, section 5).
 - Queue-zone coordinates must be calibrated per camera placement.
 - Liveness detection is not implemented — a photograph held to the camera could
   be recognised. Mitigated by the Join the Queue gate (an attacker also needs
