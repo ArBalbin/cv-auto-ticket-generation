@@ -507,12 +507,31 @@ def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
             }
             for p in tracked_filtered
         ]
+        detector_ids = [p["track_id"] for p in tracked]
         tracked = remap_track_ids(tracked, queue_tracker)
+        # The detector's number -> the number the tracker holds the person
+        # under, for people the detector renumbered (remap_track_ids keeps the
+        # order). Faces arrive under the detector's number.
+        renumbered = {
+            old: new["track_id"] for old, new in zip(detector_ids, tracked)
+            if old != new["track_id"]
+        }
+        _remember_detector_numbers(renumbered)
         try:
             queue_state = queue_tracker.process_frame(tracked)
         except Exception as exc:
             print(f"[QueueService] process_frame error: {exc}")
 
+        # A renumbered person's face must reach them under the tracker's
+        # number. It used to be looked up under the detector's, which the
+        # tracker does not know, so it was dropped on every frame: the person
+        # could never be recognised. Two people in view make the detector
+        # renumber far more often (23 Nov 2026).
+        if renumbered:
+            filtered = [
+                {**p, "track_id": renumbered.get(p["track_id"], p["track_id"])}
+                for p in filtered
+            ]
         inject_face_embeddings(filtered, queue_tracker)
         try:
             _try_link_students(filtered)
@@ -534,16 +553,33 @@ def done_pending_people() -> list:
     ]
 
 
+# The detector's track number -> the tracker's, for the people the detector
+# renumbered in the latest update (see process_tracked_persons).
+_detector_numbers: dict = {}
+
+
+def _remember_detector_numbers(renumbered: dict) -> None:
+    global _detector_numbers
+    _detector_numbers = dict(renumbered)
+
+
 def face_resolved_track_ids() -> list:
     """Tracks whose identity is settled, so the detector need only refresh
     their faces now and then: students with a number, numbered walk-ins, and
     students recognized but not queueing (a fresh face from them is still
     used, at a slower pace, if they tap join). Everyone else gets the
-    detector's face budget first."""
-    return [
+    detector's face budget first.
+
+    Given in the detector's own numbers too: for a person it renumbered,
+    the tracker's number means nothing to it, and it would keep spending its
+    face budget on someone already settled instead of on the person waiting."""
+    resolved = [
         tid for tid, p in queue_tracker.active_queue.items()
         if p.queue_number is not None or p.identity_status in ("linked", "bystander")
     ]
+    settled = set(resolved)
+    resolved += [det for det, tid in _detector_numbers.items() if tid in settled]
+    return resolved
 
 def is_queue_number_active(queue_number: int) -> bool:
     return any(

@@ -1102,8 +1102,11 @@ def run() -> None:
                         del _fresh_embeddings[tid]
 
             for tid in face_schedule.choose(list(boxes), resolved, now):
+                # Everyone else in the frame, so a neighbour's face inside this
+                # person's box is not taken for theirs.
+                others = [b for t, b in boxes.items() if t != tid]
                 try:
-                    embedding = face_service.compute_embedding(frame, boxes[tid])
+                    embedding = face_service.compute_embedding(frame, boxes[tid], others)
                 except Exception as e:
                     embedding = None
                     print(f"[Detector] WARNING face embedding error: {e}")

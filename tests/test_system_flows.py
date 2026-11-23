@@ -851,3 +851,34 @@ def test_staff_actions_log_when_the_person_was_called(system, monkeypatch):
     assert saved[numbers[3]] == (None, None)
     called_seconds_ago, window = saved[numbers[0]]
     assert called_seconds_ago is not None and window == 1
+
+
+# ------------------------------------------- two people in view (23 Nov 2026)
+
+def test_a_face_arriving_under_a_renumbered_track_still_reaches_its_person(system):
+    """The detector gave a person a new track number (common with two people
+    in view, crossing or overlapping) and the backend mapped it back to the
+    person it already held. The face sent with it must reach that person;
+    it used to be looked up under the detector's new number and dropped, so
+    the person could never be recognised and never got a number."""
+    ana = face(1)
+    system.enrolled[101] = ana
+    tap_join(101)
+
+    # Seen and confirmed while the face is not yet clear (looking down).
+    for i in range(40):
+        jitter = (i % 5) * 6
+        queue_service.process_tracked_persons(frame((7, 100 + jitter, None)), i)
+    assert 7 in system.tracker.active_queue, "presence confirmed on track 7"
+    assert system.tracker.active_queue[7].queue_number is None
+
+    # The detector renumbers them 70; now the face is clear.
+    for i in range(40, 46):
+        queue_service.process_tracked_persons(frame((70, 104, near(ana, i, 0.3))), i)
+
+    state = app_state(101)
+    assert state["state"] == "active", "recognised and given a number on the renumbered track"
+    assert system.tracker.get_person_by_student_id(101).track_id == 7
+    resolved = queue_service.face_resolved_track_ids()
+    assert 7 in resolved and 70 in resolved, \
+        "the detector is told in its own numbering, so it stops spending faces on a settled person"
