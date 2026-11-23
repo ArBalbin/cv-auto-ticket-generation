@@ -741,6 +741,28 @@ def test_a_queue_reset_keeps_the_counters_closed(system, monkeypatch):
         queue_service.set_counters_closed_until(None)
 
 
+def test_a_queue_reset_keeps_students_requests_for_a_number(system, monkeypatch):
+    """23 Nov 2026: six resets in half an hour, and after each one a student
+    who had tapped Get a Queue Number was ignored by the camera until they
+    tapped again. A reset clears the line, not the requests."""
+    monkeypatch.setattr(queue_service, "delete_all_tickets", lambda: 0)
+    monkeypatch.setattr(queue_service, "record_queue_reset", lambda *a: None)
+    old = queue_service.queue_tracker
+    old.arm_join_intent(41, {"payment_type": "Tuition", "payment_amount": 5000.0})
+    old.arm_join_intent(42)
+    old._join_intents[42] -= timedelta(hours=5)          # long lapsed
+    armed_at = old._join_intents[41]
+
+    queue_service.reset_queue()
+    new = queue_service.queue_tracker
+    assert new is not old
+    assert new.has_join_intent(41), "still waiting for the camera"
+    assert new._join_intents[41] == armed_at, "keeps its time, so it still lapses on schedule"
+    assert new._join_details[41]["payment_type"] == "Tuition"
+    assert not new.has_join_intent(42), "a lapsed request is not revived"
+    assert new.active_queue == {} or len(new.active_queue) == 0, "the line itself is cleared"
+
+
 def test_the_dashboard_forecast_comes_from_the_engine(system, monkeypatch):
     monkeypatch.setattr(queue_service, "USE_QUEUE_ENGINE", True)
     for n in range(6200, 6206):

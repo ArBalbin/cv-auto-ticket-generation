@@ -53,7 +53,30 @@ Nothing is added or taken away in fixed steps. Every figure moves with the line.
 
 ## 4. The formulas
 
+To tell a student when their turn will come, the engine has to answer three
+questions, one formula each:
+
+| Formula | Question it answers | Takes | Gives |
+|---|---|---|---|
+| 1. Time left at a busy window | How much longer will the student now at each window take? | How long they have been there (*e*), the average service time (μ) | Minutes until that window is free |
+| 2. Current average service time | How long does one student take at the window, at today's pace? | The long-run average, the services just finished, any still running long | μ, in minutes |
+| 3. Playing the line forward | Given those, when does each person in line reach a window? | When each window is free (formula 1), μ (formula 2), the order of the line | Each student's wait in seconds and their time of service |
+
+Formula 2 feeds formulas 1 and 3, and formula 1 feeds formula 3. All three are
+worked out again on every request, so the answer changes as soon as the line
+does.
+
 ### Formula 1: time left at a busy window (mean residual life)
+
+**What it is for.** It tells the engine when each busy window will be free. A
+student who has been at a window for *e* minutes has some time still to go, and
+that is how long everyone behind them must wait for that window. This is the
+formula that makes the estimate real-time: *e* grows every second, so the answer
+is different on every request. Simply taking "average minus time so far" would
+reach zero after an average-length service and say the window is about to free
+up even when the student is clearly taking long. This formula instead uses how
+real cashier transactions behave: one that has already run long usually still
+has time to go.
 
 A transaction that has lasted *e* minutes is expected to need
 
@@ -88,7 +111,31 @@ runs long: a transaction that has gone on unusually long is an unusual one.
 so a student's time of service can only move later while the person ahead of
 them is still at the window.
 
+| Symbol | Meaning |
+|---|---|
+| *e* | How long the student now at the window has been there, in minutes |
+| μ | The current average service time (formula 2) |
+| *x* = *e*/μ | The time so far as a multiple of the average (x = 1 means one average service so far) |
+| σ = 0.425 | How spread out cashier transaction times are, from the October log |
+| ln | Natural logarithm |
+| Φ | Standard normal distribution function (the area under the bell curve up to a value) |
+| m(*x*) | The time left as a multiple of the average |
+| R(*e*) | The time left, in minutes |
+
+**Example.** With μ = 1.87 min, a student who has been at the window for 2
+minutes is expected to need R(2) = 0.74 min more, so that window is free in
+about 45 seconds.
+
 ### Formula 2: the current average service time
+
+**What it is for.** It is how long one student takes at the window at today's
+pace. Formula 3 gives each person still waiting this much time at the window,
+formula 1 uses it as the scale for the time left, and students see it as
+"Average service time". The cashier's pace is not fixed: some days, and some
+hours, transactions take longer. So instead of a fixed number the engine starts
+from the long-run average and moves toward the times it has just measured. A
+student taking unusually long right now also pushes it up at once, so that
+everyone behind them is warned before that service ends.
 
 ```
 μ = ( k·μ₀ + ΣSᵢ + Σeⱼ ) / ( k + n + L )
@@ -105,7 +152,22 @@ With nothing timed, μ = μ₀. As services are timed it follows the cashier's r
 pace that day. A window running long raises μ at once, so everyone behind it is
 told so.
 
+The long-run average counts as 10 services so that a single fast or slow
+transaction early in the day does not swing every estimate; after 20 services
+it carries about a third of the weight.
+
+**Example.** Four services of 2:00 were just finished and no one is running
+long: μ = (10 × 1.87 + 4 × 2.0) / (10 + 4) = 1.907 min, shown as 1:54.
+
 ### Formula 3: playing the line forward
+
+**What it is for.** It turns the window times into each student's wait. This is
+the queue itself, worked out step by step the way the cashier line actually
+moves: first come, first served, each person going to whichever window frees up
+first. Each student gets their own answer from their place in line, the number
+of windows calling, and how long the people already at the windows have been
+there. It also gives the clock time of their turn (the estimated time of
+service) and handles a lunch closure.
 
 Each counted window *w* is free at
 
@@ -134,6 +196,38 @@ wait = R(e) + p · μ
 
 With *c* windows, the line is shared out to whichever window frees first, so
 each window takes about every *c*-th person.
+
+| Symbol | Meaning |
+|---|---|
+| F_w | The moment window *w* can take the next person |
+| *e_w* | How long the student at window *w* has been there |
+| closed_until | The time the windows reopen after a lunch closure, if any |
+| start | The moment a person is taken by a window |
+| *p* | People still waiting ahead (not counting those already at a window) |
+| *c* | Windows calling |
+
+**Example.** One window; Q1 has been at it 5 minutes and μ = 2.113 min. The
+window is free in R(5) = 0.85 min, so Q2 (next) waits 0:51. Q3 goes after Q2:
+0.85 + 2.113 = 2.97 min, so Q3 waits 2:58 (section 5).
+
+### Is the engine trained?
+
+Not the way a machine-learning model is. It is not trained on past waits and
+does not learn a mapping from inputs to a wait. It works out each wait by
+playing the line forward from what the system knows at that moment, so it needs
+no training set of waits, and its accuracy is checked by validation on lines it
+has never seen (section 8). Two of its values do come from real data:
+
+| Part | Where its value comes from | Kind |
+|---|---|---|
+| σ = 0.425, the shape of service times | Fitted once by maximum likelihood to 511 real transactions in the October 2026 cashier log | Estimated from data (a statistical fit) |
+| μ, the average service time | Updated live from every service staff finish, starting from the October mean | Learned continuously from the cashier's own data |
+| k = 10 and the last 20 services | Chosen by trying settings on replayed lines (section 8.4) | Tuned |
+| First come first served, windows, lunch closure | How the cashier line works | Not learned: a model of the process |
+
+In short, it is a queue model calibrated on real cashier data: the data sets
+how long transactions take, and the queue rules turn that into each student's
+wait.
 
 ## 5. Worked example: the panel's case
 
@@ -480,11 +574,14 @@ wait is when you reach a window. With one window: wait = R(e) + people ahead × 
 Because the longer a transaction has run, the more it is expected to need, and a
 long one also raises the average everyone behind it is given (section 5).
 
-**Is this machine learning?**
-Its two learned parts are estimated from data: the shape σ by maximum likelihood
-on 511 real transactions, and the average μ online, from every service staff
-finish. The rest is the queue itself, played forward from what the system knows
-at that moment.
+**Is it trained? Is this machine learning?**
+It is not trained on past waits the way a machine-learning model is. It is a
+queue model calibrated on real cashier data: the shape σ was fitted by maximum
+likelihood to 511 real transactions, and the average μ is learned continuously
+from every service staff finish. The rest is the queue itself, played forward
+from what the system knows at that moment (section 4, "Is the engine trained?").
+Because it does not fit itself to past waits, its accuracy comes from validation
+on lines it has never seen.
 
 **What is its R²?**
 In simulation with real October service times, run through the real backend

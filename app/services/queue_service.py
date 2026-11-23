@@ -583,8 +583,14 @@ def reset_queue(actor_username: str | None = None) -> None:
     invalidate_ticket_cache()
     deleted = delete_all_tickets()
     print(f"[Reset] Deleted {deleted} ticket PDF(s)")
+    previous = queue_tracker
     queue_tracker = QueueTracker(zone=queue_zone)
     wire_callbacks()
+    # Students who tapped Get a Queue Number and are still waiting for the
+    # camera keep their request; the reset clears the line, not them.
+    kept = queue_tracker.carry_join_intents_from(previous)
+    if kept:
+        print(f"[Reset] Kept {kept} student request(s) for a number")
     threading.Thread(
         target=record_queue_reset,
         args=(actor_username,),

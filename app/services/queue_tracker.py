@@ -400,6 +400,24 @@ class QueueTracker:
         self._join_intents.pop(student_id, None)
         self._join_details.pop(student_id, None)
 
+    def carry_join_intents_from(self, previous: "QueueTracker") -> int:
+        """Keep the requests of students still waiting for the camera when
+        staff reset the queue. A reset clears the line, not the requests:
+        without this a student who had tapped Get a Queue Number was silently
+        written off as a bystander and had to tap again before the camera
+        would give them a number (six resets in half an hour on 23 Nov 2026
+        made assignment look broken). Each request keeps its original time,
+        so it still lapses on schedule. Returns how many were kept."""
+        kept = 0
+        for student_id, armed_at in list(previous._join_intents.items()):
+            if not previous.has_join_intent(student_id):
+                continue
+            self._join_intents[student_id] = armed_at
+            if student_id in previous._join_details:
+                self._join_details[student_id] = dict(previous._join_details[student_id])
+            kept += 1
+        return kept
+
     def has_join_intent(self, student_id: int) -> bool:
         """True only if this student armed themselves and the intent has not
         lapsed. Expiry is checked on read rather than swept on a timer, so a
