@@ -157,6 +157,22 @@ also confirmed after `QUEUE_MIN_CONFIRM_SECONDS` (1 s) over at least
 second. A candidate without a face still needs the full count, so the
 static-object check below keeps enough positions to judge it.
 
+**A student who asked for a number is confirmed by their face** (since 25 Nov
+2026). When a new person's face, in one update, is a registered student who
+tapped Get a Queue Number and holds no number, they are confirmed and issued
+the number on that update (`queue_service.recognised_newcomers`). At about
+one update a second, the one-second-and-three-updates wait had put three
+seconds or more before the face was even checked. Not for a face that two new
+boxes match in the same update, nor for a box the backend has already held as
+someone else, nor for a student the camera already knows on another box:
+those reads may have caught a neighbour's face.
+
+A new box that overlaps someone already in line is treated as a possible
+second box on that person until a face tells them apart. A face already
+captured for the newcomer now counts on the updates that carry none; before,
+a person standing close beside a student with a number was thrown out on
+every update without a fresh face read and could go a minute unconfirmed.
+
 **After someone is served** the same correction applies:
 
 - They count as gone once out of view for 1 second over at least 3 updates. This was 10 updates, which became 4–5 seconds.
@@ -192,6 +208,29 @@ mechanisms defend against this.
 **Remapping** merges a new track into an existing one when they plainly
 describe the same body — IoU ≥ 0.10 or centroid distance < 180 px, within
 45 frames of absence.
+
+Since 25 Nov 2026 it is limited by what the camera has seen
+(`services/track_sightings.py`), because a third person stepping in front of
+someone in line was taken for that hidden person:
+
+- Two numbers seen in the same update are two people and are never merged.
+- Without a face, a new box is merged only if it is in the same place and of
+  the same size as the person was (IoU ≥ 0.5, neither box half as big again)
+  and they vanished within 8 updates. The 8 was set at about 15 updates a
+  second; at the cloud backend's one a second it had let anyone within
+  180 px over 8 s take a missing person's number.
+- With a face, the face must match and the boxes be of similar size. A face
+  seen not to match rules that pair out for good.
+- A merged box counts as settled for the detector's face budget only after
+  two of its face reads were taken as that person's.
+
+**A number moves to a new box** (a student back in view on a new track) only
+when the reads on that box have settled on them: at least
+`MIN_READS_TO_MOVE_A_NUMBER` (3) name them and more name them than not. Never
+onto a box seen together with them, nor onto one that came into view the
+moment they vanished and is clearly bigger or smaller, which is someone who
+stepped in front of them. A single read had handed a hidden student's number
+to the person in front.
 
 **Deduplication** scans the active queue for entries overlapping at
 IoU ≥ 0.10 or centre distance < 0.50 × box diagonal and drops the younger

@@ -27,6 +27,8 @@ def push_frame(body: dict = Body(...), _=Depends(verify_cam_token)):
         "done_pending": queue_service.done_pending_people(),
         # The detector spends its face budget on everyone else first.
         "face_resolved": queue_service.face_resolved_track_ids(),
+        # A student is waiting for a number: read unidentified faces quickly.
+        "faces_wanted": queue_service.faces_wanted(),
         "config": queue_service.runtime_config(),
     }
 

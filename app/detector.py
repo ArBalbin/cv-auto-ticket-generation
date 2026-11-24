@@ -333,6 +333,8 @@ def _push_to_api(payload: dict) -> None:
             _shared_state["done_pending"]    = done_pending
             # The people the backend no longer needs faces for.
             _shared_state["face_resolved"]   = resolved_track_ids(data)
+            # A student is waiting for a number: no slowing down on faces.
+            _shared_state["faces_wanted"]    = bool(data.get("faces_wanted", False))
 
     except requests.RequestException as e:
         _push_errors += 1
@@ -1095,13 +1097,14 @@ def run() -> None:
             now = time.time()
             with _state_lock:
                 resolved = set(_shared_state.get("face_resolved", ()))
+                urgent = bool(_shared_state.get("faces_wanted", False))
             face_schedule.forget_absent(set(boxes), now)
             with _fresh_lock:
                 for tid in list(_fresh_embeddings):
                     if tid not in face_schedule.state:
                         del _fresh_embeddings[tid]
 
-            for tid in face_schedule.choose(list(boxes), resolved, now):
+            for tid in face_schedule.choose(list(boxes), resolved, now, urgent=urgent):
                 # Everyone else in the frame, so a neighbour's face inside this
                 # person's box is not taken for theirs.
                 others = [b for t, b in boxes.items() if t != tid]

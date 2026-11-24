@@ -451,6 +451,13 @@ Remapping is a best-effort pre-filter. When it succeeds, the queue tracker
 sees the correct track_id and avoids re-identification overhead entirely.
 When it fails, re-identification handles the new ID.
 
+Since 25 Nov 2026 a remap also needs: the two numbers never seen in the same
+update; without a face, the same place and size (IoU ≥ 0.5, area within
+1.5×); with a face, a matching face and a similar size. These stop a third
+person who steps in front of someone in line from being taken for them (see
+ALGORITHMS.md §3). Measured in simulation (`load_testing/simulate_third_person.py`,
+results in `load_testing/results/third_person_results.md`).
+
 ### Failure Modes
 
 | Mode | Condition | Effect |
@@ -458,6 +465,7 @@ When it fails, re-identification handles the new ID.
 | Remap miss | Person returns to a completely different position | Falls through to re-identification |
 | Wrong remap | Two people swap positions during brief absence | Could mismap; appearance check in re-ID corrects it |
 | Absent too long | Person absent > 45 frames | Remap disabled; re-identification must handle |
+| Newcomer in front | Someone steps in front of a person in line, hiding them | No longer merged: the newcomer is bigger in the picture, or was seen beside them first |
 
 ---
 

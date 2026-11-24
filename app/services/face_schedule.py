@@ -15,6 +15,8 @@ Face work now runs in its own worker on a budget:
   fewest times first, so someone who just walked in is looked at at once.
   After FACE_WARMUP tries, a person is tried less often, so someone who will
   never match (a walk-in, or someone facing away) cannot starve the rest.
+  While a student who asked for a number is still waiting for one, the
+  backend says so (faces_wanted) and nobody is slowed down.
 - People the backend has already resolved (identified, or recognized but
   not queueing) are refreshed only every FACE_REFRESH_SECONDS, which keeps
   the backend's face checks on them current.
@@ -45,8 +47,15 @@ class FaceSchedule:
     forget_seconds: float = 10.0
     state: dict = field(default_factory=dict)
 
-    def choose(self, track_ids, resolved: set, now: float) -> list:
-        """The tracks to compute a face signature for now, in order."""
+    def choose(self, track_ids, resolved: set, now: float, urgent: bool = False) -> list:
+        """The tracks to compute a face signature for now, in order.
+
+        `urgent` is the backend saying a student has asked for a number and
+        not been given one (faces_wanted). Unidentified people are then
+        retried at the quick pace however many tries they have had: a
+        student who stood in view for a while before asking, or who came
+        close only after several misses from afar, was otherwise looked at
+        once a second. They still take turns, fewest tries first."""
         unresolved, refresh = [], []
         for tid in track_ids:
             s = self.state.get(tid)
@@ -58,7 +67,7 @@ class FaceSchedule:
                         and since_try >= self.refresh_seconds):
                     refresh.append((s.last_success, tid))
                 continue
-            gap = self.retry_gap if s.tries < self.warmup else self.slow_gap
+            gap = self.retry_gap if (urgent or s.tries < self.warmup) else self.slow_gap
             if since_try >= gap:
                 unresolved.append((s.tries, s.first_seen, tid))
         unresolved.sort()

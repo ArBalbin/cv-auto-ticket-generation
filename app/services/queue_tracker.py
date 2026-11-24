@@ -7,6 +7,7 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 
 from services import face_service
+from services.track_sightings import Sightings, similar_size
 from core.school_time import CLOCK_FULL, clock
 from core.config import FACE_ONLY_QUEUE_NUMBER_START, JOIN_INTENT_TIMEOUT_MINUTES
 
@@ -49,6 +50,14 @@ class QueuePerson:
         # the very first frame this person appeared in, which is earlier than
         # entered_at (the moment presence was *confirmed*).
         'first_seen_at', 'embed_attempts', 'embed_successes',
+        # Recognised as a student before they asked for a number, then they
+        # asked: the face already captured is checked again at once instead
+        # of waiting for the camera's next read of it.
+        'face_recheck',
+        # For a person not yet identified: how many face reads named each
+        # registered student (None: matched nobody, or nobody clearly).
+        # See queue_service._try_link_students.
+        'match_votes',
     )
 
     def __init__(self, track_id: int, bbox: tuple, queue_number: int | None = None):
@@ -85,6 +94,8 @@ class QueuePerson:
         self.first_seen_at        = None
         self.embed_attempts       = 0
         self.embed_successes      = 0
+        self.face_recheck         = False
+        self.match_votes          = None
 
     def link_queue_number(self, queue_number: int, student_id: int | None = None,
                            linked_via: str = 'manual') -> None:
@@ -239,6 +250,12 @@ class QueueTracker:
     DEDUP_IOU_THRESH              = 0.15
     DEDUP_CENTRE_FRAC             = 0.55
     BBOX_SMOOTH_ALPHA             = 0.45
+    # Face reads that must name a person out of view before their number
+    # moves onto a new track (and more must name them than not). A read can
+    # catch the face of whoever stands hidden behind the person in the box;
+    # with two, a third student in front of someone in line was still handed
+    # that person's number in about 3% of simulated arrivals (25 Nov 2026).
+    MIN_READS_TO_MOVE_A_NUMBER    = 3
 
     def __init__(self, zone: QueueZone = None):
         self.zone                        = zone or QueueZone()
@@ -284,6 +301,46 @@ class QueueTracker:
         self._join_intents: dict          = {}
         # student_id -> {'payment_type', 'payment_amount'} from the join form
         self._join_details: dict          = {}
+        # Which detector numbers were in view together, so a newcomer is
+        # never mapped onto someone seen beside them (queue_service.remap_track_ids).
+        self.sightings                    = Sightings()
+
+    def take_face(self, person: 'QueuePerson', embedding) -> bool:
+        """Store a fresh face read on a person, unless it is plainly someone
+        else's. Once a person is identified, a read that does not look like
+        the face already held for them is a neighbour's face caught in their
+        box, and keeping it would make them look like that neighbour: the
+        checks that tell two people apart compare these stored faces, and
+        would then take the neighbour for a duplicate of them. Returns
+        whether the read was kept."""
+        live = np.asarray(embedding, dtype=np.float32)
+        if (person.identity_status == 'linked' and person.student_id is not None
+                and person.face_embedding is not None
+                and face_service.cosine_similarity(live, person.face_embedding) < self.FACE_MATCH_THRESHOLD):
+            return False
+        person.face_embedding = live
+        return True
+
+    def known_elsewhere(self, student_id: int, track_id) -> 'QueuePerson | None':
+        """An unfinished entry on another track already recognised as this
+        student (one with their number, or one recognised before they asked
+        for it), if any."""
+        for tid, p in self.active_queue.items():
+            if tid != track_id and p.student_id == student_id and p.status != 'done_pending':
+                return p
+        return None
+
+    def has_waiting_request(self) -> bool:
+        """Whether a student has asked for a number and not been given one
+        yet. While one has, the detector reads unidentified faces as fast as
+        it can instead of slowing down after a few tries."""
+        for student_id in list(self._join_intents):
+            if not self.has_join_intent(student_id):
+                continue
+            existing = self.get_person_by_student_id(student_id)
+            if existing is None or existing.status == 'done_pending':
+                return True
+        return False
 
 
     # LOOKUP BY QUEUE NUMBER (O(1) via secondary index)
@@ -356,6 +413,7 @@ class QueueTracker:
                 continue
             if person.identity_status == 'bystander':
                 person.identity_status = 'pending_link'
+                person.face_recheck = person.face_embedding is not None
                 print(f"🔓 Student {student_id} joined — re-evaluating "
                       f"track {person.track_id}")
             elif person.status == 'done_pending':
@@ -556,6 +614,54 @@ class QueueTracker:
             and p.face_embedding is not None
         ]
 
+    def _could_be_returning(self, track_id, old_tid, bbox) -> bool:
+        """Whether the new track `track_id` (box `bbox`) may be the person
+        held under `old_tid`, come back into view.
+
+        Not if the two were in view together. (A face on this box that did
+        not match the last capture held for them does not rule it out here:
+        that capture may be a turned head, and these checks compare with
+        their registration.) Nor if this box came into view
+        the moment that person vanished and is clearly bigger or smaller: a
+        renumbering of the same person keeps their size (and is followed by
+        queue_service.remap_track_ids anyway), so this is somebody who
+        stepped in front of them and hides them. A read on that box that
+        catches the hidden person's face then counts for nothing; three such
+        reads in a row had handed the hidden person's number to the one in
+        front for a minute (simulated, 25 Nov 2026)."""
+        s = self.sightings
+        if s.seen_together(track_id, old_tid):
+            return False
+        person = self.active_queue.get(old_tid)
+        if (person is not None and s.stepped_in_as_they_vanished(track_id, old_tid)
+                and not similar_size(bbox, person.bbox)):
+            return False
+        return True
+
+    def _returning_person(self, live_embedding, current_track_ids, reads=(),
+                          track_id=None, bbox=None):
+        """The person out of view whose face this new track shows, once the
+        track's face reads have settled on them: MIN_READS_TO_MOVE_A_NUMBER
+        of `reads` (the recent reads on this track, this one included) match
+        them, and more match them than not.
+
+        A single read can catch the face of whoever stands hidden just behind
+        this person. Moving that person's entry onto this track on one read
+        handed their number to someone else's body, and left the newcomer
+        unable to get a number of their own (25 Nov 2026)."""
+        if live_embedding is None:
+            return None, None, 0.0
+        tid, person, score = self._find_returning_student(live_embedding, current_track_ids)
+        if person is None:
+            return None, None, 0.0
+        agree = sum(1 for r in reads
+                    if self._find_returning_student(r, current_track_ids)[1] is person)
+        if agree < self.MIN_READS_TO_MOVE_A_NUMBER or agree <= len(reads) - agree:
+            return None, None, 0.0
+        if track_id is not None and not self._could_be_returning(track_id, tid, bbox):
+            return None, None, 0.0
+        return tid, person, score
+
     def _find_returning_student(self, live_embedding, current_track_ids):
         """Face-based re-identification. A face embedding is discriminative
         enough on its own that the old tiered recency/spatial-fallback/twin-
@@ -624,6 +730,8 @@ class QueueTracker:
         old_tid = next((tid for tid, p in self.active_queue.items() if p is person), None)
         if old_tid is None:
             return False
+        if not self._could_be_returning(track_id, old_tid, newcomer.bbox):
+            return False
         embedding = None if live_embedding is None else np.array(live_embedding, dtype=np.float32)
         self._restore_missing_person(person, old_tid, track_id, newcomer.bbox, embedding)
         return True
@@ -659,8 +767,18 @@ class QueueTracker:
             return 0.0
         return inter / ((b1[2]-b1[0])*(b1[3]-b1[1]) + (b2[2]-b2[0])*(b2[3]-b2[1]) - inter)
 
-    def _is_in_done_cooldown(self, bbox, threshold=0.35) -> bool:
-        return any(self._iou(e['bbox'], bbox) > threshold for e in self._done_cooldowns)
+    def _is_in_done_cooldown(self, bbox, threshold=0.35, recognised_as=None) -> bool:
+        """Whether a new person here falls in the spot of someone just served.
+
+        The pause is there so the served person's own box, flickering as they
+        walk away, is not taken for someone new. A newcomer whose face is a
+        different registered student is plainly not them, so for them only
+        a pause left by that same student counts."""
+        return any(
+            self._iou(e['bbox'], bbox) > threshold
+            and (recognised_as is None or e.get('student_id') == recognised_as)
+            for e in self._done_cooldowns
+        )
 
     def is_recently_retired(self, person) -> bool:
         """Whether staff marked this entry done or a no-show within the last
@@ -794,7 +912,17 @@ class QueueTracker:
 
     # MAIN FRAME PROCESSOR
 
-    def process_frame(self, tracked_persons: list) -> dict:
+    def process_frame(self, tracked_persons: list, recognised: dict | None = None) -> dict:
+        """One update from the detector.
+
+        `recognised` maps the track number of a person not yet tracked to
+        the registered student whose face they showed in this update, for a
+        student who asked for a number and holds none
+        (queue_service.recognised_newcomers). That face is all the
+        confirmation such a person needs: they skip the wait of several
+        updates, and the overlap check meant for a second box drawn on
+        someone already in line."""
+        recognised = recognised or {}
         self._tick_done_cooldowns()
         self._apply_rejoin_requests()
         self._claimed_this_frame = {}
@@ -826,7 +954,7 @@ class QueueTracker:
                     if live_embedding is not None:
                         p.embed_successes += 1
                 if live_embedding is not None:
-                    p.face_embedding = np.array(live_embedding, dtype=np.float32)
+                    self.take_face(p, live_embedding)
                 if in_zone:
                     current_in_zone.add(track_id)
                     if p.status in ('missing', 'waiting') and p.went_missing_at is not None:
@@ -850,21 +978,38 @@ class QueueTracker:
             _raw_embed = person.get('face_embedding')
             live_embedding = np.array(_raw_embed, dtype=np.float32) if _raw_embed is not None else None
 
-            # First-sight re-entry check
+            # First-sight re-entry check, with the reads from earlier updates
             if live_embedding is not None:
-                ret_tid, ret_person, ret_score = self._find_returning_student(
-                    live_embedding, current_in_zone)
+                prior = self._candidates.get(track_id)
+                reads = list(prior.get('face_embeds', [])) if prior else []
+                ret_tid, ret_person, ret_score = self._returning_person(
+                    live_embedding, current_in_zone, reads + [live_embedding], track_id, bbox)
                 if ret_person is not None:
                     label = f"Q{ret_person.queue_number:03d}" if ret_person.queue_number is not None else "(pending)"
                     print(f"✅ {label} re-entry (score={ret_score:.2f}, track {ret_tid}→{track_id})")
                     self._restore_missing_person(ret_person, ret_tid, track_id, bbox, live_embedding)
                     continue
 
-            if self._is_in_done_cooldown(bbox):
+            student_seen = recognised.get(track_id)
+            ready = student_seen is not None
+
+            if self._is_in_done_cooldown(bbox, recognised_as=student_seen):
                 self._candidates.pop(track_id, None)
                 continue
 
-            if self._is_duplicate_of_active(bbox, live_embedding):
+            # A box overlapping someone already in line may be a second box
+            # drawn on that same person. Only a face tells them apart, and
+            # most updates carry none: a face already captured for this new
+            # person counts too. Without it, someone standing close beside a
+            # person with a number was thrown out on every update that came
+            # without a fresh face read, starting over each time, and could
+            # go a minute without being confirmed.
+            known_face = live_embedding
+            if known_face is None:
+                earlier = self._candidates.get(track_id)
+                if earlier and earlier.get('face_embeds'):
+                    known_face = earlier['face_embeds'][-1]
+            if not ready and self._is_duplicate_of_active(bbox, known_face):
                 self._candidates.pop(track_id, None)
                 print(f"🔁 track {track_id} suppressed — duplicate of active person")
                 continue
@@ -918,17 +1063,19 @@ class QueueTracker:
                     if len(embeds) > 8:
                         embeds.pop(0)
 
-            # Mid-accumulation re-entry check
+            # Mid-accumulation re-entry check (this read is among the track's reads)
+            reads = list(cand.get('face_embeds', []))
             if live_embedding is not None:
-                early_tid, early_person, early_score = self._find_returning_student(
-                    live_embedding, current_in_zone)
+                early_tid, early_person, early_score = self._returning_person(
+                    live_embedding, current_in_zone, reads, track_id, bbox)
                 if early_person is not None:
                     label = f"Q{early_person.queue_number:03d}" if early_person.queue_number is not None else "(pending)"
                     print(f"✅ {label} re-entry (accumulation frame {cand['count']}, score={early_score:.2f})")
                     self._restore_missing_person(early_person, early_tid, track_id, bbox, live_embedding)
                     continue
 
-            if cand['count'] < self.MIN_CONFIRM_FRAMES and not self._confirmed_by_time(cand):
+            if (not ready and cand['count'] < self.MIN_CONFIRM_FRAMES
+                    and not self._confirmed_by_time(cand)):
                 if cand['count'] % 5 == 0:
                     print(f"[QueueTracker] DEBUG tid={track_id} accumulating "
                           f"count={cand['count']}/{self.MIN_CONFIRM_FRAMES}")
@@ -943,8 +1090,8 @@ class QueueTracker:
                 continue
 
             # Final gate re-entry check
-            final_tid, final_person, final_score = self._find_returning_student(
-                live_embedding, current_in_zone)
+            final_tid, final_person, final_score = self._returning_person(
+                live_embedding, current_in_zone, reads, track_id, bbox)
             if final_person is not None:
                 label = f"Q{final_person.queue_number:03d}" if final_person.queue_number is not None else "(pending)"
                 print(f"✅ {label} final gate (score={final_score:.2f}) — not new")
@@ -1046,6 +1193,7 @@ class QueueTracker:
         self._done_cooldowns.append({
             'bbox': p.bbox,
             'until': datetime.now() + timedelta(seconds=self.DONE_COOLDOWN_SECONDS),
+            'student_id': p.student_id,
         })
         with self._lock:
             if reason == 'served':
@@ -1235,6 +1383,7 @@ class QueueTracker:
                         'bbox': drop.bbox,
                         'until': datetime.now() + timedelta(seconds=min(
                             self.DONE_COOLDOWN_SECONDS, self.DUPLICATE_COOLDOWN_SECONDS)),
+                        'student_id': drop.student_id,
                     })
                     to_drop.add(drop_tid)
 

@@ -109,3 +109,15 @@ def test_the_backend_lists_settled_people_but_not_those_still_unidentified(monke
     pending.identity_status = "pending_link"
     monkeypatch.setattr(tracker, "active_queue", {1: linked, 2: bystander, 3: pending})
     assert sorted(queue_service.face_resolved_track_ids()) == [1, 2]
+
+
+def test_while_a_student_waits_for_a_number_nobody_is_slowed_down():
+    # Someone tried a few times from afar, or who stood in view before
+    # asking, is read again at the quick pace once a student is waiting.
+    s = FaceSchedule(per_round=1, retry_gap=0.15, slow_gap=1.0, warmup=3)
+    for i in range(3):
+        s.record(40, ok=False, now=100.0 + i * 0.2)
+    assert s.choose([40], resolved=set(), now=100.8) == []
+    assert s.choose([40], resolved=set(), now=100.8, urgent=True) == [40]
+    assert s.choose([40, 41], resolved=set(), now=100.8, urgent=True) == [41], \
+        "still in turn, fewest tries first"

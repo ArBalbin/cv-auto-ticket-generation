@@ -162,13 +162,10 @@ def test_several_students_arriving_together_each_get_a_number_and_ticket(system)
         return [(60 + i, 100 + 400 * i, near(faces[sid], 1000 * update + i, 0.3))
                 for i, sid in enumerate(sids)]
 
-    for k in range(3):
-        queue_service.process_tracked_persons(frame(*people(k)), k)
-    assert not system.tickets, "under a second: nobody confirmed yet"
-
-    for candidate in system.tracker._candidates.values():
-        candidate["first_seen"] -= timedelta(seconds=1.5)
-    queue_service.process_tracked_persons(frame(*people(3)), 3)
+    # Each asked for a number, so the face is the confirmation: all four are
+    # issued one on the first update that shows their face, not after the
+    # second-long wait that applies to anyone else (25 Nov 2026).
+    queue_service.process_tracked_persons(frame(*people(0)), 0)
 
     numbers = [app_state(sid)["queue_number"] for sid in sids]
     assert None not in numbers
@@ -882,3 +879,188 @@ def test_a_face_arriving_under_a_renumbered_track_still_reaches_its_person(syste
     resolved = queue_service.face_resolved_track_ids()
     assert 7 in resolved and 70 in resolved, \
         "the detector is told in its own numbering, so it stops spending faces on a settled person"
+
+
+# ------------------------------------- a third person arrives (25 Nov 2026)
+#
+# Two students already have numbers and a third comes to get one. On 24 Nov
+# one such student stood in view for 58 seconds before getting a number. The
+# backend gets about one update a second, and most updates carry no fresh
+# face read, so most of these tests send a face only now and then.
+
+def enrol(system, sid, vec):
+    """Register a student mid-test. Registration clears the face index, as
+    the real enrolment does; otherwise a lookup in the same clock tick
+    (about 15 ms on Windows) still uses the index from before."""
+    system.enrolled[sid] = vec
+    queue_service.embedding_index.invalidate()
+
+
+def _two_numbered(system, a_sid, b_sid):
+    a, b = face(a_sid), face(b_sid)
+    enrol(system, a_sid, a)
+    enrol(system, b_sid, b)
+    tap_join(a_sid)
+    tap_join(b_sid)
+    system.stand((10, 100, near(a, 1, 0.3)), (11, 700, near(b, 2, 0.3)), frames=5)
+    qa, qb = app_state(a_sid)["queue_number"], app_state(b_sid)["queue_number"]
+    assert qa is not None and qb is not None
+    return a, b, qa, qb
+
+
+def test_a_third_student_stepping_in_front_of_someone_in_line_gets_their_own_number(system):
+    a, b, qa, qb = _two_numbered(system, 401, 402)
+    c = face(403)
+    enrol(system, 403, c)
+    tap_join(403)
+
+    # Student 3 walks in beside the other two...
+    queue_service.process_tracked_persons(frame((10, 100, None), (11, 700, None), (12, 400, None)), 10)
+    # ...then stands right in front of student 1, who is hidden from the
+    # camera. No face read comes through for a while.
+    for i in range(11, 17):
+        queue_service.process_tracked_persons(frame((11, 700, None), (12, 110, None)), i)
+    assert 12 not in queue_service.face_resolved_track_ids(), \
+        "not taken for student 1, so the detector keeps reading their face"
+    assert system.tracker.get_person_by_student_id(401).queue_number == qa
+
+    # One clear read of their face is enough.
+    queue_service.process_tracked_persons(frame((11, 700, None), (12, 110, near(c, 3, 0.3))), 17)
+    qc = app_state(403)["queue_number"]
+    assert qc is not None and qc not in (qa, qb)
+
+    # Student 3 steps aside and student 1 is in view again, number intact.
+    system.stand((10, 100, near(a, 4, 0.3)), (11, 700, None), (12, 400, None), frames=3)
+    assert app_state(401)["queue_number"] == qa
+    assert app_state(402)["queue_number"] == qb
+    assert app_state(403)["queue_number"] == qc
+    assert sorted(system.tickets) == sorted([qa, qb, qc])
+
+
+def test_a_newcomer_appearing_in_front_of_someone_is_not_taken_for_them(system):
+    # This time the two are never seen side by side: student 3 comes into
+    # view just as student 1 disappears behind them. Student 3 is a step
+    # closer to the camera, so their box is clearly bigger than student 1's.
+    a, b, qa, qb = _two_numbered(system, 491, 492)
+    c = face(493)
+    enrol(system, 493, c)
+    tap_join(493)
+    bigger = {"track_id": 12, "bbox": [90, 40, 250, 420], "conf": 0.9, "face_embedding": None}
+    for i in range(10, 14):
+        queue_service.process_tracked_persons(frame((11, 700, None)) + [dict(bigger)], i)
+    assert system.tracker.active_queue[10].missing_frames > 0, \
+        "student 1 is out of view, not standing there as student 3"
+    assert 12 not in queue_service.face_resolved_track_ids()
+
+    # Even a read that catches student 1's face (peeking past student 3's
+    # head) does not make student 3 into student 1.
+    peek = dict(bigger, face_embedding=near(a, 7, 0.3).tolist())
+    queue_service.process_tracked_persons(frame((11, 700, None)) + [peek], 14)
+    assert system.tracker.get_person_by_student_id(491).track_id == 10
+    own = dict(bigger, face_embedding=near(c, 8, 0.3).tolist())
+    queue_service.process_tracked_persons(frame((11, 700, None)) + [own], 15)
+    qc = app_state(493)["queue_number"]
+    assert qc is not None and qc not in (qa, qb)
+    assert system.tracker.get_person_by_student_id(493).track_id == 12
+
+
+def test_a_student_who_asked_gets_a_number_on_the_first_clear_look_at_their_face(system):
+    # Half in front of student 1: their boxes overlap like two boxes drawn on
+    # one person would. The overlap check used to throw the newcomer out on
+    # every update without a face, so the count never got anywhere.
+    a, b, qa, qb = _two_numbered(system, 411, 412)
+    c = face(413)
+    enrol(system, 413, c)
+    tap_join(413)
+    for i in range(2):
+        queue_service.process_tracked_persons(frame((10, 100, None), (11, 700, None), (12, 140, None)), 10 + i)
+    assert app_state(413).get("queue_number") is None
+    queue_service.process_tracked_persons(
+        frame((10, 100, None), (11, 700, None), (12, 140, near(c, 1, 0.3))), 12)
+    qc = app_state(413)["queue_number"]
+    assert qc is not None and qc not in (qa, qb)
+
+
+def test_someone_standing_close_beside_a_numbered_student_is_still_confirmed(system):
+    # A walk-in (not registered) half in front of a student with a number,
+    # with a face read every third update. Once their face is known to be
+    # someone else's, the updates without one count too.
+    a, b, qa, qb = _two_numbered(system, 421, 422)
+    stranger = face(999)
+    for i in range(45):
+        read = near(stranger, 100 + i, 0.3) if i % 3 == 0 else None
+        queue_service.process_tracked_persons(
+            frame((10, 100, None), (11, 700, None), (12, 140, read)), 10 + i)
+    assert 12 in system.tracker.active_queue, "confirmed, so staff can link the walk-in"
+    assert system.tickets == [qa, qb], "never given a number by the camera"
+
+
+def test_recognition_alone_still_waits_and_gives_no_number(system):
+    b = face(431)
+    enrol(system, 431, b)
+    queue_service.process_tracked_persons(frame((40, 100, near(b, 1, 0.3))), 0)
+    assert 40 not in system.tracker.active_queue, "no request: the usual wait applies"
+    assert system.tickets == []
+
+
+def test_one_face_on_two_new_boxes_is_not_taken_at_face_value(system):
+    # One of the two reads caught the wrong face; neither box is rushed.
+    c = face(441)
+    enrol(system, 441, c)
+    tap_join(441)
+    queue_service.process_tracked_persons(
+        frame((50, 100, near(c, 1, 0.3)), (51, 900, near(c, 2, 0.3))), 0)
+    assert system.tickets == []
+
+
+def test_a_neighbours_face_caught_in_a_numbered_students_box_is_not_kept_as_theirs(system):
+    a, b, qa, qb = _two_numbered(system, 451, 452)
+    held = system.tracker.active_queue[10].face_embedding.copy()
+    queue_service.process_tracked_persons(frame((10, 100, near(b, 5, 0.3)), (11, 700, None)), 10)
+    assert np.allclose(system.tracker.active_queue[10].face_embedding, held)
+    queue_service.process_tracked_persons(frame((10, 100, near(a, 6, 0.3)), (11, 700, None)), 11)
+    assert not np.allclose(system.tracker.active_queue[10].face_embedding, held), \
+        "their own fresh read is still taken"
+
+
+def test_the_next_student_may_step_into_the_spot_of_someone_just_served(system):
+    a = face(461)
+    c = face(462)
+    enrol(system, 461, a)
+    enrol(system, 462, c)
+    tap_join(461)
+    system.stand((70, 100, near(a, 1, 0.3)), frames=5)
+    queue_service.mark_done(app_state(461)["queue_number"])
+    system.tracker.get_person_by_student_id(461).last_seen -= timedelta(seconds=1.5)
+    system.stand(frames=3)
+
+    tap_join(462)
+    queue_service.process_tracked_persons(frame((71, 100, near(c, 2, 0.3))), 50)
+    assert app_state(462)["queue_number"] is not None, \
+        "a different student's face: the pause after a service is not for them"
+
+
+def test_tapping_join_while_already_recognised_issues_the_number_at_once(system):
+    b = face(471)
+    enrol(system, 471, b)
+    system.stand((80, 100, near(b, 1, 0.3)))
+    assert app_state(471)["state"] == "recognized_not_joined"
+    tap_join(471)
+    # The next update brings no fresh read of their face; the one already
+    # captured is checked again.
+    queue_service.process_tracked_persons(frame((80, 100, None)), 100)
+    assert app_state(471)["state"] == "active"
+
+
+def test_the_detector_is_told_to_hurry_only_while_a_student_waits(system, monkeypatch):
+    from routers import detector_api
+
+    monkeypatch.setattr(detector_api.state, "update_from_detector_payload", lambda body: None)
+    assert detector_api.push_frame({"tracked_persons": []})["faces_wanted"] is False
+    c = face(481)
+    enrol(system, 481, c)
+    tap_join(481)
+    assert queue_service.faces_wanted() is True
+    system.stand((90, 100, near(c, 1, 0.3)), frames=2)
+    assert app_state(481)["queue_number"] is not None
+    assert queue_service.faces_wanted() is False

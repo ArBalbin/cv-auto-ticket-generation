@@ -43,6 +43,7 @@ from database.database_handler import (
     update_queue_status,
 )
 from services.queue_tracker import QueueTracker, QueueZone
+from services.track_sightings import similar_size
 from services import face_service, queue_engine, ticket_service, wait_model
 from services.embedding_index import EmbeddingIndex
 from services.ticket_printer import delete_all_tickets, invalidate_ticket_cache
@@ -62,6 +63,8 @@ _MAX_REMAP_ABSENT_FRAMES = QUEUE_REMAP_ABSENT_FRAMES
 # Longest gap, in frames, over which a track is remapped without a face to
 # confirm it is the same person (about half a second at 15 fps).
 _REMAP_FACELESS_MAX_FRAMES = 8
+# And only onto a box it mostly overlaps (see _same_place_and_size).
+_REMAP_FACELESS_MIN_IOU = 0.5
 _config_lock = threading.Lock()
 
 USE_QUEUE_ENGINE = WAIT_ESTIMATOR != "regression"
@@ -208,6 +211,12 @@ def _bbox_centroid_dist(a: tuple, b: tuple) -> float:
         + ((a[1] + a[3]) / 2 - (b[1] + b[3]) / 2) ** 2
     ) ** 0.5
 
+def _same_place_and_size(a: tuple, b: tuple) -> bool:
+    """Whether two boxes could be one person who has not moved: mostly
+    overlapping, and neither half as big again as the other."""
+    return _bbox_iou(a, b) >= _REMAP_FACELESS_MIN_IOU and similar_size(a, b)
+
+
 def remap_track_ids(tracked: list, tracker) -> list:
     if not tracked:
         return tracked
@@ -239,6 +248,8 @@ def remap_track_ids(tracked: list, tracker) -> list:
 
     remapped = []
     used_cands: set[int] = set()
+    # Which detector numbers were in view together (services/track_sightings.py).
+    sightings = getattr(tracker, "sightings", None)
 
     for p in tracked:
         tid = p["track_id"]
@@ -255,6 +266,11 @@ def remap_track_ids(tracked: list, tracker) -> list:
         for c_tid, c_bbox, c_face, c_absent in candidates:
             if c_tid in used_cands:
                 continue
+            # A number seen in the same update as this person is somebody
+            # else: a third person stepping in front of someone in line, who
+            # is hidden for a moment, is not that person under a new number.
+            if sightings is not None and not sightings.could_be(tid, c_tid):
+                continue
             # Position alone cannot tell a lost track from a different person
             # stepping into the spot someone just left; remapping them handed
             # the first person's queue number to the second. When both faces
@@ -264,9 +280,29 @@ def remap_track_ids(tracked: list, tracker) -> list:
                 sim = face_service.cosine_similarity(
                     np.asarray(incoming_face, dtype=np.float32), c_face)
                 if sim < tracker.FACE_MATCH_THRESHOLD:
+                    # Remembered: on its next update without a face this
+                    # number would otherwise be mapped onto them again.
+                    if sightings is not None:
+                        sightings.faces_differ(tid, c_tid)
                     continue
-            elif c_absent > _REMAP_FACELESS_MAX_FRAMES:
-                continue
+                # A matching face on a box half as big again as the person's
+                # is the face of someone hidden behind a newcomer who stepped
+                # in front of them. A person who really came back elsewhere
+                # gets their number back through the re-entry check instead,
+                # once several reads agree.
+                if not similar_size(bbox, c_bbox):
+                    continue
+            else:
+                if c_absent > _REMAP_FACELESS_MAX_FRAMES:
+                    continue
+                # Without a face, the same person under a new number is in
+                # the same place and the same size. The limit above was set
+                # at about 15 updates a second (half a second); at the cloud
+                # backend's one a second it let anyone within 180 px over 8 s
+                # take a missing person's number, above all a newcomer
+                # stepping in front of them, who is bigger in the picture.
+                if not _same_place_and_size(bbox, c_bbox):
+                    continue
             iou = _bbox_iou(bbox, c_bbox)
             dist = _bbox_centroid_dist(bbox, c_bbox)
 
@@ -296,12 +332,14 @@ def remap_track_ids(tracked: list, tracker) -> list:
 
     return remapped
 
-def inject_face_embeddings(raw_tracked: list, tracker) -> None:
+def inject_face_embeddings(raw_tracked: list, tracker) -> set:
     """Refresh a tracked person's stored face embedding from the latest
     detector payload. Unlike the retired HSV signature (which was EMA-
     blended to smooth pixel noise), ArcFace embeddings for the same person
     are already stable frame-to-frame, so the freshest confident read is
-    kept as-is rather than blended across possibly different angles."""
+    kept as-is rather than blended across possibly different angles.
+    Returns the track numbers whose read was kept."""
+    taken = set()
     for p in raw_tracked:
         embedding = p.get("face_embedding")
         if not embedding:
@@ -313,9 +351,60 @@ def inject_face_embeddings(raw_tracked: list, tracker) -> None:
             continue
 
         try:
-            person.face_embedding = np.array(embedding, dtype=np.float32)
+            # Not a neighbour's face caught in the box of someone identified.
+            if tracker.take_face(person, embedding):
+                taken.add(tid)
         except Exception as exc:
             print(f"[QueueService] face embedding injection error tid={tid}: {exc}")
+    return taken
+
+
+def recognised_newcomers(tracked: list) -> dict:
+    """People not yet tracked whose face, in this update, is a registered
+    student who asked for a number and holds none: track number -> student.
+
+    Their face is the confirmation, so the tracker issues their number on
+    this update (QueueTracker.process_frame) instead of first watching them
+    for a second and three updates. With the backend getting about one
+    update a second, that wait was three seconds or more before the face was
+    even looked at. A face that two people in the same update both match is
+    left to the usual checks: one of the two reads caught the wrong face. So
+    is a box the backend has already taken for someone else: its read may
+    be the face of a student hidden behind that person, who would then be
+    given a number on the wrong body."""
+    found: dict = {}
+    sightings = queue_tracker.sightings
+    for p in tracked:
+        embedding = p.get("face_embedding")
+        if not embedding or p["track_id"] in queue_tracker.active_queue:
+            continue
+        if sightings.held_as_someone_else(p["track_id"]):
+            continue
+        try:
+            match = embedding_index.match(
+                np.asarray(embedding, dtype=np.float32),
+                match_threshold=FACE_MATCH_THRESHOLD,
+                margin_threshold=FACE_MARGIN_THRESHOLD,
+            )
+        except Exception as exc:
+            print(f"[QueueService] newcomer check error tid={p['track_id']}: {exc}")
+            continue
+        if not match.accepted or not queue_tracker.has_join_intent(match.student_id):
+            continue
+        existing = queue_tracker.get_person_by_student_id(match.student_id)
+        if existing is not None and existing.status != "done_pending":
+            continue
+        if queue_tracker.known_elsewhere(match.student_id, p["track_id"]) is not None:
+            continue
+        found[p["track_id"]] = match.student_id
+    students = list(found.values())
+    return {tid: sid for tid, sid in found.items() if students.count(sid) == 1}
+
+
+def faces_wanted() -> bool:
+    """Whether the detector should read unidentified faces as fast as it can:
+    while a student who asked for a number has not been given one."""
+    return queue_tracker.has_waiting_request()
 
 def _try_link_students(raw_tracked: list) -> None:
     """For each presence-confirmed-but-unlinked person whose track carries a
@@ -346,6 +435,11 @@ def _try_link_students(raw_tracked: list) -> None:
             continue
 
         embedding = p.get("face_embedding")
+        if not embedding and person.face_recheck and person.face_embedding is not None:
+            # Recognised before asking for a number, and has just asked:
+            # the face already captured decides now, not the next read.
+            embedding = person.face_embedding.tolist()
+        person.face_recheck = False
         if not embedding:
             continue
 
@@ -359,20 +453,50 @@ def _try_link_students(raw_tracked: list) -> None:
             record_face_match_event(
                 match.student_id, track_id, match.score, match.margin, match.accepted,
             )
+            # Every read of this person's face is counted, including those
+            # that matched nobody. Two steps below are hard to undo, so they
+            # wait until the reads have settled on one student: one read can
+            # catch the face of whoever stands beside or behind this person
+            # (25 Nov 2026).
+            votes = person.match_votes or {}
+            named = match.student_id if match.accepted else None
+            votes[named] = votes.get(named, 0) + 1
+            person.match_votes = votes
             if not match.accepted:
                 continue
 
-            # A student who stepped out of view and came back: their face no
-            # longer matched the last capture of it, so the camera confirmed
-            # them as a new, unidentified person while their own number sat
-            # "missing" on the staff screen. Their registration signature does
-            # match, so their number goes back to them on this track. This
-            # comes before the join-intent check, because the request that
-            # produced their number was used up when the number was issued.
+            # This student already holds a number. Either they stepped out of
+            # view and came back on this track (their face no longer matched
+            # the last capture of it, so the camera confirmed them as a new,
+            # unidentified person while their own number sat "missing"), or
+            # the read caught their face in this person's box. The request
+            # that produced their number was used up when it was issued, so
+            # this comes before the join-intent check.
+            #
+            # While they are in view on their own track, it is the second:
+            # nothing to do. When they are out of view their number moves to
+            # this track, but only once the reads have settled on them. On a
+            # single read a third student standing in front of someone in
+            # line (who is hidden for that moment) was given that person's
+            # number, and could then never get their own.
+            #
+            # A done_pending entry does not count. It is a finished
+            # transaction that lingers in active_queue only until the cleanup
+            # pass removes it, and that pass waits for the person to go
+            # missing for several frames. Treating it as blocking meant a
+            # student who had just been served could not be served again
+            # without physically leaving the camera's view first, because
+            # standing still kept their completed entry alive indefinitely.
+            # Immediate re-entry is already governed by the spatial
+            # done-cooldown, which is the guard actually designed for it.
             existing = queue_tracker.get_person_by_student_id(match.student_id)
-            if existing is not None and queue_tracker.return_to_track(existing, track_id, live_embedding):
-                label = f"Q{existing.queue_number:03d}" if existing.queue_number is not None else "(entry)"
-                print(f"↩️  {label} is back: student {match.student_id} recognised on track {track_id}")
+            if existing is not None and existing is not person and existing.status != 'done_pending':
+                moves = queue_tracker.MIN_READS_TO_MOVE_A_NUMBER
+                if (existing.missing_frames > 0
+                        and _reads_settled_on(person, match.student_id, moves)
+                        and queue_tracker.return_to_track(existing, track_id, live_embedding)):
+                    label = f"Q{existing.queue_number:03d}" if existing.queue_number is not None else "(entry)"
+                    print(f"↩️  {label} is back: student {match.student_id} recognised on track {track_id}")
                 continue
 
             # Recognition is not consent. A registered student only gets a
@@ -391,27 +515,30 @@ def _try_link_students(raw_tracked: list) -> None:
                 # bystander mark is a one-way door and someone recognized
                 # *before* tapping join could never get a number for as long
                 # as the camera held that track.
-                person.student_id = match.student_id
-                person.identity_status = "bystander"
+                #
+                # Only once the reads have settled: on one read that caught a
+                # neighbour's face, a student who then asked for a number was
+                # left marked as that neighbour and never looked at again.
+                if _reads_settled_on(person, match.student_id, 2):
+                    person.student_id = match.student_id
+                    person.identity_status = "bystander"
                 continue
 
-            # One active entry per student at a time — if they already have a
-            # pending/waiting ticket (from an earlier recognition this
-            # session), don't mint or link another. Staff must mark the
-            # existing one done (served/no-show) before this student can be
-            # queued again.
+            # One active entry per student at a time: a student who already
+            # holds a pending/waiting ticket was handled above and is never
+            # minted another. Staff must mark the existing one done (served or
+            # no-show) before this student can be queued again.
             #
-            # A done_pending entry does not count. It is a finished
-            # transaction that lingers in active_queue only until the cleanup
-            # pass removes it, and that pass waits for the person to go
-            # missing for several frames. Treating it as blocking meant a
-            # student who had just been served could not be served again
-            # without physically leaving the camera's view first, because
-            # standing still kept their completed entry alive indefinitely.
-            # Immediate re-entry is already governed by the spatial
-            # done-cooldown, which is the guard actually designed for it.
-            existing = queue_tracker.get_person_by_student_id(match.student_id)
-            if existing is not None and existing.status != 'done_pending':
+            # The camera may already know this student on another track,
+            # recognised before they asked. In view there, this read caught
+            # their face in this person's box: their number is issued on
+            # their own track. Out of view, it may be them on a new track,
+            # or them hidden behind this person, so it waits for the reads
+            # here to agree. On one read, a student who asked and was then
+            # hidden behind someone was issued their number on that person.
+            elsewhere = queue_tracker.known_elsewhere(match.student_id, track_id)
+            if elsewhere is not None and (elsewhere.missing_frames <= 0
+                                          or not _reads_settled_on(person, match.student_id, 2)):
                 continue
 
         except Exception as exc:
@@ -427,6 +554,16 @@ def _try_link_students(raw_tracked: list) -> None:
 
         if linked is not None:
             _record_recognition_metric(linked, match, intent_at)
+
+def _reads_settled_on(person, student_id, at_least: int) -> bool:
+    """Whether a person's face reads have settled on one registered student:
+    at least `at_least` named them, and more named them than not (reads
+    that matched nobody count against, so a walk-in's own unmatched reads
+    outvote a stray read of the person hidden behind them)."""
+    votes = person.match_votes or {}
+    named = votes.get(student_id, 0)
+    return named >= at_least and named > sum(votes.values()) - named
+
 
 def _record_recognition_metric(person, match, intent_at=None) -> None:
     """
@@ -509,6 +646,8 @@ def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
             for p in tracked_filtered
         ]
         detector_ids = [p["track_id"] for p in tracked]
+        sightings = queue_tracker.sightings
+        sightings.begin(detector_ids)
         tracked = remap_track_ids(tracked, queue_tracker)
         # The detector's number -> the number the tracker holds the person
         # under, for people the detector renumbered (remap_track_ids keeps the
@@ -518,8 +657,15 @@ def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
             if old != new["track_id"]
         }
         _remember_detector_numbers(renumbered)
+        for old, new in zip(detector_ids, tracked):
+            sightings.saw(old, new["track_id"])
         try:
-            queue_state = queue_tracker.process_frame(tracked)
+            recognised = recognised_newcomers(tracked)
+        except Exception as exc:
+            recognised = {}
+            print(f"[QueueService] newcomer check error: {exc}")
+        try:
+            queue_state = queue_tracker.process_frame(tracked, recognised)
         except Exception as exc:
             print(f"[QueueService] process_frame error: {exc}")
 
@@ -533,12 +679,16 @@ def process_tracked_persons(raw_tracked: list, yolo_frame_idx: int = 0) -> dict:
                 {**p, "track_id": renumbered.get(p["track_id"], p["track_id"])}
                 for p in filtered
             ]
-        inject_face_embeddings(filtered, queue_tracker)
+        taken = inject_face_embeddings(filtered, queue_tracker)
+        for det, tid in renumbered.items():
+            if tid in taken:
+                sightings.face_taken(det, tid)
         try:
             _try_link_students(filtered)
         except Exception as exc:
             print(f"[QueueService] student linking pass error: {exc}")
     else:
+        queue_tracker.sightings.begin([])
         try:
             queue_state = queue_tracker.process_frame([])
         except Exception as exc:
@@ -573,13 +723,18 @@ def face_resolved_track_ids() -> list:
 
     Given in the detector's own numbers too: for a person it renumbered,
     the tracker's number means nothing to it, and it would keep spending its
-    face budget on someone already settled instead of on the person waiting."""
+    face budget on someone already settled instead of on the person waiting.
+    But only once a face read on that renumbered box was taken as theirs: a
+    box mapped to them by position alone may be someone who stepped in front
+    of them, and that newcomer's face is exactly what must be read next."""
     resolved = [
         tid for tid, p in queue_tracker.active_queue.items()
         if p.queue_number is not None or p.identity_status in ("linked", "bystander")
     ]
     settled = set(resolved)
-    resolved += [det for det, tid in _detector_numbers.items() if tid in settled]
+    sightings = queue_tracker.sightings
+    resolved += [det for det, tid in _detector_numbers.items()
+                 if tid in settled and sightings.face_confirmed(det, tid)]
     return resolved
 
 def is_queue_number_active(queue_number: int) -> bool:
