@@ -33,6 +33,7 @@ from core.config import (
     WAIT_ESTIMATOR,
 )
 from database.database_handler import (
+    fetch_queue_records,
     fetch_recent_service_seconds,
     get_all_active_embeddings,
     record_counter_config_change,
@@ -45,7 +46,7 @@ from services.queue_tracker import QueueTracker, QueueZone
 from services import face_service, queue_engine, ticket_service, wait_model
 from services.embedding_index import EmbeddingIndex
 from services.ticket_printer import delete_all_tickets, invalidate_ticket_cache
-from core.school_time import CLOCK_FULL, clock, db_clock
+from core.school_time import CLOCK_FULL, clock, db_clock, db_on_school_clock
 
 queue_zone = QueueZone(x1=10, y1=10, x2=1910, y2=1070)
 queue_tracker = QueueTracker(zone=queue_zone)
@@ -1379,6 +1380,125 @@ def build_queue_prediction() -> dict:
         },
         "active_queue": people,
     }
+
+# QUEUE RECORDS (the staff dashboard's Queue Records page)
+
+RECORD_STATUS_LABELS = {"served": "Served", "no_show": "Skipped", "expired": "Expired"}
+
+
+def school_day_bounds_utc(day) -> tuple[datetime, datetime]:
+    """A school day as the UTC times the database stamps with NOW(). The
+    service_date column holds the database's own (UTC) date, so a ticket
+    taken before 8 AM in Naga carries the day before; the join time does
+    not."""
+    start = datetime(day.year, day.month, day.day) - timedelta(hours=SCHOOL_UTC_OFFSET_HOURS)
+    return start, start + timedelta(days=1)
+
+
+def _number(value):
+    return None if value is None else float(value)
+
+
+def queue_record_row(record: dict, is_today: bool) -> dict:
+    """One ticket as the Queue Records page shows it, on the school's clock."""
+    created = _as_datetime(record.get("created_at"))
+    called = _as_datetime(record.get("called_at"))
+    finished = _as_datetime(record.get("served_at"))
+    status = str(record.get("status") or "waiting")
+    queue_number = as_int(record.get("queue_number"), 0)
+
+    wait_seconds = (
+        int((called - created).total_seconds())
+        if called and created and called >= created else None
+    )
+    service_seconds = (
+        int((finished - called).total_seconds())
+        if status == "served" and called and finished and finished >= called else None
+    )
+    if status == "waiting":
+        # A ticket from an earlier day still marked waiting was never called
+        # or finished (most often the line was lost in a restart or reset).
+        status_label = "Waiting" if is_today else "Not finished"
+    else:
+        status_label = RECORD_STATUS_LABELS.get(status, status.replace("_", " ").title())
+    student_name = record.get("student_name")
+    school_id = record.get("student_school_id")
+    estimate = _number(record.get("predicted_wait_min"))
+    return {
+        "id": record.get("id"),
+        "queue_number": queue_number,
+        "queue_label": f"Q{queue_number:03d}",
+        "status": status,
+        "status_label": status_label,
+        "joined_at": db_clock(created) if created else None,
+        "joined_at_iso": db_on_school_clock(created).isoformat() if created else None,
+        "called_at": db_clock(called) if called else None,
+        "finished_at": db_clock(finished) if finished and status != "waiting" else None,
+        "wait_seconds": wait_seconds,
+        "service_seconds": service_seconds,
+        "cashier_window": record.get("cashier_window"),
+        "payment_type": record.get("payment_type"),
+        "payment_amount": _number(record.get("payment_amount")),
+        "payment_note": record.get("payment_note"),
+        "student_name": student_name,
+        "student_school_id": school_id,
+        "walk_in": bool(record.get("is_walkin")) and school_id is None,
+        "linked_via": record.get("linked_via"),
+        "estimated_wait_seconds": int(round(estimate * 60)) if estimate is not None else None,
+        "people_ahead_at_issue": record.get("people_ahead_at_issue"),
+        "served_by": record.get("served_by"),
+    }
+
+
+def queue_records_page(
+    day: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict | None:
+    """A school day's tickets, newest first, a page at a time, with the day's
+    totals. None when the database is unavailable."""
+    today = datetime.now(SCHOOL_TZ).date()
+    try:
+        chosen = datetime.strptime(day, "%Y-%m-%d").date() if day else today
+    except ValueError:
+        chosen = today
+    status = status if status in ("waiting", "served", "no_show", "expired") else None
+    page = max(1, as_int(page, 1))
+    page_size = max(1, min(200, as_int(page_size, 50)))
+
+    start, end = school_day_bounds_utc(chosen)
+    result = fetch_queue_records(start, end, status, search, limit=page_size,
+                                 offset=(page - 1) * page_size)
+    if result is None:
+        return None
+    is_today = chosen == today
+    s = result.get("summary") or {}
+    avg_wait = _number(s.get("avg_wait_seconds"))
+    avg_service = _number(s.get("avg_service_seconds"))
+    total = as_int(result.get("total"), 0)
+    return {
+        "date": chosen.isoformat(),
+        "is_today": is_today,
+        "status": status or "all",
+        "search": (search or "").strip(),
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": max(1, -(-total // page_size)),
+        "summary": {
+            "tickets": as_int(s.get("tickets"), 0),
+            "served": as_int(s.get("served"), 0),
+            "skipped": as_int(s.get("no_show"), 0),
+            "waiting": as_int(s.get("waiting"), 0),
+            "avg_wait_seconds": int(round(avg_wait)) if avg_wait is not None else None,
+            "avg_service_seconds": int(round(avg_service)) if avg_service is not None else None,
+            "served_amount": _number(s.get("served_amount")) or 0.0,
+        },
+        "records": [queue_record_row(r, is_today) for r in result.get("rows") or []],
+    }
+
 
 def _clean_queue_record(record: dict) -> dict:
     hidden = {"access_token", "jwt_token", "short_code", "pdf_path"}

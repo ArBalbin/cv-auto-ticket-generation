@@ -268,6 +268,28 @@ def queue_service_records(username: str = Depends(require_staff)):
 
 
 @router.get(
+    "/api/queue/records",
+    summary="Staff - a school day's queue records, newest first",
+    tags=["Queue"],
+)
+def queue_records(
+    date: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    username: str = Depends(require_staff),
+):
+    """`date` is a school day (YYYY-MM-DD, default today). `status` is
+    waiting, served, no_show or expired (default all). `q` matches a queue
+    number, a school ID or part of a student's name."""
+    result = queue_service.queue_records_page(date, status, q, page, page_size)
+    if result is None:
+        raise HTTPException(status_code=503, detail="Queue records are unavailable right now.")
+    return result
+
+
+@router.get(
     "/api/queue/on_way_notifications",
     summary="Staff - customer on-way notifications",
     tags=["Queue"],

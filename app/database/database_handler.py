@@ -460,6 +460,125 @@ def fetch_wait_observations(days: int | None = None) -> list[dict]:
         close_db_resources(cursor, conn)
 
 
+# What the staff Queue Records page lists for each ticket, when the column
+# exists. Missing optional columns come back as NULL, so an older database
+# still shows the page.
+_RECORD_COLUMNS = (
+    "id", "queue_number", "service_date", "status", "created_at", "called_at",
+    "served_at", "cashier_window", "payment_type", "payment_amount",
+    "payment_note", "linked_via", "is_walkin", "predicted_wait_min",
+    "people_ahead_at_issue",
+)
+RECORD_STATUSES = ("waiting", "served", "no_show", "expired")
+
+
+def _records_where(start_utc, end_utc, status, search, has_students):
+    """The WHERE clause shared by the record list and its count."""
+    where = ["qr.created_at >= %s", "qr.created_at < %s"]
+    params: list = [start_utc, end_utc]
+    if status in RECORD_STATUSES:
+        where.append("qr.status = %s")
+        params.append(status)
+    search = (search or "").strip()
+    if search:
+        digits = search.upper().lstrip("Q")
+        terms = []
+        if digits.isdigit():
+            terms.append("qr.queue_number = %s")
+            params.append(int(digits))
+        if has_students:
+            terms += ["sp.school_id LIKE %s", "sp.full_name LIKE %s"]
+            params += [f"%{search}%", f"%{search}%"]
+        where.append("(" + (" OR ".join(terms) or "FALSE") + ")")
+    return " AND ".join(where), params
+
+
+def fetch_queue_records(
+    start_utc,
+    end_utc,
+    status: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict | None:
+    """Tickets issued between two UTC times (the database clock), newest first,
+    for the staff Queue Records page: the page of rows, how many match, and
+    the day's totals. Read-only. Each row carries the student's name and
+    school ID when the ticket was linked to an account still on file, and the
+    username of the staff member who marked it. None when the database is
+    unavailable."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return None
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if not _table_exists(cursor, "queue_records"):
+            return {"rows": [], "total": 0, "summary": {}}
+        columns = _get_table_columns(cursor, "queue_records")
+        has_students = "student_id" in columns and _table_exists(cursor, "student_profiles")
+        has_users = "served_by_user_id" in columns and _table_exists(cursor, "users")
+
+        fields = [f"qr.{c}" if c in columns else f"NULL AS {c}" for c in _RECORD_COLUMNS]
+        joins = ""
+        if has_students:
+            fields += ["sp.full_name AS student_name", "sp.school_id AS student_school_id"]
+            joins += " LEFT JOIN student_profiles sp ON sp.id = qr.student_id"
+        else:
+            fields += ["NULL AS student_name", "NULL AS student_school_id"]
+        if has_users:
+            fields.append("u.username AS served_by")
+            joins += " LEFT JOIN users u ON u.id = qr.served_by_user_id"
+        else:
+            fields.append("NULL AS served_by")
+
+        where, params = _records_where(start_utc, end_utc, status, search, has_students)
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
+        cursor.execute(
+            f"SELECT {', '.join(fields)} FROM queue_records qr{joins} "
+            f"WHERE {where} ORDER BY qr.created_at DESC, qr.id DESC LIMIT %s OFFSET %s",
+            (*params, limit, offset),
+        )
+        rows = list(cursor.fetchall() or [])
+
+        cursor.execute(
+            f"SELECT COUNT(*) AS n FROM queue_records qr{joins} WHERE {where}",
+            tuple(params),
+        )
+        total = int((cursor.fetchone() or {}).get("n") or 0)
+
+        # The day's totals, whatever the status filter and search.
+        called = "qr.called_at" if "called_at" in columns else "NULL"
+        amount = "qr.payment_amount" if "payment_amount" in columns else "NULL"
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) AS tickets,
+                   SUM(qr.status = 'served') AS served,
+                   SUM(qr.status = 'no_show') AS no_show,
+                   SUM(qr.status = 'waiting') AS waiting,
+                   AVG(CASE WHEN {called} IS NOT NULL AND {called} >= qr.created_at
+                            THEN TIMESTAMPDIFF(SECOND, qr.created_at, {called}) END) AS avg_wait_seconds,
+                   AVG(CASE WHEN qr.status = 'served' AND {called} IS NOT NULL
+                             AND qr.served_at >= {called}
+                            THEN TIMESTAMPDIFF(SECOND, {called}, qr.served_at) END) AS avg_service_seconds,
+                   SUM(CASE WHEN qr.status = 'served' THEN {amount} END) AS served_amount
+            FROM queue_records qr
+            WHERE qr.created_at >= %s AND qr.created_at < %s
+            """,
+            (start_utc, end_utc),
+        )
+        summary = cursor.fetchone() or {}
+        return {"rows": rows, "total": total, "summary": summary}
+    except Exception as exc:
+        print(f"[DB] fetch_queue_records error: {exc}")
+        return None
+    finally:
+        close_db_resources(cursor, conn)
+
+
 def fetch_completed_transactions() -> list[dict]:
     """Served tickets with their real wait and service time, for retraining.
     Read-only. No student identifiers are selected: no names, school IDs or
