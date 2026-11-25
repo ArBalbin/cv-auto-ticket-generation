@@ -525,14 +525,16 @@ class QueueTracker:
 
     def line_snapshot(self) -> list[dict]:
         """The live line in order: each person's position, their counter (None
-        while still waiting) and when they were called to it."""
+        while still waiting), when they were called to it, and when they got
+        their number."""
         people = [
             p for p in list(self.active_queue.values())
             if p.queue_number is not None and p.status in ('waiting', 'missing') and p.position_in_line > 0
         ]
         return [
             {"position": p.position_in_line, "queue_number": p.queue_number,
-             "counter_number": p.counter_number, "called_at": p.called_at}
+             "counter_number": p.counter_number, "called_at": p.called_at,
+             "linked_at": p.linked_at or p.entered_at}
             for p in sorted(people, key=lambda p: p.position_in_line)
         ]
 

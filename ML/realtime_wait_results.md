@@ -134,6 +134,44 @@ the only window, and the waits of the next two in line (min:sec).
 | 7 | 0:57 | 1:24 | 3:06 | 3:16 |
 | 8 | 1:01 | 1:24 | 3:13 | 3:16 |
 
+## Pressure test with the time staff take to call (25 Nov 2026)
+
+The test sessions of 20 to 24 November logged 20 served tickets; 14 had nobody
+ahead and were told 0:00, and staff pressed Call next about 71 s later on
+average. The engine now learns that time from the calls (formula 4 in
+`WAIT_TIME_MODEL.md`). The pressure test was changed so that staff call a set
+time after they can, also when a student arrives at a free window (before, a
+student arriving at a free window was called at once), and run with and
+without the learned call time. Same 9 runs, 282 students.
+
+| Staff take | Engine | Live R² | Live MAE | At-join R² | At-join MAE | Frozen 60 s+ |
+|---|---|---|---|---|---|---|
+| 5 s | without the call time | 0.834 | 53 s | 0.813 | 70 s | 6 |
+| 5 s | with it | 0.826 | 55 s | 0.811 | 71 s | 10 |
+| 30 s | without the call time | 0.834 | 76 s | 0.749 | 121 s | 10 |
+| 30 s | with it | 0.896 | 60 s | 0.834 | 96 s | 10 |
+| 60 s | without the call time | 0.672 | 168 s | 0.500 | 270 s | not counted |
+| 60 s | with it | 0.919 | 73 s | 0.844 | 131 s | not counted |
+
+Per run with staff taking 5 s and the call time learned (the table in
+`WAIT_TIME_MODEL.md` section 8.3): pooled over 16,523 phone checks, live R² 0.826
+(MAE 55 s); at join R² 0.811 (MAE 71 s). The "frozen" counts with the call time
+are the student next in line held at 45 to 59 s while the transaction ahead is
+two to four minutes in, where the expected time left is nearly flat, as in the
+runs without it, plus one held at 3:16 and called 3 s later.
+
+The panel's case inside the first run, with the call time:
+
+| Minutes at window | Next in line | Second in line |
+|---|---|---|
+| 2 | 0:47 | 2:40 |
+| 3 | 0:47 | 2:44 |
+| 4 | 0:49 | 2:50 |
+| 5 | 0:53 | 2:57 |
+| 6 | 0:56 | 3:05 |
+| 7 | 1:00 | 3:12 |
+| 8 | 1:04 | 3:20 |
+
 ## Load test (20 Nov 2026)
 
 A local server with the real queue router (database off), 25 students in

@@ -172,6 +172,61 @@ def seed_recent_services() -> None:
     except Exception as exc:
         print(f"[QueueService] could not read recent service times: {exc}")
 
+# HOW LONG STAFF TAKE TO CALL THE NEXT STUDENT
+#
+# With staff calling, a free window takes nobody until a member of staff
+# presses Call next. The engine used to treat a free window as taking the next
+# student at once, so a student with nobody ahead was told 0:00. In the test
+# sessions of 20-24 Nov 2026 such students were called about 71 s later on
+# average (14 of 20 tickets).
+#
+# Each call is timed from the moment staff could have made it: the latest of
+# the student getting their number, the window's last Done (or no-show), and
+# the window being taken by a staff member. A gap longer than
+# MAX_CALL_GAP_SECONDS is a break, not a call, and is ignored. The delay used
+# is the average of the last RECENT_CALL_GAPS calls in the past two hours,
+# starting from no delay (the old assumption) counted as
+# CALL_GAP_PRIOR_WEIGHT calls, so one slow call does not swing every
+# estimate. With automatic calling a window calls the moment it frees, so the
+# delay is zero.
+MAX_CALL_GAP_SECONDS = 5 * 60
+RECENT_CALL_GAPS = 10
+CALL_GAP_PRIOR_WEIGHT = 3
+_recent_call_gaps: deque = deque(maxlen=50)    # (time.monotonic() at the call, seconds)
+_recent_call_gaps_lock = threading.Lock()
+# window -> when its last transaction ended / when staff took it (this process's clock)
+_window_free_since: dict[int, datetime] = {}
+_window_opened_at: dict[int, datetime] = {}
+
+
+def record_call_gap(gap_seconds: float | None) -> bool:
+    """Count one staff call in the call delay. False when ignored."""
+    if gap_seconds is None or not 0 <= gap_seconds <= MAX_CALL_GAP_SECONDS:
+        return False
+    with _recent_call_gaps_lock:
+        _recent_call_gaps.append((time.monotonic(), float(gap_seconds)))
+    return True
+
+
+def current_call_delay_minutes() -> float:
+    """How long staff take to call the next student, now, in minutes."""
+    if queue_tracker.auto_call:
+        return 0.0
+    horizon = time.monotonic() - queue_engine.RECENT_WINDOW_MIN * 60
+    with _recent_call_gaps_lock:
+        gaps = [s for at, s in _recent_call_gaps if at >= horizon][-RECENT_CALL_GAPS:]
+    return sum(gaps) / 60 / (CALL_GAP_PRIOR_WEIGHT + len(gaps))
+
+
+def _window_ready_since(counter_number: int, waiting_since: datetime | None) -> datetime | None:
+    """Since when staff at this free window could have called the student
+    who has been waiting since `waiting_since`."""
+    if waiting_since is None:
+        return None
+    times = [waiting_since, _window_free_since.get(counter_number), _window_opened_at.get(counter_number)]
+    return max(t for t in times if t is not None)
+
+
 def wire_callbacks() -> None:
     queue_tracker.on_number_linked = _on_number_linked
     queue_tracker.auto_call = _call_mode == "auto"
@@ -828,6 +883,9 @@ def claim_window(username: str, counter_number: int) -> None:
         for counter, (user, _) in list(_window_claims.items()):
             if user == username and counter != counter_number:
                 del _window_claims[counter]
+        if holder is None:
+            # The window opens now: a call cannot be late from before this.
+            _window_opened_at[counter_number] = datetime.now()
         _window_claims[counter_number] = (username, now)
 
 
@@ -876,8 +934,19 @@ def call_next(counter_number: int, username: str) -> tuple[str, dict | None]:
     claim_window(username, counter_number)
     outcome, person = queue_tracker.call_next(counter_number)
     if outcome == "called" and person is not None:
+        _time_the_call(counter_number, person.get("queue_number"))
         invalidate_ticket_cache(person.get("queue_number"))
     return outcome, person
+
+
+def _time_the_call(counter_number: int, queue_number) -> None:
+    """How long after it could have been made this call came (record_call_gap)."""
+    p = queue_tracker._person_by_queue_number(queue_number) if queue_number is not None else None
+    if p is None or p.called_at is None:
+        return
+    ready = _window_ready_since(counter_number, p.linked_at or p.entered_at)
+    if ready is not None:
+        record_call_gap((p.called_at - ready).total_seconds())
 
 
 def mark_done(queue_number: int, actor_username: str | None = None) -> dict | None:
@@ -889,6 +958,8 @@ def mark_done(queue_number: int, actor_username: str | None = None) -> dict | No
 
     # Timed from the call to Done; the next estimate counts it.
     record_service_time(called_seconds_ago)
+    if cashier_window is not None:
+        _window_free_since[cashier_window] = datetime.now()
     invalidate_ticket_cache(queue_number)
     threading.Thread(
         target=_update_status_then_invalidate,
@@ -906,6 +977,8 @@ def mark_no_show(queue_number: int, actor_username: str | None = None) -> dict |
     cashier_window = queue_tracker.get_counter_number(queue_number)
     if not queue_tracker.mark_no_show(queue_number):
         return None
+    if cashier_window is not None:
+        _window_free_since[cashier_window] = datetime.now()
 
     invalidate_ticket_cache(queue_number)
     threading.Thread(
@@ -1178,9 +1251,14 @@ class LineState:
 
     @property
     def moving(self) -> bool:
-        """Someone is at a window, so the line moves on its own. With nobody
-        at one it waits for a window to call, and no estimate counts down."""
-        return any(c.busy_since is not None for c in self.counters)
+        """Someone is at a window, so the line moves on its own; or a window a
+        staff member holds is free with someone waiting, and their call is
+        due. Otherwise the line waits for a window to call, and no estimate
+        counts down."""
+        if any(c.busy_since is not None for c in self.counters):
+            return True
+        return (self.windows_calling > 0 and self.model.call_delay_min > 0
+                and any(c.ready_since is not None for c in self.counters))
 
 
 def line_state(counters: int) -> LineState:
@@ -1192,13 +1270,20 @@ def line_state(counters: int) -> LineState:
     at_window = [(now - at).total_seconds() / 60 for at in called.values() if at is not None]
     model = queue_engine.service_model(
         recent_service_minutes(), at_window, prior_min=runtime_config()["avg_service_time"],
+        call_delay_min=current_call_delay_minutes(),
     )
     closed = counters_closed_until()
     calling = calling_windows(counters, line)
-    states = [
-        queue_engine.CounterState(busy_since=called.get(n), closed_until=closed)
-        for n in (calling or [1])
-    ]
+    # The first student still waiting, for timing a free window's call.
+    waiting = [q.get("linked_at") for q in line if q["counter_number"] is None and q.get("linked_at")]
+    first_waiting_since = min(waiting) if waiting else None
+    states = []
+    for n in (calling or [1]):
+        busy = called.get(n)
+        ready = None
+        if busy is None and calling:
+            ready = _window_ready_since(n, first_waiting_since)
+        states.append(queue_engine.CounterState(busy_since=busy, closed_until=closed, ready_since=ready))
     return LineState(now=now, line=line, model=model, counters=states, windows_calling=len(calling))
 
 
@@ -1258,6 +1343,9 @@ def average_service_fields(model: queue_engine.ServiceModel) -> dict:
         "avg_service_seconds": seconds,
         "avg_service_label": format_wait_seconds(seconds),
         "avg_service_basis": basis,
+        # How long staff have been taking to call the next student; counted
+        # in every wait (zero with automatic calling).
+        "avg_call_seconds": int(round(model.call_delay_min * 60)),
     }
 
 def wait_range_fields(wait_min: float, in_line: bool = True) -> dict:

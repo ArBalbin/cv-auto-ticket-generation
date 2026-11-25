@@ -101,7 +101,14 @@ def old_wait(now, counters, ahead, svc=MEAN):
     return max(0.0, (last - now).total_seconds())
 
 
-def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5, call_gap=5):
+_learned_call_delay = queue_service.current_call_delay_minutes
+
+
+def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5, call_gap=5,
+        learn_call=True):
+    """`call_gap`: seconds staff take to press Call next once they could (after
+    Done, or after a student arrives at a free window). `learn_call` False runs
+    the engine without the learned call delay, as it was before 25 Nov 2026."""
     rng = random.Random(seed)
     Clock.t = 0.0
     builtins.print = lambda *a, **k: None
@@ -112,6 +119,11 @@ def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5,
     queue_service.queue_tracker = tracker
     queue_service._window_claims = {}
     queue_service._recent_services = deque(maxlen=50)
+    queue_service._recent_call_gaps = deque(maxlen=50)
+    queue_service._window_free_since = {}
+    queue_service._window_opened_at = {}
+    queue_service.current_call_delay_minutes = (
+        _learned_call_delay if learn_call else (lambda: 0.0))
     queue_service.runtime_config = lambda: {"avg_service_time": MEAN, "active_counters": windows}
     logged.clear()
 
@@ -124,7 +136,7 @@ def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5,
 
     joined, called, served = {}, {}, {}
     at_window = {w: None for w in range(1, windows + 1)}   # (queue_number, ends_at)
-    next_call = {w: 0.0 for w in range(1, windows + 1)}
+    freed_at = {w: 0.0 for w in range(1, windows + 1)}     # last Done at the window
     polls = []           # (t, number, new_s, old_s, moving)
     panel = []           # minute-by-minute during the long transaction
     overrun_number = number[overrun_index]
@@ -144,8 +156,11 @@ def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5,
                 queue_service.mark_done(current[0])
                 served[current[0]] = now_t
                 at_window[w] = None
-                next_call[w] = now_t + call_gap
-            if at_window[w] is None and now_t >= next_call[w]:
+                freed_at[w] = now_t
+            waiting = [joined[q] for q in joined if q not in called]
+            # Staff call `call_gap` seconds after they could: after Done, or
+            # after the first student waiting arrived at a free window.
+            if at_window[w] is None and waiting and now_t >= max(freed_at[w], min(waiting)) + call_gap:
                 outcome, person = queue_service.call_next(w, f"staff{w}")
                 if outcome == "called":
                     q = person["queue_number"]
@@ -262,3 +277,20 @@ if __name__ == "__main__":
         if len(behind) >= 2:
             a, b = behind[0], behind[1]
             print(f"| {minute} | {f(a[2])} | {f(a[3])} | {f(b[2])} | {f(b[3])} |")
+
+    # Staff slow to call, as in the test sessions of 20-24 Nov 2026 (about
+    # 71 s): the same runs with and without the learned call delay.
+    print("\nSTAFF TAKE 60 S TO CALL (same 9 runs):")
+    print("| Engine | Live R² | Live MAE | At-join R² | At-join MAE | Students |")
+    print("|---|---|---|---|---|---|")
+    for learn, label in ((False, "Without the call delay (until 25 Nov)"), (True, "Learning the call delay")):
+        live, join = [], []
+        for students, windows, util in scenarios:
+            for seed in range(3):
+                r = run(students, windows, util, seed, call_gap=60, learn_call=learn)
+                live += [(a, n) for a, n, _ in r["rows"]]
+                join += r["join_rows"]
+        la, lp = [a for a, _ in live], [p for _, p in live]
+        ja, jp = [a for a, _ in join], [p for _, p in join]
+        print(f"| {label} | {r2(lp, la):.3f} | {mae(lp, la):.0f} s | {r2(jp, ja):.3f} "
+              f"| {mae(jp, ja):.0f} s | {len(ja)} |", flush=True)
