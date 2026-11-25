@@ -32,7 +32,8 @@ reading (`line_state()`):
 
 1. Read the line from the tracker: order, who is at which window, and since when.
 2. Work out the **current average service time** μ (formula 2) and **how long
-   staff take to call** the next student, *d* (formula 4).
+   staff take to call** the next student, right after Done and at a free window
+   (formula 4).
 3. For each window, work out **when it frees up** (formula 1).
 4. **Play the line forward** to find when each person reaches a window (formula 3).
 5. Send each student their wait in seconds, the clock time of their turn, μ, and
@@ -50,7 +51,7 @@ Nothing is added or taken away in fixed steps. Every figure moves with the line.
 | Windows counted | Automatic calling: every open window. Call next: the windows a staff member holds plus any where someone is being served (`calling_windows()`). If none, one is assumed and the app says no window is calling. |
 | Services just finished | Every Done is timed from Call next to Done and kept in memory (`record_service_time()`); after a restart the last ones are read from the database (`fetch_recent_service_seconds()`). |
 | Long-run average μ₀ | `AVG_SERVICE_TIME`, default 1.87 min, the mean of the October 2026 cashier log |
-| Calls just made | Every Call next is timed from the moment staff could have made it (`record_call_gap()`, formula 4) |
+| Calls just made | Every Call next is timed from the moment staff could have made it, by kind (`record_call_gap()`, formula 4); after a restart the last ones are read from the database (`fetch_recent_call_gaps()`) |
 | When each window freed or opened | The window's last Done or no-show, and the moment a staff member took it |
 | Lunch closure | "Close all counters until" on the dashboard |
 
@@ -63,8 +64,8 @@ questions, one formula each:
 |---|---|---|---|
 | 1. Time left at a busy window | How much longer will the student now at each window take? | How long they have been there (*e*), the average service time (μ) | Minutes until that window is free |
 | 2. Current average service time | How long does one student take at the window, at today's pace? | The long-run average, the services just finished, any still running long | μ, in minutes |
-| 3. Playing the line forward | Given those, when does each person in line reach a window? | When each window is free (formula 1), μ (formula 2), *d* (formula 4), the order of the line | Each student's wait in seconds and their time of service |
-| 4. Time staff take to call | Once a window could take the next student, how long until staff press Call next? | The calls just made | *d*, in minutes |
+| 3. Playing the line forward | Given those, when does each person in line reach a window? | When each window is free (formula 1), μ (formula 2), the call times (formula 4), the order of the line | Each student's wait in seconds and their time of service |
+| 4. Time staff take to call | Once a window could take the next student, how long until staff press Call next? | The calls just made, by kind | *d_done* and *d_free*, in minutes |
 
 Formula 2 feeds formulas 1 and 3, and formulas 1 and 4 feed formula 3. All four
 are worked out again on every request, so the answer changes as soon as the line
@@ -176,14 +177,15 @@ service) and handles a lunch closure.
 Each counted window *w* takes its next person at
 
 ```
-F_w = now + max(0, d − i_w)          if no one is at it
-F_w = now + R(e_w) + d               if someone has been at it e_w minutes
-F_w = max(F_w, closed_until + d)     during a lunch closure
+F_w = now + R(e_w) + d_done            if someone has been at it e_w minutes
+F_w = now + C(i_w)                     if it is free and someone is waiting (formula 4)
+F_w = max(F_w, closed_until + d_free)  during a lunch closure
 ```
 
 The people still waiting are taken in queue order. Each goes to the window that
-frees first, which is then busy for μ minutes and calls the next person *d*
-minutes after that. The moment a person is taken is their start:
+frees first, which is then busy for μ minutes, and staff press Done and call the
+next person *d_done* minutes after that. The moment a person is taken is their
+start:
 
 ```
 wait                        = start − now
@@ -195,7 +197,7 @@ With one window and *p* people waiting ahead (not counting the one at the
 window):
 
 ```
-wait = R(e) + d + p · (μ + d)
+wait = R(e) + d_done + p · (μ + d_done)
 ```
 
 With *c* windows, the line is shared out to whichever window frees first, so
@@ -205,49 +207,86 @@ each window takes about every *c*-th person.
 |---|---|
 | F_w | The moment window *w* takes the next person |
 | *e_w* | How long the student at window *w* has been there |
-| *d* | How long staff take to call the next student (formula 4); 0 with automatic calling |
-| *i_w* | For a free window: minutes since staff could have called the first student waiting (the later of the window freeing and that student getting their number) |
+| *d_done* | How long staff take to call the next student right after Done (formula 4); 0 with automatic calling |
+| *d_free* | How long staff take to call a student who arrives at a window already free (formula 4) |
+| *i_w*, C(*i_w*) | For a free window: minutes since staff could have called the first student waiting, and the time still expected until they do (formula 4) |
 | closed_until | The time the windows reopen after a lunch closure, if any |
 | start | The moment a person is taken by a window |
 | *p* | People still waiting ahead (not counting those already at a window) |
 | *c* | Windows calling |
 
-**Example.** One window; Q1 has been at it 5 minutes, μ = 2.113 min and no call
-has been timed yet (*d* = 0). The window is free in R(5) = 0.85 min, so Q2
-(next) waits 0:51. Q3 goes after Q2: 0.85 + 2.113 = 2.97 min, so Q3 waits 2:58
-(section 5). Had staff been taking 30 s to call (*d* = 0.5), Q2 would wait
-0.85 + 0.5 = 1.35 min, 1:21, and Q3 1.35 + 2.113 + 0.5 = 3.96 min, 3:58.
+**Example.** One window; Q1 has been at it 5 minutes, μ = 2.113 min and staff
+call at once after Done (*d_done* = 0). The window is free in R(5) = 0.85 min, so
+Q2 (next) waits 0:51. Q3 goes after Q2: 0.85 + 2.113 = 2.97 min, so Q3 waits 2:58
+(section 5). Had staff been taking 30 s to call after Done (*d_done* = 0.5), Q2
+would wait 0.85 + 0.5 = 1.35 min, 1:21, and Q3 1.35 + 2.113 + 0.5 = 3.96 min,
+3:58.
 
 ### Formula 4: the time staff take to call
 
-**What it is for.** With staff calling, a free window takes nobody until a
-member of staff presses Call next. Without this, a student with nobody ahead and
-a free window was told 0:00. In the test sessions of 20 to 24 November 2026, 14
-of the 20 students served had nobody ahead; they were all told 0:00 and were
-called about 71 seconds later on average.
+**What it is for.** With staff calling, a window takes nobody until a member of
+staff presses Call next. Without this, a student with nobody ahead and a free
+window was told 0:00: in the test sessions of 20 to 24 November 2026, 14 of the
+20 students served had nobody ahead, were all told 0:00, and were called about
+71 seconds later on average.
 
 Each call is timed from the moment staff could have made it:
 
 ```
 gap = called_at − max(number issued, window's last Done or no-show, window taken by staff)
-
-d = ( k_d · 0 + Σ gapᵢ ) / ( k_d + n_d )
 ```
+
+The calls logged from 20 to 25 November come in two kinds that take very
+different times, so each kind is learned on its own:
+
+| Kind of call | The latest moment above is | Gaps logged | Typical |
+|---|---|---|---|
+| Right after Done, the student already waiting | The window's Done | 2, 3, 3, 5, 6, 10, 13, 19, 22, 28, 29, 31, 246 s | 13 s |
+| A student arriving at a window already free | The number being issued (or staff taking the window) | 41, 50, 52, 60, 65, 67, 77, 81, 88, 93, 98, 102, 106, 112, 132, 248 s | 85 s |
+
+```
+d_done = ( k_d · 0 + Σ gapᵢ ) / ( k_d + n )     over the last n ≤ 10 calls right after Done
+d_free = ( k_d · 0 + Σ gapᵢ ) / ( k_d + n )     over the last n ≤ 10 calls at a free window
+```
+
+A single average of both, used on the morning of 25 November, added about a
+minute to every turn in a long line, where nearly every call comes right after
+Done (section 8.3).
+
+**A call later than usual is not "now".** A free window with someone waiting is
+expected to call in
+
+```
+C(i) = d · m(i / d)        d = d_done if the window freed after the student was waiting, else d_free
+```
+
+where *i* is how long the student has been waiting for that call and m is the
+same mean residual life as in formula 1. It starts at *d* and counts down with
+the student's clock; if staff are later than usual it levels off instead of
+reaching 0:00, because a call that is already late is still expected to take a
+little more. Before this, a late call showed 0:00 until staff pressed Call next
+(25 November 2026).
 
 | Symbol | Meaning |
 |---|---|
-| gapᵢ | The last n_d calls made in the past two hours (n_d ≤ 10); a gap over 5 minutes is a break, not a call, and is ignored |
+| gapᵢ | A call's gap; one over 5 minutes is a break, not a call, and is ignored |
 | k_d = 3 | The old assumption, no delay, counted as three calls, so one slow call does not swing every estimate |
-| *d* | Minutes; 0 with automatic calling, where a window calls the moment it frees |
+| *d_done*, *d_free* | Minutes; both 0 with automatic calling, where a window calls the moment it frees |
+| *i* | Minutes the student has been waiting for this window's call |
 
-**Example.** Ten calls of 70 s: *d* = (3 × 0 + 10 × 70) / (3 + 10) = 54 s. A
-student who gets a number at a free window is told 0:54, and the clock counts
-down from when staff could first call them. If staff are later than that, the
-estimate stays at 0:00 until they call.
+The calls are kept in memory as staff make them, and read from the database
+when the backend starts (the last 50 calls of the past 30 days), so a restart
+does not drop both back to no delay. On 25 November the first student after a
+redeploy was told 0:00 and called 4 minutes later.
 
-The free window's call counts down with the student's clock, so the app shows
-the line as moving (**Live**) while a window a staff member holds is free and
-someone is waiting.
+**Example.** Ten calls of 85 s at a free window and ten of 13 s after Done:
+*d_free* = 850 / 13 = 65 s and *d_done* = 130 / 13 = 10 s. A student who gets a
+number at a free window is told 1:05. Thirty seconds on, still not called, they
+are told 0:38; at 65 s, 0:26; at two minutes, 0:25; at four, 0:30. A student who
+is next when the window's Done is pressed is told 0:10.
+
+While a window a staff member holds is free and someone is waiting, a call is
+due, so the app shows the line as moving (**Live**).
 
 ### Is the engine trained?
 
@@ -261,7 +300,7 @@ has never seen (section 8). Two of its values do come from real data:
 |---|---|---|
 | σ = 0.425, the shape of service times | Fitted once by maximum likelihood to 511 real transactions in the October 2026 cashier log | Estimated from data (a statistical fit) |
 | μ, the average service time | Updated live from every service staff finish, starting from the October mean | Learned continuously from the cashier's own data |
-| *d*, the time staff take to call | Updated live from every Call next, starting from no delay | Learned continuously from the cashier's own data |
+| *d_done* and *d_free*, the time staff take to call | Updated live from every Call next, starting from the calls in the database | Learned continuously from the cashier's own data |
 | k = 10 and the last 20 services | Chosen by trying settings on replayed lines (section 8.4) | Tuned |
 | First come first served, windows, lunch closure | How the cashier line works | Not learned: a model of the process |
 
@@ -272,7 +311,8 @@ wait.
 ## 5. Worked example: the panel's case
 
 One window. Four services of 2:00 were timed earlier, and staff have been
-calling promptly (*d* = 0; with a call time, each turn adds *d* as in formula 3).
+calling promptly (*d_done* = 0; with a call time, each turn adds *d_done* as in
+formula 3).
 Q1 has been at the window for 5 minutes; Q2 is next, Q3 after Q2.
 
 ```
@@ -444,7 +484,8 @@ One window, as in section 5. Q3 joins just as Q1 is called; Q2 is next.
 | Look-back | 2 hours | A service from another day says little about today's pace |
 | Timed service kept | 5 s to 30 min | Shorter is a mis-click, longer a forgotten Done |
 | k_d | 3 calls of no delay | So one slow call does not swing every estimate |
-| n_d | last 10 calls | |
+| Calls averaged | last 10 of each kind | |
+| Calls read at startup | last 50 of the past 30 days | So a restart does not forget the staff's pace |
 | Timed call kept | 0 to 5 min | Longer is a break, not a call |
 | Recalculation | every request (every 4 s on the waiting screen) | |
 
@@ -464,15 +505,19 @@ section 9.
 
 | Test | R² | MAE |
 |---|---:|---:|
-| Pressure test on the real backend code, staff calling 5 s after they can, estimate shown every 5 s while waiting (9 runs, 282 students, 16,523 checks) | **0.826** | **55 s** |
-| Same runs, estimate given when the student joined | **0.811** | **71 s** |
-| Same runs with staff taking 60 s to call, estimate shown while waiting | **0.919** | **73 s** |
-| Same, estimate given when the student joined | **0.844** | **131 s** |
+| Pressure test on the real backend code, busy lines, staff calling 5 s after they can, estimate shown every 5 s while waiting (9 runs, 282 students, 16,523 checks) | **0.826** | **55 s** |
+| Same runs, estimate given when the student joined | **0.812** | **70 s** |
+| Same busy lines, staff calling as in the test sessions (15 s after Done, 85 s at a free window), while waiting | **0.857** | **60 s** |
+| Same, estimate given when the student joined | **0.783** | **91 s** |
+| Quiet lines like the test sessions, staff calling as in them, while waiting (15 runs, 240 students) | **0.695** | **28 s** |
+| Same, estimate given when the student joined | **0.665** | **31 s** |
 | Replayed lines, estimate given when the student joined (15 scenarios, 103,500 students) | **0.967** | **81 s** |
 | Same replays, estimate shown every 30 s while waiting (1,509,230 checks) | **0.961** | **123 s** |
 
 Pooled R² mixes scenarios whose waits differ tenfold, which raises it; the
-per-scenario figures follow. The replays assume staff call at once (*d* = 0).
+per-scenario figures follow. The replays assume staff call at once. On quiet
+lines waits are short and vary little, so R² is lower while the miss is under
+half a minute.
 
 ### 8.2 Replayed lines
 
@@ -513,52 +558,73 @@ The tracker, queue service and engine run unchanged with the database switched
 off and a simulated clock (`ML/pressure_test_realtime_wait.py`). Students arrive
 at random and get a number; staff at each window press Call next 5 seconds after
 they can (after Done, or after a student arrives at a free window), serve for a
-time drawn from the October log, and press Done. One transaction per run takes 9
-minutes. Every waiting student's phone asks for its estimate every 5 seconds, and
-each answer is checked against when that student was really called. Three runs
-per setting.
+time drawn from the October log, and press Done. Ten earlier calls of each kind
+are known when a run starts, as the backend reads the last calls from the
+database when it starts. One transaction per run takes 9 minutes. Every waiting
+student's phone asks for its estimate every 5 seconds, and each answer is
+checked against when that student was really called. Three runs per setting.
 
 | Students | Windows | Busy | Mean wait | Longest wait | Longest line | Checks | R² while waiting | MAE | R² at join | MAE at join | Unchanged 60 s+ |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 24 | 1 | 85% | 5.2 min | 11.7 min | 6 | 1,502 | 0.714 | 53 s | 0.656 | 84 s | 1 |
-| 24 | 1 | 85% | 8.9 min | 15.1 min | 7 | 2,569 | 0.851 | 56 s | 0.764 | 93 s | 3 |
-| 24 | 1 | 85% | 6.3 min | 13.2 min | 6 | 1,824 | 0.863 | 50 s | 0.771 | 76 s | 3 |
-| 30 | 2 | 90% | 2.9 min | 7.2 min | 7 | 1,043 | 0.689 | 49 s | 0.692 | 63 s | 0 |
-| 30 | 2 | 90% | 5.9 min | 9.8 min | 11 | 2,121 | 0.682 | 63 s | 0.660 | 82 s | 1 |
-| 30 | 2 | 90% | 4.7 min | 9.3 min | 9 | 1,708 | 0.711 | 57 s | 0.671 | 81 s | 2 |
-| 40 | 3 | 95% | 1.0 min | 4.2 min | 5 | 462 | 0.425 | 39 s | 0.775 | 25 s | 0 |
-| 40 | 3 | 95% | 7.2 min | 14.7 min | 18 | 3,438 | 0.824 | 65 s | 0.719 | 106 s | 0 |
-| 40 | 3 | 95% | 3.9 min | 8.7 min | 12 | 1,856 | 0.806 | 40 s | 0.816 | 45 s | 0 |
-| **Pooled** | | | | | | **16,523** | **0.826** | **55 s** | **0.811** | **71 s** | |
+| 24 | 1 | 85% | 5.2 min | 11.7 min | 6 | 1,502 | 0.716 | 52 s | 0.656 | 84 s | 2 |
+| 24 | 1 | 85% | 8.9 min | 15.1 min | 7 | 2,569 | 0.852 | 56 s | 0.764 | 92 s | 2 |
+| 24 | 1 | 85% | 6.3 min | 13.2 min | 6 | 1,824 | 0.864 | 50 s | 0.771 | 76 s | 2 |
+| 30 | 2 | 90% | 2.9 min | 7.2 min | 7 | 1,043 | 0.690 | 49 s | 0.692 | 63 s | 1 |
+| 30 | 2 | 90% | 5.9 min | 9.8 min | 11 | 2,121 | 0.682 | 63 s | 0.661 | 81 s | 0 |
+| 30 | 2 | 90% | 4.7 min | 9.3 min | 9 | 1,708 | 0.712 | 57 s | 0.671 | 81 s | 2 |
+| 40 | 3 | 95% | 1.0 min | 4.2 min | 5 | 462 | 0.424 | 39 s | 0.775 | 24 s | 0 |
+| 40 | 3 | 95% | 7.2 min | 14.7 min | 18 | 3,438 | 0.824 | 65 s | 0.721 | 105 s | 0 |
+| 40 | 3 | 95% | 3.9 min | 8.7 min | 12 | 1,856 | 0.807 | 40 s | 0.817 | 45 s | 0 |
+| **Pooled** | | | | | | **16,523** | **0.826** | **55 s** | **0.812** | **70 s** | |
 
 "Unchanged 60 s+" counts each time a waiting student's estimate stayed identical
-for a minute or more while the line was moving (ten in all). Nine are a student
-next in line held at 45 to 59 s while the person at the window is two to four
-minutes in, where the expected time left is nearly flat (formula 1); the other
-was held at 3:16 and called 3 s after it. During the 9-minute
-transaction in the first run, the next two in line were told:
+for a minute or more while the line was moving (nine in all). Eight are a
+student next in line held at 46 to 59 s while the person at the window is two to
+four minutes in, where the expected time left is nearly flat (formula 1); the
+other was held at 3:16 and called 3 s after it. During the 9-minute transaction
+in the first run, the next two in line were told:
 
 | Minutes at the window | Next in line | Second in line |
 |---:|---:|---:|
-| 2 | 0:47 | 2:40 |
-| 3 | 0:47 | 2:44 |
-| 4 | 0:49 | 2:50 |
-| 5 | 0:53 | 2:57 |
-| 6 | 0:56 | 3:05 |
-| 7 | 1:00 | 3:12 |
-| 8 | 1:04 | 3:20 |
+| 2 | 0:47 | 2:41 |
+| 3 | 0:47 | 2:45 |
+| 4 | 0:50 | 2:51 |
+| 5 | 0:53 | 2:58 |
+| 6 | 0:57 | 3:06 |
+| 7 | 1:01 | 3:13 |
+| 8 | 1:05 | 3:21 |
 
-**When staff take longer to call.** The same nine runs, with staff pressing
-Call next a set time after they can, and the engine with and without formula 4:
+**Staff calling as in the test sessions.** Staff press Call next 15 seconds
+after Done and 85 seconds after a student arrives at a free window, as in the
+calls logged from 20 to 25 November. Three versions of the engine: no call time
+(until 25 November), one average of both kinds of call (the morning of 25
+November), and each kind learned on its own (formula 4). "Told 0:00" counts the
+checks where a student was told 0:00 with their call still 10 seconds or more
+away.
 
-| Staff take | Without the call time: R² while waiting | MAE | R² at join | MAE at join | With it: R² while waiting | MAE | R² at join | MAE at join |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 5 s | 0.834 | 53 s | 0.813 | 70 s | 0.826 | 55 s | 0.811 | 71 s |
-| 30 s | 0.834 | 76 s | 0.749 | 121 s | 0.896 | 60 s | 0.834 | 96 s |
-| 60 s | 0.672 | 168 s | 0.500 | 270 s | 0.919 | 73 s | 0.844 | 131 s |
+Quiet lines, like the test sessions (12 students at one window 35% busy, 16 at
+one window 50% busy, 20 at two windows 50% busy; five runs each, 240 students,
+5,303 checks):
 
-When staff call within seconds the call time changes almost nothing; when they
-take a minute, as in the test sessions, it halves the miss.
+| Engine | R² while waiting | MAE | R² at join | MAE at join | Told 0:00 | Unchanged 60 s+ |
+|---|---:|---:|---:|---:|---:|---:|
+| No call time | 0.509 | 39 s | −0.022 | 65 s | 1,854 | 3 |
+| One average of both kinds | 0.099 | 51 s | 0.155 | 48 s | 0 | 2 |
+| Each kind on its own | **0.695** | **28 s** | **0.665** | **31 s** | 0 | 5 |
+
+Busy lines (the nine runs above, 282 students, 23,887 checks):
+
+| Engine | R² while waiting | MAE | R² at join | MAE at join | Told 0:00 | Unchanged 60 s+ |
+|---|---:|---:|---:|---:|---:|---:|
+| No call time | 0.849 | 61 s | 0.746 | 103 s | 703 | 7 |
+| One average of both kinds | 0.323 | 149 s | 0.310 | 176 s | 0 | 11 |
+| Each kind on its own | **0.857** | **60 s** | **0.783** | **91 s** | 0 | 12 |
+
+Without a call time, a third of the checks on quiet lines told a student 0:00
+while they still had to wait. One average of both kinds stops that but adds about
+a minute to every turn, which on busy lines, where nearly every call comes right
+after Done, more than doubles the miss. Learning each kind on its own is the most
+accurate on both and never says 0:00 before the call.
 
 **Load.** A local server with the real queue router, 25 students in line and
 two windows calling, with 25 phones each asking for their status and the queue
@@ -617,10 +683,12 @@ next and Done, gives the engine's first R² measured at the cashier.
    in μ at its length so far, so a window left open for an hour makes everyone's
    estimate long until staff press Done. Once Done is pressed, a service over
    30 minutes is ignored.
-4. **The call time is learned only from this session's calls.** It starts at no
-   delay after a restart and moves to the staff's pace over the first few
-   calls; it is one average for every window and for calls after Done and after
-   a student arrives at a free window alike.
+4. **The call times are one figure per kind for every window.** They follow the
+   last ten calls of each kind, so one very slow call (a 4-minute call after
+   Done on 24 November) raises its kind until newer calls replace it. The
+   database does not record when staff took a window, so after a restart a
+   first call of the day can count time from before the window opened.
+   Calls the 20 to 25 November test sessions logged are the only data so far.
 5. **First come, first served is assumed.** Skipped numbers, staff calling out
    of order and students who leave are not predicted; the estimate corrects
    itself on the next request.
@@ -632,9 +700,10 @@ next and Done, gives the engine's first R² measured at the cashier.
 **What is the formula?**
 Section 4. A busy window's time left is R(e) = μ · m(e/μ), the mean residual
 life of a lognormal fitted to the October cashier log; μ is the live average of
-the last 20 services; *d* is how long staff have been taking to call; the line is
-then played forward, μ + *d* per person, and the wait is when you reach a window.
-With one window: wait = R(e) + *d* + people ahead × (μ + *d*).
+the last 20 services; *d_done* and *d_free* are how long staff have been taking to
+call right after Done and at a free window; the line is then played forward,
+μ + *d_done* per person, and the wait is when you reach a window. With one
+window: wait = R(e) + *d_done* + people ahead × (μ + *d_done*).
 
 **Why does Q2's time move later while Q1 takes long?**
 Because the longer a transaction has run, the more it is expected to need, and a
@@ -651,15 +720,19 @@ on lines it has never seen.
 
 **What is its R²?**
 In simulation with real October service times, run through the real backend
-code: 0.826 for the estimate shown while waiting (MAE 55 s) and 0.811 at join
-(MAE 71 s) with staff calling promptly; 0.919 and 0.844 with staff taking a
-minute to call; on replayed lines 0.961 and 0.967 (section 8). It has not yet
-been measured at the cashier; every served ticket is logged for that (section 9).
+code: 0.826 for the estimate shown while waiting (MAE 55 s) and 0.812 at join
+(MAE 70 s) on busy lines with staff calling promptly; 0.857 and 0.783 with staff
+calling as in the test sessions; 0.695 and 0.665 on quiet lines like the test
+sessions (MAE 28 and 31 s); on replayed lines 0.961 and 0.967 (section 8). It
+has not yet been measured at the cashier; every served ticket is logged for that
+(section 9).
 
 **Why did the app once say 0:00 and the student wait a minute?**
 Until 25 November the engine took a free window to call the next student at
-once. With staff calling, it now learns how long they take (formula 4) and adds
-it; in the test sessions that was about 71 seconds.
+once. With staff calling, it now learns how long they take, for a call right
+after Done (about 13 s in the test sessions) and for a student arriving at a
+free window (about 85 s), and adds it (formula 4). A call later than usual is
+still expected soon, so the app shows a time, not 0:00, until the call comes.
 
 **Why is R² lower for short lines?**
 When most waits are under a minute or two, they barely vary, so even a 30-second

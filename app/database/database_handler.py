@@ -918,6 +918,56 @@ def fetch_recent_service_seconds(window_minutes: int = 120, limit: int = 10) -> 
         close_db_resources(cursor, conn)
 
 
+def fetch_recent_call_gaps(days: int = 30, limit: int = 50) -> list[tuple[int, bool]]:
+    """The last `limit` staff calls of the past `days`, newest first, as
+    (seconds from when the call could have been made to the call, whether it
+    came right after the window's previous Done). A call could be made once
+    the student had their number and the window's previous transaction that
+    day had ended; the later of the two decides the kind. Read only; seeds the
+    learned call times after a restart. The database does not record when
+    staff took a window, so a first call of the day may count time before the
+    window opened; calls over five minutes are dropped by the caller."""
+    pool = _ensure_db_pool()
+    if pool is None:
+        return []
+
+    conn = cursor = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if not {"called_at", "served_at", "cashier_window"} <= _get_table_columns(cursor, "queue_records"):
+            return []
+        cursor.execute(
+            """
+            SELECT TIMESTAMPDIFF(SECOND, GREATEST(created_at, COALESCE(prev_done, created_at)),
+                                 called_at) AS gap_seconds,
+                   (prev_done IS NOT NULL AND prev_done > created_at) AS after_done
+            FROM (
+                SELECT created_at, called_at,
+                       LAG(served_at) OVER (PARTITION BY cashier_window, DATE(called_at)
+                                            ORDER BY called_at) AS prev_done
+                FROM queue_records
+                WHERE called_at IS NOT NULL
+                  AND cashier_window IS NOT NULL
+                  AND created_at >= NOW() - INTERVAL %s DAY
+            ) calls
+            ORDER BY called_at DESC
+            LIMIT %s
+            """,
+            (int(days), int(limit)),
+        )
+        return [
+            (int(r["gap_seconds"]), bool(r["after_done"]))
+            for r in (cursor.fetchall() or [])
+            if r.get("gap_seconds") is not None
+        ]
+    except Exception as exc:
+        print(f"[DB] fetch_recent_call_gaps error: {exc}")
+        return []
+    finally:
+        close_db_resources(cursor, conn)
+
+
 # STUDENT SELF-REGISTRATION + FACE ENROLLMENT (Algorithm 4 support)
 #
 # Accounts are created via self-service Sign-in-with-Google against the

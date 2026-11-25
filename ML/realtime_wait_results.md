@@ -141,8 +141,12 @@ ahead and were told 0:00, and staff pressed Call next about 71 s later on
 average. The engine now learns that time from the calls (formula 4 in
 `WAIT_TIME_MODEL.md`). The pressure test was changed so that staff call a set
 time after they can, also when a student arrives at a free window (before, a
-student arriving at a free window was called at once), and run with and
-without the learned call time. Same 9 runs, 282 students.
+student arriving at a free window was called at once).
+
+### First version: one average of every call (morning)
+
+Run with and without the learned call time, staff taking the same time for
+every call. Same 9 runs, 282 students.
 
 | Staff take | Engine | Live R² | Live MAE | At-join R² | At-join MAE | Frozen 60 s+ |
 |---|---|---|---|---|---|---|
@@ -153,24 +157,55 @@ without the learned call time. Same 9 runs, 282 students.
 | 60 s | without the call time | 0.672 | 168 s | 0.500 | 270 s | not counted |
 | 60 s | with it | 0.919 | 73 s | 0.844 | 131 s | not counted |
 
-Per run with staff taking 5 s and the call time learned (the table in
-`WAIT_TIME_MODEL.md` section 8.3): pooled over 16,523 phone checks, live R² 0.826
-(MAE 55 s); at join R² 0.811 (MAE 71 s). The "frozen" counts with the call time
-are the student next in line held at 45 to 59 s while the transaction ahead is
-two to four minutes in, where the expected time left is nearly flat, as in the
-runs without it, plus one held at 3:16 and called 3 s later.
+This version was deployed the same day. Two faults showed at once in use: the
+first student after the redeploy was told 0:00 (no call timed since the
+restart) and called after 4 min 8 s, and a call later than the average showed
+0:00 until it came.
 
-The panel's case inside the first run, with the call time:
+### Second version: two kinds of call, never 0:00 before the call (afternoon)
+
+The calls logged from 20 to 25 November come in two kinds: right after Done
+with the student already waiting (2 to 31 s, typically 13 s, plus one of 246 s)
+and a student arriving at a window already free (41 to 132 s, typically 85 s,
+plus one of 248 s). The single average put about a minute on every turn in a
+long line, where nearly every call is the quick kind. The engine now learns the
+two apart, reads the last calls from the database when it starts, and treats a
+late call at a free window like a transaction running long (mean residual life),
+so it never shows 0:00 before the call. Each run starts with ten earlier calls
+of each kind known, as the backend does after reading the database.
+
+Staff calling 5 s after they can, the 9 busy runs: pooled over 16,523 phone
+checks, live R² 0.826 (MAE 55 s); at join R² 0.812 (MAE 70 s); 9 estimates
+unchanged for 60 s or more (eight the student next in line held at 46 to 59 s
+while the transaction ahead is two to four minutes in, where the expected time
+left is nearly flat; one held at 3:16 and called 3 s later). The panel's case
+inside the first run:
 
 | Minutes at window | Next in line | Second in line |
 |---|---|---|
-| 2 | 0:47 | 2:40 |
-| 3 | 0:47 | 2:44 |
-| 4 | 0:49 | 2:50 |
-| 5 | 0:53 | 2:57 |
-| 6 | 0:56 | 3:05 |
-| 7 | 1:00 | 3:12 |
-| 8 | 1:04 | 3:20 |
+| 2 | 0:47 | 2:41 |
+| 3 | 0:47 | 2:45 |
+| 4 | 0:50 | 2:51 |
+| 5 | 0:53 | 2:58 |
+| 6 | 0:57 | 3:06 |
+| 7 | 1:01 | 3:13 |
+| 8 | 1:05 | 3:21 |
+
+Staff calling as in the test sessions (15 s after Done, 85 s at a free window),
+three versions of the engine. "Told 0:00" counts checks where a student was told
+0:00 with their call still 10 s or more away.
+
+| Lines | Engine | Live R² | Live MAE | At-join R² | At-join MAE | Told 0:00 | Frozen 60 s+ |
+|---|---|---|---|---|---|---|---|
+| Quiet (240 students, 5,303 checks) | no call time | 0.509 | 39 s | -0.022 | 65 s | 1,854 | 3 |
+| Quiet | one average (first version) | 0.099 | 51 s | 0.155 | 48 s | 0 | 2 |
+| Quiet | two kinds (second version) | 0.695 | 28 s | 0.665 | 31 s | 0 | 5 |
+| Busy (282 students, 23,887 checks) | no call time | 0.849 | 61 s | 0.746 | 103 s | 703 | 7 |
+| Busy | one average (first version) | 0.323 | 149 s | 0.310 | 176 s | 0 | 11 |
+| Busy | two kinds (second version) | 0.857 | 60 s | 0.783 | 91 s | 0 | 12 |
+
+Quiet lines: 12 students at one window 35% busy, 16 at one window 50%, 20 at two
+windows 50%, five runs each. Busy lines: the 9 runs above.
 
 ## Load test (20 Nov 2026)
 

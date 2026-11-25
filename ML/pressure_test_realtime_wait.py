@@ -101,14 +101,28 @@ def old_wait(now, counters, ahead, svc=MEAN):
     return max(0.0, (last - now).total_seconds())
 
 
-_learned_call_delay = queue_service.current_call_delay_minutes
+_learned_call_delays = queue_service.current_call_delays
 
 
-def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5, call_gap=5,
-        learn_call=True):
-    """`call_gap`: seconds staff take to press Call next once they could (after
-    Done, or after a student arrives at a free window). `learn_call` False runs
-    the engine without the learned call delay, as it was before 25 Nov 2026."""
+def _one_average_of_both():
+    """Both kinds of call averaged together (the engine of 25 Nov 2026, morning)."""
+    both = list(queue_service._calls_after_done) + list(queue_service._calls_when_free)
+    d = queue_service._call_average_minutes(both)
+    return d, d
+
+
+CALL_TIMES = {"none": lambda: (0.0, 0.0), "one": _one_average_of_both, "split": _learned_call_delays}
+
+
+def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5,
+        gap_after_done=5, gap_when_free=5, learn="split", earlier_calls=10):
+    """Staff press Call next `gap_after_done` seconds after Done when a student
+    is waiting, and `gap_when_free` seconds after a student arrives at a window
+    already free. `learn` is how the engine counts the call: not at all
+    ("none"), one average of both kinds ("one"), or each kind on its own
+    ("split", the engine as deployed). `earlier_calls` of each kind, at the
+    same pace, are known before the run starts, as the deployed backend reads
+    the last calls from the database when it starts."""
     rng = random.Random(seed)
     Clock.t = 0.0
     builtins.print = lambda *a, **k: None
@@ -119,11 +133,11 @@ def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5,
     queue_service.queue_tracker = tracker
     queue_service._window_claims = {}
     queue_service._recent_services = deque(maxlen=50)
-    queue_service._recent_call_gaps = deque(maxlen=50)
+    queue_service._calls_after_done = deque([float(gap_after_done)] * earlier_calls, maxlen=50)
+    queue_service._calls_when_free = deque([float(gap_when_free)] * earlier_calls, maxlen=50)
     queue_service._window_free_since = {}
     queue_service._window_opened_at = {}
-    queue_service.current_call_delay_minutes = (
-        _learned_call_delay if learn_call else (lambda: 0.0))
+    queue_service.current_call_delays = CALL_TIMES[learn]
     queue_service.runtime_config = lambda: {"avg_service_time": MEAN, "active_counters": windows}
     logged.clear()
 
@@ -158,9 +172,13 @@ def run(students, windows, util, seed, overrun_index=5, overrun_min=9.0, poll=5,
                 at_window[w] = None
                 freed_at[w] = now_t
             waiting = [joined[q] for q in joined if q not in called]
-            # Staff call `call_gap` seconds after they could: after Done, or
-            # after the first student waiting arrived at a free window.
-            if at_window[w] is None and waiting and now_t >= max(freed_at[w], min(waiting)) + call_gap:
+            # Staff call a set time after they could: after Done with a
+            # student waiting, or after a student arrives at a free window.
+            if at_window[w] is None and waiting:
+                after_done = freed_at[w] > min(waiting)
+                gap = gap_after_done if after_done else gap_when_free
+                due = max(freed_at[w], min(waiting)) + gap
+            if at_window[w] is None and waiting and now_t >= due:
                 outcome, person = queue_service.call_next(w, f"staff{w}")
                 if outcome == "called":
                     q = person["queue_number"]
@@ -278,19 +296,33 @@ if __name__ == "__main__":
             a, b = behind[0], behind[1]
             print(f"| {minute} | {f(a[2])} | {f(a[3])} | {f(b[2])} | {f(b[3])} |")
 
-    # Staff slow to call, as in the test sessions of 20-24 Nov 2026 (about
-    # 71 s): the same runs with and without the learned call delay.
-    print("\nSTAFF TAKE 60 S TO CALL (same 9 runs):")
-    print("| Engine | Live R² | Live MAE | At-join R² | At-join MAE | Students |")
-    print("|---|---|---|---|---|---|")
-    for learn, label in ((False, "Without the call delay (until 25 Nov)"), (True, "Learning the call delay")):
-        live, join = [], []
-        for students, windows, util in scenarios:
-            for seed in range(3):
-                r = run(students, windows, util, seed, call_gap=60, learn_call=learn)
-                live += [(a, n) for a, n, _ in r["rows"]]
-                join += r["join_rows"]
-        la, lp = [a for a, _ in live], [p for _, p in live]
-        ja, jp = [a for a, _ in join], [p for _, p in join]
-        print(f"| {label} | {r2(lp, la):.3f} | {mae(lp, la):.0f} s | {r2(jp, ja):.3f} "
-              f"| {mae(jp, ja):.0f} s | {len(ja)} |", flush=True)
+    # Staff calling as in the test sessions of 20-25 Nov 2026: about 13 s
+    # after Done, about 85 s when a student arrives at a free window.
+    lines = (
+        ("QUIET LINES, like the test sessions (12 students at 1 window 35% busy, 16 at 1 window "
+         "50%, 20 at 2 windows 50%; 5 runs each)",
+         [(12, 1, 0.35), (16, 1, 0.50), (20, 2, 0.50)], 5, {"overrun_index": 0, "overrun_min": 1.87}),
+        ("BUSY LINES (the 9 runs above)", scenarios, 3, {}),
+    )
+    for title, settings, seeds, extra in lines:
+        print()
+        print(f"STAFF CALL AS IN THE TEST SESSIONS, 15 s after Done and 85 s at a free window. {title}:")
+        print("| Engine | Live R² | Live MAE | At-join R² | At-join MAE | Told 0:00 with the call 10 s+ away "
+              "| Unchanged 60 s+ | Students |")
+        print("|---|---|---|---|---|---|---|---|")
+        for learn, label in (("none", "No call time (until 25 Nov)"),
+                             ("one", "One average of both kinds (25 Nov, morning)"),
+                             ("split", "Each kind learned on its own")):
+            live, join, zeros, frozen_n = [], [], 0, 0
+            for students, windows, util in settings:
+                for seed in range(seeds):
+                    r = run(students, windows, util, seed, gap_after_done=15, gap_when_free=85,
+                            learn=learn, **extra)
+                    live += [(a, n) for a, n, _ in r["rows"]]
+                    join += r["join_rows"]
+                    zeros += sum(1 for a, n, _ in r["rows"] if n == 0 and a >= 10)
+                    frozen_n += r["frozen_new"]
+            la, lp = [a for a, _ in live], [p for _, p in live]
+            ja, jp = [a for a, _ in join], [p for _, p in join]
+            print(f"| {label} | {r2(lp, la):.3f} | {mae(lp, la):.0f} s | {r2(jp, ja):.3f} "
+                  f"| {mae(jp, ja):.0f} s | {zeros} of {len(la):,} | {frozen_n} | {len(ja)} |", flush=True)

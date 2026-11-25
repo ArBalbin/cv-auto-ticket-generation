@@ -30,11 +30,15 @@ evidently slower than usual, so everyone behind it is told so at once.
 A window's remaining time is then average x shape: avg * m(elapsed / avg),
 where m is the fitted mean residual life in units of its own mean.
 
-The TIME STAFF TAKE TO CALL the next student: with staff calling, a free
-window takes nobody until a member of staff presses Call next. It is learned
-from the calls themselves (queue_service.current_call_delay_minutes) and is
-zero when windows call by themselves. On 20-24 Nov 2026 the engine said 0:00
-to students with nobody ahead, who were then called about 71 s later.
+The TIME STAFF TAKE TO CALL the next student: with staff calling, a window
+takes nobody until a member of staff presses Call next. Two kinds of call take
+very different times and are learned apart from the calls themselves
+(queue_service.current_call_delays): right after Done, with someone already
+waiting (about 13 s in the test sessions of 20-25 Nov 2026), and a student
+arriving at a window that is already free (about 85 s). Both are zero when
+windows call by themselves. A call at a free window that is taking longer than
+usual is treated like a transaction running long: its expected time left is
+the same mean residual life, so it never reaches 0:00 before the call comes.
 
 The line is then played forward. Each window is free now, free when its
 transaction is expected to end, or closed until a set time (lunch), and then
@@ -93,12 +97,25 @@ def remaining_fraction(x: float) -> float:
 class ServiceModel:
     mean_min: float = HISTORY_MEAN_MIN   # the current average service time
     timed: int = 0                       # recent services behind that average
-    call_delay_min: float = 0.0          # how long staff take to call the next student
+    call_after_done_min: float = 0.0     # Done, then Call next for the student waiting
+    call_when_free_min: float = 0.0      # a student arrives at a window already free
 
     def remaining(self, elapsed_min: float) -> float:
         """Expected minutes left in a transaction that has run `elapsed_min`."""
         mean = max(0.1, self.mean_min)
         return mean * remaining_fraction(max(0.0, elapsed_min) / mean)
+
+    def free_call_remaining(self, waited_min: float, after_done: bool = False) -> float:
+        """Expected minutes until staff at a free window call the student
+        who has been waiting for them `waited_min`: since the window's Done
+        (`after_done`), or since the student arrived at a window already
+        free. Like a transaction, a call already later than usual is still
+        expected to need some time, so this never reaches zero before the
+        call comes."""
+        usual = self.call_after_done_min if after_done else self.call_when_free_min
+        if usual <= 0:
+            return 0.0
+        return usual * remaining_fraction(max(0.0, waited_min) / usual)
 
 
 def current_average(
@@ -124,13 +141,15 @@ def service_model(
     finished_min: list[float],
     at_window_min: list[float] = (),
     prior_min: float = HISTORY_MEAN_MIN,
-    call_delay_min: float = 0.0,
+    call_after_done_min: float = 0.0,
+    call_when_free_min: float = 0.0,
 ) -> ServiceModel:
     recent = list(finished_min)[-RECENT_SERVICES:]
     return ServiceModel(
         mean_min=current_average(recent, list(at_window_min), prior_min),
         timed=len(recent),
-        call_delay_min=max(0.0, call_delay_min),
+        call_after_done_min=max(0.0, call_after_done_min),
+        call_when_free_min=max(0.0, call_when_free_min),
     )
 
 
@@ -151,27 +170,30 @@ class CounterState:
     busy_since: datetime | None = None    # when the person now at it was called
     closed_until: datetime | None = None  # no one is called before this time
     # Free, with someone waiting: since when staff could have called them
-    # (the later of the window freeing and that person getting their number).
+    # (the later of the window freeing and that person getting their number),
+    # and whether that moment was the window's Done (a call right after Done
+    # comes much sooner than one for a student arriving at a free window).
     ready_since: datetime | None = None
+    ready_after_done: bool = False
 
 
 def free_at(counter: CounterState, now: datetime, service) -> datetime:
     """When this counter takes the next person: once its transaction is
     expected to end, after any closure, and once staff call."""
     model = _as_model(service)
-    call = model.call_delay_min
     if counter.busy_since is not None:
         elapsed = (now - counter.busy_since).total_seconds() / 60
-        free = now + timedelta(minutes=model.remaining(elapsed) + call)
+        free = now + timedelta(minutes=model.remaining(elapsed) + model.call_after_done_min)
     else:
-        # Already free: the call is due that long after it could first have
-        # been made, so the estimate counts down with the student's clock.
-        idle = 0.0
+        # Already free: the call is due about the usual time after it could
+        # first have been made, counting down with the student's clock; a call
+        # later than usual is expected soon, never "now" (free_call_remaining).
+        waited = 0.0
         if counter.ready_since is not None:
-            idle = max(0.0, (now - counter.ready_since).total_seconds() / 60)
-        free = now + timedelta(minutes=max(0.0, call - idle))
+            waited = max(0.0, (now - counter.ready_since).total_seconds() / 60)
+        free = now + timedelta(minutes=model.free_call_remaining(waited, counter.ready_after_done))
     if counter.closed_until is not None:
-        reopens = counter.closed_until + timedelta(minutes=call)
+        reopens = counter.closed_until + timedelta(minutes=model.call_when_free_min)
         if reopens > free:
             free = reopens
     return free
@@ -190,8 +212,8 @@ def start_times(
     if not counters or waiting <= 0:
         return []
     model = _as_model(service)
-    # One average service, then the call of the next person.
-    length = timedelta(minutes=max(0.1, model.mean_min) + model.call_delay_min)
+    # One average service, then Done and the call of the next person.
+    length = timedelta(minutes=max(0.1, model.mean_min) + model.call_after_done_min)
     free = [free_at(c, now, model) for c in counters]
     heapq.heapify(free)
     starts = []

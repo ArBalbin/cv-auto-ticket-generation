@@ -49,6 +49,8 @@ async def lifespan(app: FastAPI):
     # The services finished in the past two hours, for the live average
     # service time the wait estimate uses (a restart empties it).
     threading.Thread(target=queue_service.seed_recent_services, name="service-time-seed", daemon=True).start()
+    # The last calls staff made, for the call times the wait estimate adds.
+    threading.Thread(target=queue_service.seed_recent_calls, name="call-time-seed", daemon=True).start()
     retention_service.start_scheduler()
     yield
 
